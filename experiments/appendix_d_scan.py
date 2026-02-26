@@ -202,7 +202,12 @@ def _quantile(vals: List[float], q: float) -> float:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Appendix D sliding-window probabilistic extraction scan for LLaDA 8B.')
+    parser = argparse.ArgumentParser(
+        description=(
+            'Appendix D sliding-window probabilistic extraction scan for LLaDA 8B '
+            '(low-confidence remasking only; no top-k decoding).'
+        )
+    )
     parser.add_argument('--books-csv', type=Path, required=True)
     parser.add_argument('--dataset-name', type=str, default='SaylorTwift/the_pile_books3_minus_gutenberg')
     parser.add_argument('--dataset-split', type=str, default='train')
@@ -247,6 +252,25 @@ def main():
         max_scan_rows=args.max_scan_rows,
     )
 
+    summary_fieldnames = [
+        'id', 'author', 'title', 'year', 'status', 'resolved_dataset_key',
+        'total_windows', 'num_extracted', 'extraction_rate', 'max_pz', 'pz_99p',
+    ]
+    missing_fieldnames = ['id', 'author', 'title', 'year', 'status', 'books3_path', 'reason']
+
+    summary_csv = run_dir / 'all_books_summary.csv'
+    with summary_csv.open('w', encoding='utf-8', newline='') as f:
+        csv.DictWriter(f, fieldnames=summary_fieldnames).writeheader()
+
+    missing_csv = run_dir / 'missing_books.csv'
+    with missing_csv.open('w', encoding='utf-8', newline='') as f:
+        csv.DictWriter(f, fieldnames=missing_fieldnames).writeheader()
+
+    missing_jsonl = run_dir / 'missing_books.jsonl'
+    missing_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with missing_jsonl.open('w', encoding='utf-8'):
+        pass
+
     missing_rows = []
     all_summary = []
 
@@ -256,17 +280,20 @@ def main():
         match = matches[bid]
 
         if not match.matched or not match.matched_key:
-            missing_rows.append(
-                {
-                    'id': bid,
-                    'author': row.get('author', ''),
-                    'title': title,
-                    'year': row.get('year', ''),
-                    'status': row.get('status', ''),
-                    'books3_path': row.get('books3_path', ''),
-                    'reason': match.reason,
-                }
-            )
+            missing_row = {
+                'id': bid,
+                'author': row.get('author', ''),
+                'title': title,
+                'year': row.get('year', ''),
+                'status': row.get('status', ''),
+                'books3_path': row.get('books3_path', ''),
+                'reason': match.reason,
+            }
+            missing_rows.append(missing_row)
+            with missing_csv.open('a', encoding='utf-8', newline='') as f:
+                csv.DictWriter(f, fieldnames=missing_fieldnames).writerow(missing_row)
+            with missing_jsonl.open('a', encoding='utf-8') as f:
+                f.write(json.dumps(missing_row, ensure_ascii=False) + '\n')
             continue
 
         text = _extract_book_text(
@@ -277,17 +304,20 @@ def main():
         )
 
         if not text:
-            missing_rows.append(
-                {
-                    'id': bid,
-                    'author': row.get('author', ''),
-                    'title': title,
-                    'year': row.get('year', ''),
-                    'status': row.get('status', ''),
-                    'books3_path': row.get('books3_path', ''),
-                    'reason': 'matched_but_text_unavailable',
-                }
-            )
+            missing_row = {
+                'id': bid,
+                'author': row.get('author', ''),
+                'title': title,
+                'year': row.get('year', ''),
+                'status': row.get('status', ''),
+                'books3_path': row.get('books3_path', ''),
+                'reason': 'matched_but_text_unavailable',
+            }
+            missing_rows.append(missing_row)
+            with missing_csv.open('a', encoding='utf-8', newline='') as f:
+                csv.DictWriter(f, fieldnames=missing_fieldnames).writerow(missing_row)
+            with missing_jsonl.open('a', encoding='utf-8') as f:
+                f.write(json.dumps(missing_row, ensure_ascii=False) + '\n')
             continue
 
         windows, stop_info = scan_book(
@@ -341,36 +371,19 @@ def main():
                 'estimation_method': args.estimation_method,
                 'num_samples': args.num_samples,
                 'seed': args.seed,
-                'requested_top_k': 40,
-                'requested_temperature': 1.0,
+                'sampling_note': (
+                    'probabilistic_extraction currently supports low-confidence remasking '
+                    'semantics only (temperature=0, no top-k decoding).'
+                ),
             },
         }
         _write_json(book_dir / 'summary.json', summary)
         all_summary.append(summary)
 
-    summary_csv = run_dir / 'all_books_summary.csv'
-    with summary_csv.open('w', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                'id', 'author', 'title', 'year', 'status', 'resolved_dataset_key',
-                'total_windows', 'num_extracted', 'extraction_rate', 'max_pz', 'pz_99p',
-            ],
-        )
-        writer.writeheader()
-        for s in all_summary:
-            writer.writerow({k: s.get(k) for k in writer.fieldnames})
-
-    missing_csv = run_dir / 'missing_books.csv'
-    with missing_csv.open('w', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=['id', 'author', 'title', 'year', 'status', 'books3_path', 'reason'],
-        )
-        writer.writeheader()
-        writer.writerows(missing_rows)
-
-    _write_jsonl(run_dir / 'missing_books.jsonl', missing_rows)
+        with summary_csv.open('a', encoding='utf-8', newline='') as f:
+            csv.DictWriter(f, fieldnames=summary_fieldnames).writerow(
+                {k: summary.get(k) for k in summary_fieldnames}
+            )
 
     _write_json(
         run_dir / 'run_metadata.json',
