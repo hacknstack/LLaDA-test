@@ -202,7 +202,12 @@ def _quantile(vals: List[float], q: float) -> float:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Appendix D sliding-window probabilistic extraction scan for LLaDA 8B.')
+    parser = argparse.ArgumentParser(
+        description=(
+            'Appendix D sliding-window probabilistic extraction scan for LLaDA 8B '
+            '(low-confidence remasking only; no top-k decoding).'
+        )
+    )
     parser.add_argument('--books-csv', type=Path, required=True)
     parser.add_argument('--dataset-name', type=str, default='SaylorTwift/the_pile_books3_minus_gutenberg')
     parser.add_argument('--dataset-split', type=str, default='train')
@@ -341,8 +346,10 @@ def main():
                 'estimation_method': args.estimation_method,
                 'num_samples': args.num_samples,
                 'seed': args.seed,
-                'requested_top_k': 40,
-                'requested_temperature': 1.0,
+                'sampling_note': (
+                    'probabilistic_extraction currently supports low-confidence remasking '
+                    'semantics only (temperature=0, no top-k decoding).'
+                ),
             },
         }
         _write_json(book_dir / 'summary.json', summary)
