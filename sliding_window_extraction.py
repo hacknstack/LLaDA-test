@@ -18,6 +18,13 @@ DEFAULT_MODEL = 'GSAI-ML/LLaDA-8B-Base'
 MASK_ID = 126336
 
 
+def _resolve_model_used(model_name: str) -> str:
+    lowered = model_name.lower()
+    if 'llama-3.1-8b' in lowered or 'llama3.1-8b' in lowered:
+        return 'llama3.1-8b'
+    return 'llada'
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Sliding-window probabilistic extraction for a single text file using LLaDA.'
@@ -34,6 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--output-dir', type=Path, default=Path('outputs'))
     parser.add_argument('--model-name', type=str, default=DEFAULT_MODEL)
+    parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature (Llama-only).')
+    parser.add_argument('--top-k', type=int, default=None, help='Optional top-k sampling filter (Llama-only).')
+    parser.add_argument('--top-p', type=float, default=None, help='Optional top-p sampling filter (Llama-only).')
     parser.add_argument('--num-samples', type=int, default=1000, help='Monte Carlo samples when --mode monte-carlo')
     parser.add_argument('--seed', type=int, default=None, help='Optional Monte Carlo seed')
     return parser.parse_args()
@@ -55,6 +65,8 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
     prompt_tokens = torch.tensor([prefix_ids], dtype=torch.long)
     target_tokens = torch.tensor([suffix_ids], dtype=torch.long)
 
+    model_used = _resolve_model_used(args.model_name)
+
     result = compute_probabilitic_extraction(
         model=model,
         prompt_tokens=prompt_tokens,
@@ -64,6 +76,10 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
         mask_id=MASK_ID,
         remasking='low-confidence',
         estimation_method=args.mode,
+        model_used=model_used,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
         num_samples=args.num_samples,
         seed=args.seed,
     )
@@ -78,6 +94,8 @@ def main() -> None:
 
     if args.prefix_tokens + args.suffix_tokens != args.seq_tokens:
         raise ValueError('prefix_tokens + suffix_tokens must equal seq_tokens.')
+    if args.temperature <= 0:
+        raise ValueError('temperature must be > 0.')
     if not args.txt_path.exists() or not args.txt_path.is_file():
         raise FileNotFoundError(f'Input file not found: {args.txt_path}')
 
@@ -186,6 +204,11 @@ def main() -> None:
             'suffix_tokens': args.suffix_tokens,
             'tau_min': args.tau,
             'mode': args.mode,
+            'model_name': args.model_name,
+            'model_used': _resolve_model_used(args.model_name),
+            'temperature': args.temperature,
+            'top_k': args.top_k,
+            'top_p': args.top_p,
         },
         'num_windows_total': num_windows_total,
         'num_windows_scored': num_windows_scored,
