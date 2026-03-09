@@ -24,20 +24,6 @@ def _validate_common_args(remasking: str, estimation_method: str) -> None:
         raise ValueError("estimation_method must be one of {'exact', 'monte-carlo'}")
 
 
-def _validate_model_choice(model_used: str) -> str:
-    normalized = model_used.strip().lower()
-    aliases = {
-        'llada': 'llada',
-        'llama': 'llama3.1-8b',
-        'llama3.1': 'llama3.1-8b',
-        'llama3.1-8b': 'llama3.1-8b',
-        'llama-3.1-8b': 'llama3.1-8b',
-    }
-    if normalized not in aliases:
-        raise ValueError("model_used must be one of {'llada', 'llama3.1-8b'}")
-    return aliases[normalized]
-
-
 def _suffix_attention_mask(prompt_attention_mask: Optional[torch.Tensor], suffix_len: int, device: torch.device) -> Optional[torch.Tensor]:
     if prompt_attention_mask is None:
         return None
@@ -94,96 +80,6 @@ def _safe_wald_and_wilson(hits: int, n: int, z: float = 1.96) -> Tuple[float, fl
     half = (z / denom) * math.sqrt((p * (1.0 - p) / n) + ((z * z) / (4.0 * n * n)))
     wilson = (max(0.0, center - half), min(1.0, center + half))
     return p, se, wald, wilson
-
-
-def _filtered_probs_for_llama(
-    logits_1d: torch.Tensor,
-    temperature: float,
-    top_k: int | None,
-    top_p: float | None,
-) -> torch.Tensor:
-    if temperature < 0:
-        raise ValueError('temperature must be >= 0.')
-    if top_k is not None and top_k <= 0:
-        raise ValueError('top_k must be > 0 when provided.')
-    if top_p is not None and not (0.0 < top_p <= 1.0):
-        raise ValueError('top_p must be in (0, 1] when provided.')
-
-    if temperature == 0:
-        probs = torch.zeros_like(logits_1d, dtype=torch.float64)
-        argmax_set = _max_token_set(logits_1d)
-        probs[argmax_set] = 1.0 / len(argmax_set)
-    else:
-        probs = F.softmax(logits_1d / temperature, dim=-1).to(torch.float64)
-
-    if top_k is not None:
-        k = min(top_k, probs.shape[-1])
-        topk_indices = torch.topk(probs, k=k, dim=-1).indices
-        mask = torch.zeros_like(probs, dtype=torch.bool)
-        mask[topk_indices] = True
-        probs = probs * mask
-
-    if top_p is not None:
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-        cumulative = torch.cumsum(sorted_probs, dim=-1)
-        keep_sorted = cumulative <= top_p
-        keep_sorted[0] = True
-        keep_mask = torch.zeros_like(probs, dtype=torch.bool)
-        keep_mask[sorted_indices] = keep_sorted
-        probs = probs * keep_mask
-
-    total = probs.sum()
-    if total <= 0:
-        raise RuntimeError('Sampling filters removed all probability mass.')
-    return probs / total
-
-
-@torch.no_grad()
-def _exact_probability_llama(
-    model,
-    prompt_tokens: torch.Tensor,
-    target_tokens: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    temperature: float,
-    top_k: int | None,
-    top_p: float | None,
-) -> float:
-    device = model.device
-    prompt_tokens = prompt_tokens.to(device)
-    target_tokens = target_tokens.to(device)
-
-    suffix_len = target_tokens.shape[1]
-    total_prob = 1.0
-
-    for pos in range(suffix_len):
-        input_ids = torch.cat([prompt_tokens, target_tokens[:, :pos]], dim=-1)
-
-        if attention_mask is None:
-            current_attention_mask = None
-        else:
-            prefix_mask = attention_mask.to(device)
-            if pos == 0:
-                current_attention_mask = prefix_mask
-            else:
-                current_attention_mask = torch.cat(
-                    [prefix_mask, torch.ones((1, pos), dtype=prefix_mask.dtype, device=device)],
-                    dim=-1,
-                )
-
-        logits = model(input_ids, attention_mask=current_attention_mask).logits[0, -1]
-        probs = _filtered_probs_for_llama(
-            logits_1d=logits,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-        )
-
-        token_id = int(target_tokens[0, pos].item())
-        total_prob *= float(probs[token_id].item())
-        if total_prob == 0.0:
-            break
-
-    return total_prob
 
 
 @torch.no_grad()
@@ -352,7 +248,7 @@ def _monte_carlo_probability(
 
 
 @torch.no_grad()
-def compute_probabilitic_extraction(
+def compute_probabilistic_extraction(
     model,
     prompt_tokens: torch.Tensor,
     target_tokens: torch.Tensor,
@@ -361,10 +257,6 @@ def compute_probabilitic_extraction(
     mask_id: int = 126336,
     remasking: str = 'low-confidence',
     estimation_method: str = 'exact',
-    model_used: str = 'llada',
-    temperature: float = 1.0,
-    top_k: int | None = None,
-    top_p: float | None = None,
     num_samples: int = 1000,
     seed: Optional[int] = None,
 ):
@@ -385,15 +277,6 @@ def compute_probabilitic_extraction(
         String selector. Currently only 'low-confidence'.
     estimation_method:
         'exact' (branching over tie-breaks) or 'monte-carlo'.
-    model_used:
-        Model family used for the extraction calculation. Supports 'llada' (default)
-        and 'llama3.1-8b' (autoregressive exact probability only).
-    temperature:
-        Temperature used by Llama sampling.
-    top_k:
-        Optional top-k truncation used by Llama sampling.
-    top_p:
-        Optional nucleus (top-p) truncation used by Llama sampling.
     num_samples:
         Number of Monte Carlo samples when estimation_method='monte-carlo'.
     seed:
@@ -410,29 +293,9 @@ def compute_probabilitic_extraction(
     if target_tokens.shape[1] < steps:
         raise ValueError('steps must be <= target suffix length for this scheduler.')
 
-    resolved_model = _validate_model_choice(model_used)
-
-    if resolved_model == 'llama3.1-8b':
-        if estimation_method != 'exact':
-            raise ValueError("For model_used='llama3.1-8b', only estimation_method='exact' is supported.")
-        return {
-            'method': 'exact',
-            'model_used': 'llama3.1-8b',
-            'probability': _exact_probability_llama(
-                model=model,
-                prompt_tokens=prompt_tokens,
-                target_tokens=target_tokens,
-                attention_mask=attention_mask,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-            ),
-        }
-
     if estimation_method == 'exact':
         return {
             'method': 'exact',
-            'model_used': 'llada',
             'probability': _exact_probability(
                 model=model,
                 prompt_tokens=prompt_tokens,
@@ -455,7 +318,6 @@ def compute_probabilitic_extraction(
     )
     return {
         'method': 'monte-carlo',
-        'model_used': 'llada',
         'estimate': mc.estimate,
         'standard_error': mc.standard_error,
         'wald_ci': mc.wald_ci,

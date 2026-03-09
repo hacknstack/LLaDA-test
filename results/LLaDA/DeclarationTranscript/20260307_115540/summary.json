@@ -1,0 +1,31 @@
+{
+  "input_file": "LLaDA-test/texts/DeclarationTranscript.txt",
+  "total_chars": 8149,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_chars": 10,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "model_used": "llada",
+    "temperature": 1.0,
+    "top_k": null,
+    "top_p": null
+  },
+  "num_windows_total": 765,
+  "num_windows_scored": 765,
+  "num_windows_extracted": 1,
+  "extraction_rate": 0.00130718954248366,
+  "p_z_distribution": {
+    "min": 0.0,
+    "median": 0.0,
+    "mean": 0.0013071895424836598,
+    "max": 0.9999999999999998,
+    "q_0.9": 0.0,
+    "q_0.99": 0.0,
+    "q_0.999": 0.23599999999998994
+  }
+}
