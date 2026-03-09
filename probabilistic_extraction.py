@@ -82,6 +82,12 @@ def _safe_wald_and_wilson(hits: int, n: int, z: float = 1.96) -> Tuple[float, fl
     return p, se, wald, wilson
 
 
+def _model_device(model) -> torch.device:
+    if hasattr(model, 'device'):
+        return model.device
+    return next(model.parameters()).device
+
+
 @torch.no_grad()
 def _exact_probability(
     model,
@@ -91,7 +97,7 @@ def _exact_probability(
     attention_mask: Optional[torch.Tensor],
     mask_id: int,
 ) -> float:
-    device = model.device
+    device = _model_device(model)
     prompt_tokens = prompt_tokens.to(device)
     target_tokens = target_tokens.to(device)
     suffix_len = target_tokens.shape[1]
@@ -176,7 +182,7 @@ def _monte_carlo_probability(
     num_samples: int,
     seed: Optional[int],
 ) -> MonteCarloResult:
-    device = model.device
+    device = _model_device(model)
     prompt_tokens = prompt_tokens.to(device)
     target_tokens = target_tokens.to(device)
     suffix_len = target_tokens.shape[1]
@@ -248,6 +254,85 @@ def _monte_carlo_probability(
 
 
 @torch.no_grad()
+def _autoregressive_probability(
+    model,
+    prompt_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    decoding_scheme: str,
+    k: int,
+    temperature: float,
+    return_token_details: bool,
+):
+    device = _model_device(model)
+    prompt_tokens = prompt_tokens.to(device)
+    target_tokens = target_tokens.to(device)
+
+    if prompt_tokens.shape[1] == 0:
+        raise ValueError('For model_family="llama", prompt_tokens must contain at least one token.')
+    if decoding_scheme not in {'top_k', 'greedy'}:
+        raise ValueError("decoding_scheme must be one of {'top_k', 'greedy'} for model_family='llama'.")
+    if decoding_scheme == 'top_k' and k <= 0:
+        raise ValueError('k must be > 0 when decoding_scheme="top_k".')
+    if decoding_scheme == 'top_k' and temperature <= 0:
+        raise ValueError('temperature must be > 0 when decoding_scheme="top_k".')
+
+    full_tokens = torch.cat([prompt_tokens, target_tokens], dim=1)
+    full_attention_mask = _suffix_attention_mask(attention_mask, target_tokens.shape[1], device)
+    logits = model(full_tokens, attention_mask=full_attention_mask).logits[0]
+
+    prompt_len = prompt_tokens.shape[1]
+    log_prob_total = 0.0
+    total_prob_zero = False
+    token_details: List[Dict[str, float]] = []
+
+    for t in range(target_tokens.shape[1]):
+        pred_logits = logits[prompt_len + t - 1]
+        target_id = int(target_tokens[0, t].item())
+
+        if decoding_scheme == 'greedy':
+            greedy_id = int(torch.argmax(pred_logits).item())
+            step_prob = 1.0 if greedy_id == target_id else 0.0
+        else:
+            scaled_logits = pred_logits / temperature
+            top_k = min(k, scaled_logits.shape[-1])
+            topk_vals, topk_idx = torch.topk(scaled_logits, k=top_k, dim=-1)
+            in_topk = bool((topk_idx == target_id).any().item())
+            if in_topk:
+                selected_logit = scaled_logits[target_id]
+                log_denom = torch.logsumexp(topk_vals, dim=-1)
+                step_prob = float(torch.exp(selected_logit - log_denom).item())
+            else:
+                step_prob = 0.0
+
+        if step_prob == 0.0:
+            total_prob_zero = True
+            log_prob_total = float('-inf')
+        elif not total_prob_zero:
+            log_prob_total += math.log(step_prob)
+
+        if return_token_details:
+            token_details.append(
+                {
+                    'position': t,
+                    'token_id': target_id,
+                    'step_probability': step_prob,
+                }
+            )
+
+    result = {
+        'method': 'autoregressive',
+        'model_family': 'llama',
+        'decoding_scheme': decoding_scheme,
+        'probability': 0.0 if total_prob_zero else float(math.exp(log_prob_total)),
+        'log_probability': float(log_prob_total),
+    }
+    if return_token_details:
+        result['token_details'] = token_details
+    return result
+
+
+@torch.no_grad()
 def compute_probabilistic_extraction(
     model,
     prompt_tokens: torch.Tensor,
@@ -259,6 +344,11 @@ def compute_probabilistic_extraction(
     estimation_method: str = 'exact',
     num_samples: int = 1000,
     seed: Optional[int] = None,
+    model_family: str = 'llada',
+    decoding_scheme: str = 'top_k',
+    k: int = 40,
+    temperature: float = 1.0,
+    return_token_details: bool = False,
 ):
     """
     Compute probabilistic extraction under LLaDA Algorithm-5 style low-confidence remasking.
@@ -282,12 +372,30 @@ def compute_probabilistic_extraction(
     seed:
         RNG seed for Monte Carlo.
     """
-    _validate_common_args(remasking=remasking, estimation_method=estimation_method)
-
     if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
         raise ValueError('prompt_tokens must have shape (1, a).')
     if target_tokens.ndim != 2 or target_tokens.shape[0] != 1:
         raise ValueError('target_tokens must have shape (1, j).')
+
+    model_family = model_family.lower()
+
+    if model_family == 'llama':
+        return _autoregressive_probability(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            attention_mask=attention_mask,
+            decoding_scheme=decoding_scheme,
+            k=k,
+            temperature=temperature,
+            return_token_details=return_token_details,
+        )
+
+    if model_family != 'llada':
+        raise ValueError("model_family must be one of {'llada', 'llama'}")
+
+    _validate_common_args(remasking=remasking, estimation_method=estimation_method)
+
     if steps <= 0:
         raise ValueError('steps must be > 0.')
     if target_tokens.shape[1] < steps:
