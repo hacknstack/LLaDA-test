@@ -9,18 +9,19 @@ from typing import List
 
 import torch
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from probabilistic_extraction import compute_probabilistic_extraction
 
 
-DEFAULT_MODEL = 'GSAI-ML/LLaDA-8B-Base'
+DEFAULT_LLADA_MODEL = 'GSAI-ML/LLaDA-8B-Base'
+DEFAULT_LLAMA_MODEL = 'NousResearch/Meta-Llama-3-8B'
 MASK_ID = 126336
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='Sliding-window probabilistic extraction for a single text file using LLaDA.'
+        description='Sliding-window probabilistic extraction for a single text file.'
     )
     parser.add_argument('txt_path', type=Path, help='Input txt file path (e.g. texts/book.txt)')
     parser.add_argument('--mode', choices=['exact', 'monte-carlo'], default='exact')
@@ -33,9 +34,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-windows', type=int, default=None)
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--output-dir', type=Path, default=Path('outputs'))
-    parser.add_argument('--model-name', type=str, default=DEFAULT_MODEL)
+    parser.add_argument('--model-family', choices=['llada', 'llama'], default='llada')
+    parser.add_argument('--model-name', type=str, default=None)
     parser.add_argument('--num-samples', type=int, default=1000, help='Monte Carlo samples when --mode monte-carlo')
     parser.add_argument('--seed', type=int, default=None, help='Optional Monte Carlo seed')
+    parser.add_argument('--decoding-scheme', choices=['top_k', 'greedy'], default='top_k')
+    parser.add_argument('--k', type=int, default=40, help='Top-k value when --model-family llama and --decoding-scheme top_k')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Temperature when --model-family llama and --decoding-scheme top_k')
     return parser.parse_args()
 
 
@@ -66,8 +71,14 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
         estimation_method=args.mode,
         num_samples=args.num_samples,
         seed=args.seed,
+        model_family=args.model_family,
+        decoding_scheme=args.decoding_scheme,
+        k=args.k,
+        temperature=args.temperature,
     )
 
+    if args.model_family == 'llama':
+        return float(result['probability'])
     if args.mode == 'exact':
         return float(result['probability'])
     return float(result['estimate'])
@@ -81,10 +92,17 @@ def main() -> None:
     if not args.txt_path.exists() or not args.txt_path.is_file():
         raise FileNotFoundError(f'Input file not found: {args.txt_path}')
 
+    if args.model_name is None:
+        args.model_name = DEFAULT_LLADA_MODEL if args.model_family == 'llada' else DEFAULT_LLAMA_MODEL
+
+    if args.model_family == 'llama' and args.mode != 'exact':
+        raise ValueError("--mode must be 'exact' when --model-family llama.")
+
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
+    model_cls = AutoModel if args.model_family == 'llada' else AutoModelForCausalLM
+    model = model_cls.from_pretrained(
         args.model_name,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16 if device.startswith('cuda') else torch.float32,
@@ -186,6 +204,11 @@ def main() -> None:
             'suffix_tokens': args.suffix_tokens,
             'tau_min': args.tau,
             'mode': args.mode,
+            'model_family': args.model_family,
+            'model_name': args.model_name,
+            'decoding_scheme': args.decoding_scheme,
+            'k': args.k,
+            'temperature': args.temperature,
         },
         'num_windows_total': num_windows_total,
         'num_windows_scored': num_windows_scored,
