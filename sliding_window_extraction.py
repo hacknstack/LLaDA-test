@@ -11,7 +11,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
-from probabilistic_extraction import compute_probabilitic_extraction
+from probabilistic_extraction import compute_probabilistic_extraction
 
 
 DEFAULT_MODEL = 'GSAI-ML/LLaDA-8B-Base'
@@ -55,7 +55,7 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
     prompt_tokens = torch.tensor([prefix_ids], dtype=torch.long)
     target_tokens = torch.tensor([suffix_ids], dtype=torch.long)
 
-    result = compute_probabilitic_extraction(
+    result = compute_probabilistic_extraction(
         model=model,
         prompt_tokens=prompt_tokens,
         target_tokens=target_tokens,
