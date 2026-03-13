@@ -82,19 +82,6 @@ def _safe_wald_and_wilson(hits: int, n: int, z: float = 1.96) -> Tuple[float, fl
     return p, se, wald, wilson
 
 
-def _add_gumbel_noise_with_generator(
-    logits: torch.Tensor,
-    temperature: float,
-    rng: torch.Generator,
-) -> torch.Tensor:
-    if temperature == 0:
-        return logits
-    logits_64 = logits.to(torch.float64)
-    noise = torch.rand(logits_64.shape, generator=rng, dtype=torch.float64, device='cpu').to(logits.device)
-    gumbel_noise = (-torch.log(noise)) ** temperature
-    return logits_64.exp() / gumbel_noise
-
-
 
 def _model_device(model) -> torch.device:
     if hasattr(model, 'device'):
@@ -249,85 +236,6 @@ def _monte_carlo_probability(
 
                 suffix[p] = chosen
 
-                if chosen != int(target_tokens[0, p].item()):
-                    alive = False
-                    break
-
-        if alive and torch.equal(suffix, target_tokens[0]):
-            hits += 1
-
-    estimate, se, wald, wilson = _safe_wald_and_wilson(hits, num_samples)
-    return MonteCarloResult(
-        estimate=estimate,
-        standard_error=se,
-        wald_ci=wald,
-        wilson_ci=wilson,
-        hits=hits,
-        num_samples=num_samples,
-    )
-
-
-@torch.no_grad()
-def _monte_carlo_probability_with_temperature(
-    model,
-    prompt_tokens: torch.Tensor,
-    target_tokens: torch.Tensor,
-    steps: int,
-    attention_mask: Optional[torch.Tensor],
-    mask_id: int,
-    num_samples: int,
-    temperature: float,
-    seed: Optional[int],
-) -> MonteCarloResult:
-    device = _model_device(model)
-    prompt_tokens = prompt_tokens.to(device)
-    target_tokens = target_tokens.to(device)
-    suffix_len = target_tokens.shape[1]
-    attn = _suffix_attention_mask(attention_mask, suffix_len, device)
-
-    rng = torch.Generator(device='cpu')
-    if seed is not None:
-        rng.manual_seed(seed)
-
-    base = suffix_len // steps
-    rem = suffix_len % steps
-    schedule = [base + (1 if i < rem else 0) for i in range(steps)]
-
-    hits = 0
-
-    for _ in range(num_samples):
-        suffix = torch.full((suffix_len,), mask_id, dtype=torch.long, device=device)
-        alive = True
-
-        for step_idx in range(steps):
-            if not alive:
-                break
-
-            x = torch.cat([prompt_tokens[0], suffix], dim=0).unsqueeze(0)
-            logits = model(x, attention_mask=attn).logits[0]
-
-            masked_positions = (suffix == mask_id).nonzero(as_tuple=False).squeeze(-1).tolist()
-            k_transfer = schedule[step_idx]
-
-            sampled_tokens = {}
-            conf = []
-            for p in masked_positions:
-                l = logits[prompt_tokens.shape[1] + p]
-                logits_with_noise = _add_gumbel_noise_with_generator(l, temperature=temperature, rng=rng)
-                sampled = int(torch.argmax(logits_with_noise).item())
-                sampled_tokens[p] = sampled
-
-                probs = F.softmax(l, dim=-1)
-                conf.append(float(probs[sampled].item()))
-
-            subsets = _uniform_cutoff_subsets(masked_positions, conf, k_transfer)
-            subset_weights = torch.tensor([w for _, w in subsets], dtype=torch.float64)
-            subset_idx = int(torch.multinomial(subset_weights, 1, generator=rng).item())
-            selected_subset = subsets[subset_idx][0]
-
-            for p in selected_subset:
-                chosen = sampled_tokens[p]
-                suffix[p] = chosen
                 if chosen != int(target_tokens[0, p].item()):
                     alive = False
                     break
@@ -511,17 +419,7 @@ def compute_probabilistic_extraction(
         }
 
     if temperature > 0:
-        mc = _monte_carlo_probability_with_temperature(
-            model=model,
-            prompt_tokens=prompt_tokens,
-            target_tokens=target_tokens,
-            steps=steps,
-            attention_mask=attention_mask,
-            mask_id=mask_id,
-            num_samples=num_samples,
-            temperature=temperature,
-            seed=seed,
-        )
+        print("TO IMPLEMENT")
     else:
         mc = _monte_carlo_probability(
             model=model,
