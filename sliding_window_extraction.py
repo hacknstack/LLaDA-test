@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seed', type=int, default=None, help='Optional Monte Carlo seed')
     parser.add_argument('--decoding-scheme', choices=['top_k', 'greedy'], default='top_k')
     parser.add_argument('--k', type=int, default=40, help='Top-k value when --model-family llama and --decoding-scheme top_k')
-    parser.add_argument('--temperature', type=float, default=1.0, help='Temperature when --model-family llama and --decoding-scheme top_k')
+    parser.add_argument('--temperature', type=float, default=0.0, help='Temperature when --model-family llama and --decoding-scheme top_k')
     return parser.parse_args()
 
 
