@@ -82,6 +82,15 @@ def _safe_wald_and_wilson(hits: int, n: int, z: float = 1.96) -> Tuple[float, fl
     return p, se, wald, wilson
 
 
+def _add_gumbel_noise(logits: torch.Tensor, temperature: float, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+    if temperature == 0:
+        return logits
+    logits = logits.to(torch.float64)
+    noise = torch.rand(logits.shape, dtype=torch.float64, device=logits.device, generator=generator)
+    gumbel_noise = (-torch.log(noise)) ** temperature
+    return logits.exp() / gumbel_noise
+
+
 
 def _model_device(model) -> torch.device:
     if hasattr(model, 'device'):
@@ -236,6 +245,85 @@ def _monte_carlo_probability(
 
                 suffix[p] = chosen
 
+                if chosen != int(target_tokens[0, p].item()):
+                    alive = False
+                    break
+
+        if alive and torch.equal(suffix, target_tokens[0]):
+            hits += 1
+
+    estimate, se, wald, wilson = _safe_wald_and_wilson(hits, num_samples)
+    return MonteCarloResult(
+        estimate=estimate,
+        standard_error=se,
+        wald_ci=wald,
+        wilson_ci=wilson,
+        hits=hits,
+        num_samples=num_samples,
+    )
+
+
+@torch.no_grad()
+def _monte_carlo_probability_temperature(
+    model,
+    prompt_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    num_samples: int,
+    seed: Optional[int],
+    temperature: float,
+) -> MonteCarloResult:
+    device = _model_device(model)
+    prompt_tokens = prompt_tokens.to(device)
+    target_tokens = target_tokens.to(device)
+    suffix_len = target_tokens.shape[1]
+    attn = _suffix_attention_mask(attention_mask, suffix_len, device)
+
+    rng = torch.Generator(device=device)
+    if seed is not None:
+        rng.manual_seed(seed)
+
+    base = suffix_len // steps
+    rem = suffix_len % steps
+    schedule = [base + (1 if i < rem else 0) for i in range(steps)]
+
+    hits = 0
+
+    for _ in range(num_samples):
+        suffix = torch.full((suffix_len,), mask_id, dtype=torch.long, device=device)
+        alive = True
+
+        for step_idx in range(steps):
+            if not alive:
+                break
+
+            x = torch.cat([prompt_tokens[0], suffix], dim=0).unsqueeze(0)
+            logits = model(x, attention_mask=attn).logits[0]
+
+            masked_positions = (suffix == mask_id).nonzero(as_tuple=False).squeeze(-1).tolist()
+            k_transfer = schedule[step_idx]
+
+            sample_logits = _add_gumbel_noise(logits, temperature=temperature, generator=rng)
+            x0 = torch.argmax(sample_logits, dim=-1)
+
+            probs = F.softmax(logits, dim=-1)
+            x0_p = torch.gather(probs, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+
+            confidence = torch.full_like(x0_p, float('-inf'))
+            confidence[prompt_tokens.shape[1]:] = torch.where(
+                suffix == mask_id,
+                x0_p[prompt_tokens.shape[1]:],
+                torch.full((suffix_len,), float('-inf'), dtype=x0_p.dtype, device=device),
+            )
+
+            _, selected = torch.topk(confidence, k=k_transfer)
+            selected_suffix_positions = (selected - prompt_tokens.shape[1]).tolist()
+
+            for p in selected_suffix_positions:
+                chosen = int(x0[prompt_tokens.shape[1] + p].item())
+                suffix[p] = chosen
                 if chosen != int(target_tokens[0, p].item()):
                     alive = False
                     break
@@ -419,7 +507,17 @@ def compute_probabilistic_extraction(
         }
 
     if temperature > 0:
-        print("TO IMPLEMENT")
+        mc = _monte_carlo_probability_temperature(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            steps=steps,
+            attention_mask=attention_mask,
+            mask_id=mask_id,
+            num_samples=num_samples,
+            seed=seed,
+            temperature=temperature,
+        )
     else:
         mc = _monte_carlo_probability(
             model=model,
