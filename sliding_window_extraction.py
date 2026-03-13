@@ -39,9 +39,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--num-samples', type=int, default=1000, help='Monte Carlo samples when --mode monte-carlo')
     parser.add_argument('--seed', type=int, default=None, help='Optional Monte Carlo seed')
     parser.add_argument('--decoding-scheme', choices=['top_k', 'greedy'], default='top_k')
-    parser.add_argument('--k', type=int, default=40, help='Top-k value when --model-family llama and --decoding-scheme top_k')
-    parser.add_argument('--temperature', type=float, default=1.0, help='Temperature when --model-family llama and --decoding-scheme top_k')
+    parser.add_argument('--k', type=int, default=40, help='Top-k value when --model-family llama and --decoding-scheme top_k (ignored for llada).')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for llama top-k decoding, or llada Monte Carlo trajectory sampling when --mode monte-carlo.')
     return parser.parse_args()
+
+
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    if args.model_family == 'llama' and args.mode != 'exact':
+        raise ValueError("--mode must be 'exact' when --model-family llama.")
+    if args.model_family == 'llama' and args.decoding_scheme == 'top_k' and args.temperature <= 0:
+        raise ValueError('--temperature must be > 0 for llama top-k decoding.')
+    if args.model_family == 'llada' and args.mode == 'monte-carlo' and args.temperature > 0 and args.decoding_scheme == 'top_k':
+        # Kept for CLI compatibility: llada Monte Carlo with temperature ignores decoding scheme and k.
+        pass
 
 
 def _quantile(sorted_vals: List[float], q: float) -> float:
@@ -95,8 +107,7 @@ def main() -> None:
     if args.model_name is None:
         args.model_name = DEFAULT_LLADA_MODEL if args.model_family == 'llada' else DEFAULT_LLAMA_MODEL
 
-    if args.model_family == 'llama' and args.mode != 'exact':
-        raise ValueError("--mode must be 'exact' when --model-family llama.")
+    _validate_args(args)
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
