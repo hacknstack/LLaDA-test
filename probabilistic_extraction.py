@@ -342,12 +342,12 @@ def compute_probabilistic_extraction(
     mask_id: int = 126336,
     remasking: str = 'low-confidence',
     estimation_method: str = 'exact',
-    num_samples: int = 1000,
+    num_samples: int = 20,
     seed: Optional[int] = None,
     model_family: str = 'llada',
     decoding_scheme: str = 'top_k',
     k: int = 40,
-    temperature: float = 1.0,
+    temperature: float = 0.0,
     return_token_details: bool = False,
 ):
     """
