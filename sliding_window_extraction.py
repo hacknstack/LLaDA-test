@@ -43,7 +43,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seed', type=int, default=None, help='Optional Monte Carlo seed')
     parser.add_argument('--decoding-scheme', choices=['top_k', 'greedy'], default='top_k')
     parser.add_argument('--k', type=int, default=40, help='Top-k value when --model-family llama and --decoding-scheme top_k')
-    parser.add_argument('--temperature', type=float, default=0.0, help='Temperature when --model-family llama and --decoding-scheme top_k')
+    parser.add_argument('--temperature', type=float, default=0.0, help='Temperature for llama top-k decoding and llada target-token-confidence remasking')
+    parser.add_argument('--remasking', choices=['low-confidence', 'target-token-confidence'], default='low-confidence',
+                        help='Remasking strategy when --model-family llada')
     return parser.parse_args()
 
 
@@ -82,7 +84,7 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
         steps=len(suffix_ids),
         attention_mask=None,
         mask_id=MASK_ID,
-        remasking='low-confidence',
+        remasking=args.remasking,
         estimation_method=args.mode,
         num_samples=args.num_samples,
         seed=args.seed,
@@ -107,6 +109,13 @@ def main() -> None:
 
     if args.model_family == 'llama' and args.mode != 'exact':
         raise ValueError("--mode must be 'exact' when --model-family llama.")
+    if args.model_family == 'llama' and args.remasking != 'low-confidence':
+        raise ValueError("--remasking is only used when --model-family llada.")
+    if args.model_family == 'llada' and args.remasking == 'target-token-confidence':
+        if args.mode != 'exact':
+            raise ValueError("--mode must be 'exact' when --remasking target-token-confidence.")
+        if args.temperature <= 0:
+            raise ValueError("--temperature must be > 0 when --remasking target-token-confidence.")
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -216,6 +225,7 @@ def main() -> None:
             'mode': args.mode,
             'model_family': args.model_family,
             'model_name': args.model_name,
+            'remasking': args.remasking,
             'decoding_scheme': args.decoding_scheme,
             'k': args.k,
             'temperature': args.temperature,

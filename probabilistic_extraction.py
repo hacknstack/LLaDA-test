@@ -18,8 +18,11 @@ class MonteCarloResult:
 
 
 def _validate_common_args(remasking: str, estimation_method: str) -> None:
-    if remasking != 'low-confidence':
-        raise NotImplementedError('Only low-confidence remasking is currently supported.')
+    allowed_remasking = {'low-confidence', 'target-token-confidence'}
+    if remasking not in allowed_remasking:
+        raise NotImplementedError(
+            f"Unsupported remasking strategy: {remasking!r}. Supported strategies: {sorted(allowed_remasking)}"
+        )
     if estimation_method not in {'exact', 'monte-carlo'}:
         raise ValueError("estimation_method must be one of {'exact', 'monte-carlo'}")
 
@@ -179,6 +182,51 @@ def _exact_probability(
 
     final_state = tuple([False] * suffix_len)
     return float(state_prob.get(final_state, 0.0))
+
+
+@torch.no_grad()
+def _exact_probability_target_token_confidence(
+    model,
+    prompt_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    temperature: float,
+) -> Dict[str, float]:
+    if temperature <= 0:
+        raise ValueError('temperature must be > 0 for remasking="target-token-confidence".')
+
+    device = _model_device(model)
+    prompt_tokens = prompt_tokens.to(device)
+    target_tokens = target_tokens.to(device)
+
+    suffix_len = target_tokens.shape[1]
+    prompt_len = prompt_tokens.shape[1]
+    attn = _suffix_attention_mask(attention_mask, suffix_len, device)
+
+    suffix = torch.full((suffix_len,), mask_id, dtype=torch.long, device=device)
+    logp = 0.0
+
+    for _ in range(steps):
+        x = torch.cat([prompt_tokens[0], suffix], dim=0).unsqueeze(0)
+        logits = model(x, attention_mask=attn).logits[0]
+        probs = F.softmax(logits / temperature, dim=-1)
+
+        masked_positions = (suffix == mask_id).nonzero(as_tuple=False).squeeze(-1)
+        candidate_probs = probs[prompt_len + masked_positions, target_tokens[0, masked_positions]]
+
+        best_idx = int(torch.argmax(candidate_probs).item())
+        chosen_suffix_pos = int(masked_positions[best_idx].item())
+        selected_prob = float(candidate_probs[best_idx].item())
+
+        logp += math.log(selected_prob)
+        suffix[chosen_suffix_pos] = target_tokens[0, chosen_suffix_pos]
+
+    return {
+        'probability': float(math.exp(logp)),
+        'log_probability': float(logp),
+    }
 
 
 @torch.no_grad()
@@ -453,7 +501,7 @@ def compute_diffusion_probabilistic_extraction(
     steps:
         Number of sampling steps N.
     remasking:
-        String selector. Currently only 'low-confidence'.
+        String selector. Supported: 'low-confidence' and 'target-token-confidence'.
     estimation_method:
         'exact' (branching over tie-breaks) or 'monte-carlo'.
     num_samples:
@@ -476,6 +524,29 @@ def compute_diffusion_probabilistic_extraction(
         raise ValueError('steps must be > 0.')
     if target_tokens.shape[1] < steps:
         raise ValueError('steps must be <= target suffix length for this scheduler.')
+
+    if remasking == 'target-token-confidence':
+        if estimation_method != 'exact':
+            raise ValueError('remasking="target-token-confidence" only supports estimation_method="exact".')
+        if temperature <= 0:
+            raise ValueError('temperature must be > 0 for remasking="target-token-confidence".')
+
+        result = _exact_probability_target_token_confidence(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            steps=steps,
+            attention_mask=attention_mask,
+            mask_id=mask_id,
+            temperature=temperature,
+        )
+        return {
+            'method': 'exact',
+            'probability': result['probability'],
+            'log_probability': result['log_probability'],
+            'remasking': 'target-token-confidence',
+            'temperature': temperature,
+        }
 
     if estimation_method == 'exact':
         return {
