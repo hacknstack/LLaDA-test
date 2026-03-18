@@ -11,7 +11,10 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
-from probabilistic_extraction import compute_probabilistic_extraction
+from probabilistic_extraction import (
+    compute_autoregressive_probabilistic_extraction,
+    compute_diffusion_probabilistic_extraction,
+)
 
 
 DEFAULT_LLADA_MODEL = 'GSAI-ML/LLaDA-8B-Base'
@@ -60,7 +63,19 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
     prompt_tokens = torch.tensor([prefix_ids], dtype=torch.long)
     target_tokens = torch.tensor([suffix_ids], dtype=torch.long)
 
-    result = compute_probabilistic_extraction(
+    if args.model_family == 'llama':
+        result = compute_autoregressive_probabilistic_extraction(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            attention_mask=None,
+            decoding_scheme=args.decoding_scheme,
+            k=args.k,
+            temperature=args.temperature,
+        )
+        return float(result['probability'])
+
+    result = compute_diffusion_probabilistic_extraction(
         model=model,
         prompt_tokens=prompt_tokens,
         target_tokens=target_tokens,
@@ -71,14 +86,9 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
         estimation_method=args.mode,
         num_samples=args.num_samples,
         seed=args.seed,
-        model_family=args.model_family,
-        decoding_scheme=args.decoding_scheme,
-        k=args.k,
         temperature=args.temperature,
     )
 
-    if args.model_family == 'llama':
-        return float(result['probability'])
     if args.mode == 'exact':
         return float(result['probability'])
     return float(result['estimate'])
