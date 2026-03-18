@@ -425,7 +425,7 @@ def _autoregressive_probability(
 
 
 @torch.no_grad()
-def compute_probabilistic_extraction(
+def compute_diffusion_probabilistic_extraction(
     model,
     prompt_tokens: torch.Tensor,
     target_tokens: torch.Tensor,
@@ -437,10 +437,7 @@ def compute_probabilistic_extraction(
     num_samples: int = 20,
     seed: Optional[int] = None,
     model_family: str = 'llada',
-    decoding_scheme: str = 'top_k',
-    k: int = 40,
     temperature: float = 0.0,
-    return_token_details: bool = False,
 ):
     """
     Compute probabilistic extraction under LLaDA Algorithm-5 style low-confidence remasking.
@@ -470,21 +467,8 @@ def compute_probabilistic_extraction(
         raise ValueError('target_tokens must have shape (1, j).')
 
     model_family = model_family.lower()
-
-    if model_family == 'llama':
-        return _autoregressive_probability(
-            model=model,
-            prompt_tokens=prompt_tokens,
-            target_tokens=target_tokens,
-            attention_mask=attention_mask,
-            decoding_scheme=decoding_scheme,
-            k=k,
-            temperature=temperature,
-            return_token_details=return_token_details,
-        )
-
     if model_family != 'llada':
-        raise ValueError("model_family must be one of {'llada', 'llama'}")
+        raise ValueError('compute_diffusion_probabilistic_extraction only supports model_family="llada".')
 
     _validate_common_args(remasking=remasking, estimation_method=estimation_method)
 
@@ -538,3 +522,85 @@ def compute_probabilistic_extraction(
         'hits': mc.hits,
         'num_samples': mc.num_samples,
     }
+
+
+@torch.no_grad()
+def compute_autoregressive_probabilistic_extraction(
+    model,
+    prompt_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    model_family: str = 'llama',
+    decoding_scheme: str = 'top_k',
+    k: int = 40,
+    temperature: float = 0.0,
+    return_token_details: bool = False,
+):
+    if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
+        raise ValueError('prompt_tokens must have shape (1, a).')
+    if target_tokens.ndim != 2 or target_tokens.shape[0] != 1:
+        raise ValueError('target_tokens must have shape (1, j).')
+
+    model_family = model_family.lower()
+    if model_family != 'llama':
+        raise ValueError('compute_autoregressive_probabilistic_extraction only supports model_family="llama".')
+
+    return _autoregressive_probability(
+        model=model,
+        prompt_tokens=prompt_tokens,
+        target_tokens=target_tokens,
+        attention_mask=attention_mask,
+        decoding_scheme=decoding_scheme,
+        k=k,
+        temperature=temperature,
+        return_token_details=return_token_details,
+    )
+
+
+@torch.no_grad()
+def compute_probabilistic_extraction(
+    model,
+    prompt_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    steps: int,
+    attention_mask: Optional[torch.Tensor] = None,
+    mask_id: int = 126336,
+    remasking: str = 'low-confidence',
+    estimation_method: str = 'exact',
+    num_samples: int = 20,
+    seed: Optional[int] = None,
+    model_family: str = 'llada',
+    decoding_scheme: str = 'top_k',
+    k: int = 40,
+    temperature: float = 0.0,
+    return_token_details: bool = False,
+):
+    model_family = model_family.lower()
+    if model_family == 'llama':
+        return compute_autoregressive_probabilistic_extraction(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            attention_mask=attention_mask,
+            model_family=model_family,
+            decoding_scheme=decoding_scheme,
+            k=k,
+            temperature=temperature,
+            return_token_details=return_token_details,
+        )
+    if model_family == 'llada':
+        return compute_diffusion_probabilistic_extraction(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            steps=steps,
+            attention_mask=attention_mask,
+            mask_id=mask_id,
+            remasking=remasking,
+            estimation_method=estimation_method,
+            num_samples=num_samples,
+            seed=seed,
+            model_family=model_family,
+            temperature=temperature,
+        )
+    raise ValueError("model_family must be one of {'llada', 'llama'}")
