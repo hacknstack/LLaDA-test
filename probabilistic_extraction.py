@@ -323,7 +323,19 @@ def _monte_carlo_probability_temperature(
     seed: Optional[int],
     temperature: float,
 ) -> MonteCarloResult:
+    device = _model_device(model)
+    prompt_tokens = prompt_tokens.to(device)
+    target_tokens = target_tokens.to(device)
+    suffix_len = target_tokens.shape[1]
+    attn = _suffix_attention_mask(attention_mask, suffix_len, device)
 
+    rng = torch.Generator(device=device)
+    if seed is not None:
+        rng.manual_seed(seed)
+
+    base = suffix_len // steps
+    rem = suffix_len % steps
+    schedule = [base + (1 if i < rem else 0) for i in range(steps)]
 
     hits = 0
 
