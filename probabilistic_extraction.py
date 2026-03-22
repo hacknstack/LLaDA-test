@@ -323,10 +323,61 @@ def _monte_carlo_probability_temperature(
     seed: Optional[int],
     temperature: float,
 ) -> MonteCarloResult:
+    if steps < 1:
+        raise ValueError('steps must be >= 1.')
+    if temperature <= 0:
+        raise ValueError('temperature must be > 0.')
 
+    device = _model_device(model)
+    prompt_tokens = prompt_tokens.to(device)
+    target_tokens = target_tokens.to(device)
+    suffix_len = target_tokens.shape[1]
+    prompt_len = prompt_tokens.shape[1]
+    attn = _suffix_attention_mask(attention_mask, suffix_len, device)
+
+    rng = torch.Generator(device=device.type)
+    if seed is not None:
+        rng.manual_seed(seed)
+
+    base = suffix_len // steps
+    rem = suffix_len % steps
+    schedule = [base + (1 if i < rem else 0) for i in range(steps)]
 
     hits = 0
 
+    for _ in range(num_samples):
+        suffix = torch.full((suffix_len,), mask_id, dtype=torch.long, device=device)
+
+        for step_idx in range(steps):
+            k_transfer = schedule[step_idx]
+            if k_transfer <= 0:
+                continue
+
+            x = torch.cat([prompt_tokens[0], suffix], dim=0).unsqueeze(0)
+            logits = model(x, attention_mask=attn).logits[0]
+
+            masked_positions = (suffix == mask_id).nonzero(as_tuple=False).squeeze(-1)
+            if masked_positions.numel() == 0:
+                break
+
+            masked_positions = masked_positions.to(torch.long)
+            k_transfer = min(k_transfer, int(masked_positions.numel()))
+
+            logits_with_noise = _add_gumbel_noise(logits, temperature=temperature, generator=rng)
+            x0 = torch.argmax(logits_with_noise, dim=-1)
+
+            probs = F.softmax(logits, dim=-1)
+            x0_p = torch.gather(probs, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+
+            masked_absolute_positions = prompt_len + masked_positions
+            masked_confidence = x0_p[masked_absolute_positions]
+            _, select_index = torch.topk(masked_confidence, k=k_transfer, dim=-1)
+            selected_suffix_pos = masked_positions[select_index]
+            selected_absolute_pos = prompt_len + selected_suffix_pos
+            suffix[selected_suffix_pos] = x0[selected_absolute_pos]
+
+        if torch.equal(suffix, target_tokens[0]):
+            hits += 1
 
     estimate, se, wald, wilson = _safe_wald_and_wilson(hits, num_samples)
     return MonteCarloResult(
