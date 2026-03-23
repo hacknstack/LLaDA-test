@@ -183,6 +183,8 @@ def _exact_probability_target_token_confidence(
     attention_mask: Optional[torch.Tensor],
     mask_id: int,
     temperature: float,
+    decoding_scheme: str,
+    k: int,
 ) -> Dict[str, float]:
     if temperature <= 0:
         raise ValueError('temperature must be > 0 for remasking="target-token-confidence".')
@@ -201,15 +203,38 @@ def _exact_probability_target_token_confidence(
     for _ in range(steps):
         x = torch.cat([prompt_tokens[0], suffix], dim=0).unsqueeze(0)
         logits = model(x, attention_mask=attn).logits[0]
-        probs = F.softmax(logits / temperature, dim=-1)
 
         masked_positions = (suffix == mask_id).nonzero(as_tuple=False).squeeze(-1)
-        candidate_probs = probs[prompt_len + masked_positions, target_tokens[0, masked_positions]]
+        candidate_probs: List[float] = []
+        for pos in masked_positions.tolist():
+            target_id = int(target_tokens[0, pos].item())
+            scaled_logits = logits[prompt_len + pos] / temperature
 
-        best_idx = int(torch.argmax(candidate_probs).item())
+            if decoding_scheme == 'top_k':
+                top_k = min(k, scaled_logits.shape[-1])
+                topk_vals, topk_idx = torch.topk(scaled_logits, k=top_k, dim=-1)
+                in_topk = bool((topk_idx == target_id).any().item())
+                if in_topk:
+                    selected_logit = scaled_logits[target_id]
+                    log_denom = torch.logsumexp(topk_vals, dim=-1)
+                    prob = float(torch.exp(selected_logit - log_denom).item())
+                else:
+                    prob = 0.0
+            else:
+                prob = float(F.softmax(scaled_logits, dim=-1)[target_id].item())
+
+            candidate_probs.append(prob)
+        candidate_probs_t = torch.tensor(candidate_probs, device=device, dtype=logits.dtype)
+
+        best_idx = int(torch.argmax(candidate_probs_t).item())
         chosen_suffix_pos = int(masked_positions[best_idx].item())
-        selected_prob = float(candidate_probs[best_idx].item())
+        selected_prob = float(candidate_probs_t[best_idx].item())
 
+        if selected_prob == 0.0:
+            return {
+                'probability': 0.0,
+                'log_probability': float('-inf'),
+            }
         logp += math.log(selected_prob)
         suffix[chosen_suffix_pos] = target_tokens[0, chosen_suffix_pos]
 
@@ -554,6 +579,8 @@ def compute_diffusion_probabilistic_extraction(
             attention_mask=attention_mask,
             mask_id=mask_id,
             temperature=temperature,
+            decoding_scheme=decoding_scheme,
+            k=k,
         )
         return {
             'method': 'exact',
@@ -561,7 +588,8 @@ def compute_diffusion_probabilistic_extraction(
             'log_probability': result['log_probability'],
             'remasking': 'target-token-confidence',
             'temperature': temperature,
-            'decoding_scheme': 'full',
+            'decoding_scheme': decoding_scheme,
+            'k': k if decoding_scheme == 'top_k' else None,
         }
 
     if estimation_method == 'exact':
