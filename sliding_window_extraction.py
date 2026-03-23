@@ -136,8 +136,6 @@ def main() -> None:
             raise ValueError("--mode must be 'exact' when --remasking target-token-confidence.")
         if args.temperature <= 0:
             raise ValueError("--temperature must be > 0 when --remasking target-token-confidence.")
-        if decoding_scheme != 'full':
-            raise ValueError("--decoding-scheme must be 'full' when --remasking target-token-confidence.")
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
