@@ -85,16 +85,6 @@ def _safe_wald_and_wilson(hits: int, n: int, z: float = 1.96) -> Tuple[float, fl
     return p, se, wald, wilson
 
 
-def _add_gumbel_noise(logits: torch.Tensor, temperature: float, generator: Optional[torch.Generator] = None) -> torch.Tensor:
-    if temperature == 0:
-        return logits
-    logits = logits.to(torch.float64)
-    noise = torch.rand(logits.shape, dtype=torch.float64, device=logits.device, generator=generator)
-    gumbel_noise = (-torch.log(noise)) ** temperature
-    return logits.exp() / gumbel_noise
-
-
-
 def _model_device(model) -> torch.device:
     if hasattr(model, 'device'):
         return model.device
@@ -322,6 +312,8 @@ def _monte_carlo_probability_temperature(
     num_samples: int,
     seed: Optional[int],
     temperature: float,
+    decoding_scheme: str,
+    k: int,
 ) -> MonteCarloResult:
     device = _model_device(model)
     prompt_tokens = prompt_tokens.to(device)
@@ -353,21 +345,35 @@ def _monte_carlo_probability_temperature(
             masked_positions = (suffix == mask_id).nonzero(as_tuple=False).squeeze(-1).tolist()
             k_transfer = schedule[step_idx]
 
-            sample_logits = _add_gumbel_noise(logits, temperature=temperature, generator=rng)
-            x0 = torch.argmax(sample_logits, dim=-1)
-
             probs = F.softmax(logits, dim=-1)
-            x0_p = torch.gather(probs, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+            x0 = torch.full((logits.shape[0],), -1, dtype=torch.long, device=device)
+            chosen_prob = torch.zeros((logits.shape[0],), dtype=probs.dtype, device=device)
 
-            confidence = torch.full_like(x0_p, float('-inf'))
-            confidence[prompt_tokens.shape[1]:] = torch.where(
-                suffix == mask_id,
-                x0_p[prompt_tokens.shape[1]:],
-                torch.full((suffix_len,), float('-inf'), dtype=x0_p.dtype, device=device),
+            for p in masked_positions:
+                token_logits = logits[prompt_tokens.shape[1] + p]
+                scaled_logits = token_logits / temperature
+
+                if decoding_scheme == 'top_k':
+                    top_k = min(k, scaled_logits.shape[-1])
+                    candidate_logits, candidate_idx = torch.topk(scaled_logits, k=top_k, dim=-1)
+                else:
+                    candidate_logits = scaled_logits
+                    candidate_idx = torch.arange(scaled_logits.shape[-1], device=device)
+
+                candidate_probs = F.softmax(candidate_logits, dim=-1)
+                sampled_local = int(torch.multinomial(candidate_probs, 1, generator=rng).item())
+                sampled_token = int(candidate_idx[sampled_local].item())
+
+                x0[prompt_tokens.shape[1] + p] = sampled_token
+                chosen_prob[prompt_tokens.shape[1] + p] = probs[prompt_tokens.shape[1] + p, sampled_token]
+
+            masked_confidence = torch.tensor(
+                [chosen_prob[prompt_tokens.shape[1] + p].item() for p in masked_positions],
+                dtype=chosen_prob.dtype,
+                device=device,
             )
-
-            _, selected = torch.topk(confidence, k=k_transfer)
-            selected_suffix_positions = (selected - prompt_tokens.shape[1]).tolist()
+            top_pos_idx = torch.topk(masked_confidence, k=k_transfer).indices.tolist()
+            selected_suffix_positions = [masked_positions[i] for i in top_pos_idx]
 
             for p in selected_suffix_positions:
                 chosen = int(x0[prompt_tokens.shape[1] + p].item())
@@ -410,12 +416,12 @@ def _autoregressive_probability(
 
     if prompt_tokens.shape[1] == 0:
         raise ValueError('For model_family="llama", prompt_tokens must contain at least one token.')
-    if decoding_scheme not in {'top_k', 'greedy'}:
-        raise ValueError("decoding_scheme must be one of {'top_k', 'greedy'} for model_family='llama'.")
+    if decoding_scheme not in {'top_k', 'full', 'greedy'}:
+        raise ValueError("decoding_scheme must be one of {'top_k', 'full', 'greedy'} for model_family='llama'.")
     if decoding_scheme == 'top_k' and k <= 0:
         raise ValueError('k must be > 0 when decoding_scheme="top_k".')
-    if decoding_scheme == 'top_k' and temperature <= 0:
-        raise ValueError('temperature must be > 0 when decoding_scheme="top_k".')
+    if decoding_scheme in {'top_k', 'full'} and temperature <= 0:
+        raise ValueError('temperature must be > 0 when decoding_scheme is "top_k" or "full".')
 
     full_tokens = torch.cat([prompt_tokens, target_tokens], dim=1)
     full_attention_mask = _suffix_attention_mask(attention_mask, target_tokens.shape[1], device)
@@ -433,7 +439,7 @@ def _autoregressive_probability(
         if decoding_scheme == 'greedy':
             greedy_id = int(torch.argmax(pred_logits).item())
             step_prob = 1.0 if greedy_id == target_id else 0.0
-        else:
+        elif decoding_scheme == 'top_k':
             scaled_logits = pred_logits / temperature
             top_k = min(k, scaled_logits.shape[-1])
             topk_vals, topk_idx = torch.topk(scaled_logits, k=top_k, dim=-1)
@@ -444,6 +450,9 @@ def _autoregressive_probability(
                 step_prob = float(torch.exp(selected_logit - log_denom).item())
             else:
                 step_prob = 0.0
+        else:
+            scaled_logits = pred_logits / temperature
+            step_prob = float(F.softmax(scaled_logits, dim=-1)[target_id].item())
 
         if step_prob == 0.0:
             total_prob_zero = True
@@ -485,6 +494,8 @@ def compute_diffusion_probabilistic_extraction(
     num_samples: int = 20,
     seed: Optional[int] = None,
     model_family: str = 'llada',
+    decoding_scheme: str = 'full',
+    k: int = 40,
     temperature: float = 0.0,
 ):
     """
@@ -517,6 +528,10 @@ def compute_diffusion_probabilistic_extraction(
     model_family = model_family.lower()
     if model_family != 'llada':
         raise ValueError('compute_diffusion_probabilistic_extraction only supports model_family="llada".')
+    if decoding_scheme not in {'full', 'top_k'}:
+        raise ValueError("decoding_scheme must be one of {'full', 'top_k'} for model_family='llada'.")
+    if decoding_scheme == 'top_k' and k <= 0:
+        raise ValueError('k must be > 0 when decoding_scheme="top_k".')
 
     _validate_common_args(remasking=remasking, estimation_method=estimation_method)
 
@@ -546,6 +561,7 @@ def compute_diffusion_probabilistic_extraction(
             'log_probability': result['log_probability'],
             'remasking': 'target-token-confidence',
             'temperature': temperature,
+            'decoding_scheme': 'full',
         }
 
     if estimation_method == 'exact':
@@ -572,6 +588,8 @@ def compute_diffusion_probabilistic_extraction(
             num_samples=num_samples,
             seed=seed,
             temperature=temperature,
+            decoding_scheme=decoding_scheme,
+            k=k,
         )
     else:
         mc = _monte_carlo_probability(
@@ -592,6 +610,8 @@ def compute_diffusion_probabilistic_extraction(
         'wilson_ci': mc.wilson_ci,
         'hits': mc.hits,
         'num_samples': mc.num_samples,
+        'decoding_scheme': decoding_scheme,
+        'k': k if decoding_scheme == 'top_k' else None,
     }
 
 
@@ -641,25 +661,27 @@ def compute_probabilistic_extraction(
     num_samples: int = 20,
     seed: Optional[int] = None,
     model_family: str = 'llada',
-    decoding_scheme: str = 'top_k',
+    decoding_scheme: str = 'auto',
     k: int = 40,
     temperature: float = 0.0,
     return_token_details: bool = False,
 ):
     model_family = model_family.lower()
     if model_family == 'llama':
+        ar_decoding_scheme = 'top_k' if decoding_scheme == 'auto' else decoding_scheme
         return compute_autoregressive_probabilistic_extraction(
             model=model,
             prompt_tokens=prompt_tokens,
             target_tokens=target_tokens,
             attention_mask=attention_mask,
             model_family=model_family,
-            decoding_scheme=decoding_scheme,
+            decoding_scheme=ar_decoding_scheme,
             k=k,
             temperature=temperature,
             return_token_details=return_token_details,
         )
     if model_family == 'llada':
+        diffusion_decoding_scheme = 'full' if decoding_scheme == 'auto' else decoding_scheme
         return compute_diffusion_probabilistic_extraction(
             model=model,
             prompt_tokens=prompt_tokens,
@@ -672,6 +694,8 @@ def compute_probabilistic_extraction(
             num_samples=num_samples,
             seed=seed,
             model_family=model_family,
+            decoding_scheme=diffusion_decoding_scheme,
+            k=k,
             temperature=temperature,
         )
     raise ValueError("model_family must be one of {'llada', 'llama'}")
