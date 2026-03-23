@@ -41,9 +41,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--model-name', type=str, default=None)
     parser.add_argument('--num-samples', type=int, default=20, help='Monte Carlo samples when --mode monte-carlo')
     parser.add_argument('--seed', type=int, default=None, help='Optional Monte Carlo seed')
-    parser.add_argument('--decoding-scheme', choices=['top_k', 'greedy'], default='top_k')
-    parser.add_argument('--k', type=int, default=40, help='Top-k value when --model-family llama and --decoding-scheme top_k')
-    parser.add_argument('--temperature', type=float, default=0.0, help='Temperature for llama top-k decoding and llada target-token-confidence remasking')
+    parser.add_argument('--decoding-scheme', choices=['auto', 'full', 'top_k', 'greedy'], default='auto')
+    parser.add_argument('--k', type=int, default=40, help='Top-k value when --decoding-scheme top_k')
+    parser.add_argument('--temperature', type=float, default=0.0, help='Temperature for non-greedy llama decoding and llada target-token-confidence remasking')
     parser.add_argument('--remasking', choices=['low-confidence', 'target-token-confidence'], default='low-confidence',
                         help='Remasking strategy when --model-family llada')
     return parser.parse_args()
@@ -61,9 +61,16 @@ def _quantile(sorted_vals: List[float], q: float) -> float:
     return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
 
 
+def _resolve_decoding_scheme(args: argparse.Namespace) -> str:
+    if args.decoding_scheme != 'auto':
+        return args.decoding_scheme
+    return 'full' if args.model_family == 'llada' else 'top_k'
+
+
 def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], args: argparse.Namespace) -> float:
     prompt_tokens = torch.tensor([prefix_ids], dtype=torch.long)
     target_tokens = torch.tensor([suffix_ids], dtype=torch.long)
+    decoding_scheme = _resolve_decoding_scheme(args)
 
     if args.model_family == 'llama':
         result = compute_autoregressive_probabilistic_extraction(
@@ -71,7 +78,7 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
             prompt_tokens=prompt_tokens,
             target_tokens=target_tokens,
             attention_mask=None,
-            decoding_scheme=args.decoding_scheme,
+            decoding_scheme=decoding_scheme,
             k=args.k,
             temperature=args.temperature,
         )
@@ -88,6 +95,8 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
         estimation_method=args.mode,
         num_samples=args.num_samples,
         seed=args.seed,
+        decoding_scheme=decoding_scheme,
+        k=args.k,
         temperature=args.temperature,
     )
 
@@ -111,11 +120,24 @@ def main() -> None:
         raise ValueError("--mode must be 'exact' when --model-family llama.")
     if args.model_family == 'llama' and args.remasking != 'low-confidence':
         raise ValueError("--remasking is only used when --model-family llada.")
+    decoding_scheme = _resolve_decoding_scheme(args)
+    if args.model_family == 'llama':
+        if decoding_scheme not in {'top_k', 'full', 'greedy'}:
+            raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'greedy'} when --model-family llama.")
+        if decoding_scheme in {'top_k', 'full'} and args.temperature <= 0:
+            raise ValueError("--temperature must be > 0 when --model-family llama with --decoding-scheme in {'top_k', 'full'}.")
+    else:
+        if decoding_scheme not in {'top_k', 'full'}:
+            raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full'} when --model-family llada.")
+    if decoding_scheme == 'top_k' and args.k <= 0:
+        raise ValueError("--k must be > 0 when --decoding-scheme top_k.")
     if args.model_family == 'llada' and args.remasking == 'target-token-confidence':
         if args.mode != 'exact':
             raise ValueError("--mode must be 'exact' when --remasking target-token-confidence.")
         if args.temperature <= 0:
             raise ValueError("--temperature must be > 0 when --remasking target-token-confidence.")
+        if decoding_scheme != 'full':
+            raise ValueError("--decoding-scheme must be 'full' when --remasking target-token-confidence.")
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -226,7 +248,7 @@ def main() -> None:
             'model_family': args.model_family,
             'model_name': args.model_name,
             'remasking': args.remasking,
-            'decoding_scheme': args.decoding_scheme,
+            'decoding_scheme': decoding_scheme,
             'k': args.k,
             'temperature': args.temperature,
         },
