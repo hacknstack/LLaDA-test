@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/AssassinationAliKhamenei.txt",
+  "total_chars": 7640,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_chars": 10,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llama",
+    "model_name": "NousResearch/Meta-Llama-3-8B",
+    "remasking": "low-confidence",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 714,
+  "num_windows_scored": 714,
+  "num_windows_extracted": 0,
+  "extraction_rate": 0.0,
+  "p_z_distribution": {
+    "min": 4.060658493205441e-72,
+    "median": 1.4080895802516423e-46,
+    "mean": 4.240741314930308e-26,
+    "max": 2.991198836240991e-23,
+    "q_0.9": 6.747702700007113e-36,
+    "q_0.99": 7.808410016065448e-28,
+    "q_0.999": 8.813024813784971e-24
+  }
+}
