@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
+from get_log_likelihood import get_log_likelihood
 
 
 @dataclass
@@ -89,6 +90,34 @@ def _model_device(model) -> torch.device:
     if hasattr(model, 'device'):
         return model.device
     return next(model.parameters()).device
+
+
+@torch.no_grad()
+def _elbo_probability(
+    model,
+    prompt_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    mask_id: int,
+) -> Dict[str, float]:
+    if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
+        raise ValueError('prompt_tokens must have shape (1, a).')
+    if target_tokens.ndim != 2 or target_tokens.shape[0] != 1:
+        raise ValueError('target_tokens must have shape (1, j).')
+
+    prompt_1d = prompt_tokens[0]
+    target_1d = target_tokens[0]
+    log_probability = float(
+        get_log_likelihood(
+            model=model,
+            prompt=prompt_1d,
+            answer=target_1d,
+            mask_id=mask_id,
+        )
+    )
+    return {
+        'probability': float(math.exp(log_probability)),
+        'log_probability': log_probability,
+    }
 
 
 @torch.no_grad()
@@ -553,10 +582,26 @@ def compute_diffusion_probabilistic_extraction(
     model_family = model_family.lower()
     if model_family != 'llada':
         raise ValueError('compute_diffusion_probabilistic_extraction only supports model_family="llada".')
-    if decoding_scheme not in {'full', 'top_k'}:
-        raise ValueError("decoding_scheme must be one of {'full', 'top_k'} for model_family='llada'.")
-    if decoding_scheme == 'top_k' and k <= 0:
+    normalized_decoding_scheme = decoding_scheme.lower()
+    if normalized_decoding_scheme not in {'full', 'top_k', 'elbo'}:
+        raise ValueError("decoding_scheme must be one of {'full', 'top_k', 'ELBO'} for model_family='llada'.")
+    if normalized_decoding_scheme == 'top_k' and k <= 0:
         raise ValueError('k must be > 0 when decoding_scheme="top_k".')
+
+    if normalized_decoding_scheme == 'elbo':
+        result = _elbo_probability(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            mask_id=mask_id,
+        )
+        return {
+            'method': 'elbo',
+            'probability': result['probability'],
+            'log_probability': result['log_probability'],
+            'remasking': remasking,
+            'decoding_scheme': 'ELBO',
+        }
 
     _validate_common_args(remasking=remasking, estimation_method=estimation_method)
 
