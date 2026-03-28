@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--model-name', type=str, default=None)
     parser.add_argument('--num-samples', type=int, default=20, help='Monte Carlo samples when --mode monte-carlo')
     parser.add_argument('--seed', type=int, default=None, help='Optional Monte Carlo seed')
-    parser.add_argument('--decoding-scheme', choices=['auto', 'full', 'top_k', 'greedy'], default='auto')
+    parser.add_argument('--decoding-scheme', choices=['auto', 'full', 'top_k', 'greedy', 'ELBO', 'elbo'], default='auto')
     parser.add_argument('--k', type=int, default=40, help='Top-k value when --decoding-scheme top_k')
     parser.add_argument('--temperature', type=float, default=0.0, help='Temperature for non-greedy llama decoding and llada target-token-confidence remasking')
     parser.add_argument('--remasking', choices=['low-confidence', 'target-token-confidence'], default='low-confidence',
@@ -100,7 +100,7 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
         temperature=args.temperature,
     )
 
-    if args.mode == 'exact':
+    if args.mode == 'exact' or str(decoding_scheme).lower() == 'elbo':
         return float(result['probability'])
     return float(result['estimate'])
 
@@ -127,8 +127,8 @@ def main() -> None:
         if decoding_scheme in {'top_k', 'full'} and args.temperature <= 0:
             raise ValueError("--temperature must be > 0 when --model-family llama with --decoding-scheme in {'top_k', 'full'}.")
     else:
-        if decoding_scheme not in {'top_k', 'full'}:
-            raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full'} when --model-family llada.")
+        if decoding_scheme.lower() not in {'top_k', 'full', 'elbo'}:
+            raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'ELBO'} when --model-family llada.")
     if decoding_scheme == 'top_k' and args.k <= 0:
         raise ValueError("--k must be > 0 when --decoding-scheme top_k.")
     if args.model_family == 'llada' and args.remasking == 'target-token-confidence':
