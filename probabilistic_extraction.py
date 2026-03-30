@@ -106,16 +106,15 @@ def _elbo_probability(
 
     prompt_1d = prompt_tokens[0]
     target_1d = target_tokens[0]
-    log_probability = float(
-        get_log_likelihood(
-            model=model,
-            prompt=prompt_1d,
-            answer=target_1d,
-            mask_id=mask_id,
-        )
+    log_probability = 
+    get_log_likelihood(
+        model=model,
+        prompt=prompt_1d,
+        answer=target_1d,
+        mask_id=mask_id,
     )
     return {
-        'probability': float(math.exp(log_probability)),
+        'probability': math.exp(log_probability),
         'log_probability': log_probability,
     }
 
