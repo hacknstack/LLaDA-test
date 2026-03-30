@@ -106,8 +106,7 @@ def _elbo_probability(
 
     prompt_1d = prompt_tokens[0]
     target_1d = target_tokens[0]
-    log_probability = 
-    get_log_likelihood(
+    log_probability = get_log_likelihood(
         model=model,
         prompt=prompt_1d,
         answer=target_1d,
