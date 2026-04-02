@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/BeeMovie.txt",
+  "total_chars": 49474,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_chars": 10,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llama",
+    "model_name": "NousResearch/Meta-Llama-3-8B",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 4909,
+  "num_windows_scored": 4909,
+  "num_windows_extracted": 0,
+  "extraction_rate": 0.0,
+  "p_z_distribution": {
+    "min": 0.0,
+    "median": 0.0,
+    "mean": 9.912752541805538e-08,
+    "max": 0.0003000852377372596,
+    "q_0.9": 2.1476859055758455e-17,
+    "q_0.99": 1.7720628540020768e-08,
+    "q_0.999": 1.7449808052442424e-05
+  }
+}
