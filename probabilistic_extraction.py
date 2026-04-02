@@ -19,13 +19,13 @@ class MonteCarloResult:
 
 
 def _validate_common_args(remasking: str, estimation_method: str) -> None:
-    allowed_remasking = {'low-confidence', 'target-token-confidence'}
+    allowed_remasking = {'low-confidence', 'target-token-confidence', 'random'}
     if remasking not in allowed_remasking:
         raise NotImplementedError(
             f"Unsupported remasking strategy: {remasking!r}. Supported strategies: {sorted(allowed_remasking)}"
         )
-    if estimation_method not in {'exact', 'monte-carlo'}:
-        raise ValueError("estimation_method must be one of {'exact', 'monte-carlo'}")
+    if estimation_method not in {'exact', 'monte-carlo', 'path_sampling'}:
+        raise ValueError("estimation_method must be one of {'exact', 'monte-carlo', 'path_sampling'}")
 
 
 def _suffix_attention_mask(prompt_attention_mask: Optional[torch.Tensor], suffix_len: int, device: torch.device) -> Optional[torch.Tensor]:
@@ -452,6 +452,104 @@ def _monte_carlo_probability_temperature(
 
 
 @torch.no_grad()
+def _path_sampling_random_probability(
+    model,
+    prompt_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    num_samples: int,
+    seed: Optional[int],
+    decoding_scheme: str,
+    k: int,
+    temperature: float,
+) -> Dict[str, object]:
+    device = _model_device(model)
+    prompt_tokens = prompt_tokens.to(device)
+    target_tokens = target_tokens.to(device)
+    suffix_len = target_tokens.shape[1]
+    prompt_len = prompt_tokens.shape[1]
+    attn = _suffix_attention_mask(attention_mask, suffix_len, device)
+
+    rng = torch.Generator(device='cpu')
+    if seed is not None:
+        rng.manual_seed(seed)
+
+    base = suffix_len // steps
+    rem = suffix_len % steps
+    schedule = [base + (1 if i < rem else 0) for i in range(steps)]
+
+    sample_log_probabilities: List[float] = []
+    sample_probabilities: List[float] = []
+    for sample_idx in range(num_samples):
+        suffix = torch.full((suffix_len,), mask_id, dtype=torch.long, device=device)
+        log_path_probability = 0.0
+        path_is_zero = False
+
+        permutation = torch.randperm(suffix_len, generator=rng).tolist()
+        start = 0
+        for step_size in schedule:
+            reveal_positions = permutation[start:start + step_size]
+            start += step_size
+
+            x = torch.cat([prompt_tokens[0], suffix], dim=0).unsqueeze(0)
+            logits = model(x, attention_mask=attn).logits[0]
+
+            for p in reveal_positions:
+                token_logits = logits[prompt_len + p]
+                scaled_logits = token_logits if temperature <= 0 else (token_logits / temperature)
+                target_id = int(target_tokens[0, p].item())
+
+                if decoding_scheme == 'top_k':
+                    top_k = min(k, scaled_logits.shape[-1])
+                    topk_vals, topk_idx = torch.topk(scaled_logits, k=top_k, dim=-1)
+                    in_topk = bool((topk_idx == target_id).any().item())
+                    if in_topk:
+                        selected_logit = scaled_logits[target_id]
+                        log_denom = torch.logsumexp(topk_vals, dim=-1)
+                        step_prob = float(torch.exp(selected_logit - log_denom).item())
+                    else:
+                        step_prob = 0.0
+                else:
+                    step_prob = float(F.softmax(scaled_logits, dim=-1)[target_id].item())
+
+                if step_prob == 0.0:
+                    path_is_zero = True
+                    log_path_probability = float('-inf')
+                elif not path_is_zero:
+                    log_path_probability += math.log(step_prob)
+                suffix[p] = target_tokens[0, p]
+
+        sample_log_probabilities.append(log_path_probability)
+        path_probability = 0.0 if path_is_zero else float(math.exp(log_path_probability))
+        sample_probabilities.append(path_probability)
+        print(
+            f"[path_sampling] sample={sample_idx} "
+            f"log_probability={log_path_probability} probability={path_probability}"
+        )
+
+    if sample_log_probabilities:
+        finite_logs = [lp for lp in sample_log_probabilities if not math.isinf(lp)]
+        if not finite_logs:
+            average_probability = 0.0
+        else:
+            max_log = max(finite_logs)
+            scaled_sum = sum(math.exp(lp - max_log) for lp in finite_logs)
+            average_probability = float(math.exp(max_log) * (scaled_sum / len(sample_log_probabilities)))
+    else:
+        average_probability = 0.0
+    print(f"[path_sampling] average_probability={average_probability}")
+
+    return {
+        'probability': average_probability,
+        'sample_probabilities': sample_probabilities,
+        'num_samples': num_samples,
+        'estimation_method': 'path_sampling',
+    }
+
+
+@torch.no_grad()
 def _autoregressive_probability(
     model,
     prompt_tokens: torch.Tensor,
@@ -581,10 +679,12 @@ def compute_diffusion_probabilistic_extraction(
     if model_family != 'llada':
         raise ValueError('compute_diffusion_probabilistic_extraction only supports model_family="llada".')
     normalized_decoding_scheme = decoding_scheme.lower()
-    if normalized_decoding_scheme not in {'full', 'top_k', 'elbo'}:
-        raise ValueError("decoding_scheme must be one of {'full', 'top_k', 'ELBO'} for model_family='llada'.")
+    if normalized_decoding_scheme not in {'full', 'top_k', 'elbo', 'random'}:
+        raise ValueError("decoding_scheme must be one of {'full', 'top_k', 'ELBO', 'random'} for model_family='llada'.")
     if normalized_decoding_scheme == 'top_k' and k <= 0:
         raise ValueError('k must be > 0 when decoding_scheme="top_k".')
+    if normalized_decoding_scheme == 'random' and remasking != 'random':
+        raise ValueError('decoding_scheme="random" requires remasking="random".')
 
     if normalized_decoding_scheme == 'elbo':
         result = _elbo_probability(
@@ -633,6 +733,36 @@ def compute_diffusion_probabilistic_extraction(
             'temperature': temperature,
             'decoding_scheme': decoding_scheme,
             'k': k if decoding_scheme == 'top_k' else None,
+        }
+
+    if remasking == 'random':
+        if normalized_decoding_scheme not in {'random', 'top_k'}:
+            raise ValueError('remasking="random" requires decoding_scheme in {"random", "top_k"}.')
+        if estimation_method != 'path_sampling':
+            raise ValueError('remasking="random" only supports estimation_method="path_sampling".')
+        if num_samples <= 0:
+            raise ValueError('num_samples must be > 0 when estimation_method="path_sampling".')
+        path_sampling_result = _path_sampling_random_probability(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            steps=steps,
+            attention_mask=attention_mask,
+            mask_id=mask_id,
+            num_samples=num_samples,
+            seed=seed,
+            decoding_scheme=normalized_decoding_scheme,
+            k=k,
+            temperature=temperature,
+        )
+        return {
+            'method': 'path_sampling',
+            'probability': path_sampling_result['probability'],
+            'sample_probabilities': path_sampling_result['sample_probabilities'],
+            'num_samples': path_sampling_result['num_samples'],
+            'remasking': 'random',
+            'decoding_scheme': normalized_decoding_scheme,
+            'k': k if normalized_decoding_scheme == 'top_k' else None,
         }
 
     if estimation_method == 'exact':
