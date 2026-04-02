@@ -506,19 +506,18 @@ def _path_sampling_random_probability(
                     topk_vals, topk_idx = torch.topk(scaled_logits, k=top_k, dim=-1)
                     in_topk = bool((topk_idx == target_id).any().item())
                     if in_topk:
-                        selected_logit = scaled_logits[target_id]
-                        log_denom = torch.logsumexp(topk_vals, dim=-1)
-                        step_prob = float(torch.exp(selected_logit - log_denom).item())
+                        log_step_prob = float((scaled_logits[target_id] - torch.logsumexp(topk_vals, dim=-1)).item())
                     else:
-                        step_prob = 0.0
+                        log_step_prob = float('-inf')
                 else:
-                    step_prob = float(F.softmax(scaled_logits, dim=-1)[target_id].item())
+                    log_step_prob = float(F.log_softmax(scaled_logits, dim=-1)[target_id].item())
 
-                if step_prob == 0.0:
-                    path_is_zero = True
+                if math.isinf(log_step_prob) and log_step_prob < 0:
                     log_path_probability = float('-inf')
-                elif not path_is_zero:
-                    log_path_probability += math.log(step_prob)
+                    path_is_zero = True
+                    break
+                else:
+                    log_path_probability += log_step_prob
                 suffix[p] = target_tokens[0, p]
 
         sample_log_probabilities.append(log_path_probability)
