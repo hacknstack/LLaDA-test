@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
+from get_log_likelihood import get_log_likelihood
 
 
 @dataclass
@@ -17,14 +18,17 @@ class MonteCarloResult:
     num_samples: int
 
 
-def _validate_common_args(remasking: str, estimation_method: str) -> None:
+def _validate_common_args(remasking: str, estimation_method: str, allow_path_sampling: bool = False) -> None:
     allowed_remasking = {'low-confidence', 'target-token-confidence'}
     if remasking not in allowed_remasking:
         raise NotImplementedError(
             f"Unsupported remasking strategy: {remasking!r}. Supported strategies: {sorted(allowed_remasking)}"
         )
-    if estimation_method not in {'exact', 'monte-carlo'}:
-        raise ValueError("estimation_method must be one of {'exact', 'monte-carlo'}")
+    allowed_estimation = {'exact', 'monte-carlo'}
+    if allow_path_sampling:
+        allowed_estimation.add('path_sampling')
+    if estimation_method not in allowed_estimation:
+        raise ValueError(f"estimation_method must be one of {sorted(allowed_estimation)}")
 
 
 def _suffix_attention_mask(prompt_attention_mask: Optional[torch.Tensor], suffix_len: int, device: torch.device) -> Optional[torch.Tensor]:
@@ -89,6 +93,112 @@ def _model_device(model) -> torch.device:
     if hasattr(model, 'device'):
         return model.device
     return next(model.parameters()).device
+
+
+def _build_uniform_path(suffix_len: int, schedule: Sequence[int], rng: torch.Generator) -> List[List[int]]:
+    perm = torch.randperm(suffix_len, generator=rng, device='cpu').tolist()
+    out: List[List[int]] = []
+    cursor = 0
+    for k_transfer in schedule:
+        out.append(perm[cursor: cursor + k_transfer])
+        cursor += k_transfer
+    return out
+
+
+@torch.no_grad()
+def _elbo_probability(
+    model,
+    prompt_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    mask_id: int,
+) -> Dict[str, float]:
+    if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
+        raise ValueError('prompt_tokens must have shape (1, a).')
+    if target_tokens.ndim != 2 or target_tokens.shape[0] != 1:
+        raise ValueError('target_tokens must have shape (1, j).')
+
+    prompt_1d = prompt_tokens[0]
+    target_1d = target_tokens[0]
+    log_probability = float(
+        get_log_likelihood(
+            model=model,
+            prompt=prompt_1d,
+            answer=target_1d,
+            mask_id=mask_id,
+        )
+    )
+    return {
+        'probability': float(math.exp(log_probability)),
+        'log_probability': log_probability,
+    }
+
+
+@torch.no_grad()
+def _path_sampling_probability_random(
+    model,
+    prompt_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    num_samples: int,
+    seed: Optional[int],
+    temperature: float,
+) -> Dict[str, float]:
+    device = _model_device(model)
+    prompt_tokens = prompt_tokens.to(device)
+    target_tokens = target_tokens.to(device)
+    suffix_len = target_tokens.shape[1]
+    prompt_len = prompt_tokens.shape[1]
+    attn = _suffix_attention_mask(attention_mask, suffix_len, device)
+
+    if num_samples <= 0:
+        raise ValueError('num_samples must be > 0 for estimation_method="path_sampling".')
+
+    base = suffix_len // steps
+    rem = suffix_len % steps
+    schedule = [base + (1 if i < rem else 0) for i in range(steps)]
+
+    rng = torch.Generator(device='cpu')
+    if seed is not None:
+        rng.manual_seed(seed)
+
+    sample_probabilities: List[float] = []
+    for sample_idx in range(num_samples):
+        suffix = torch.full((suffix_len,), mask_id, dtype=torch.long, device=device)
+        sampled_path = _build_uniform_path(suffix_len=suffix_len, schedule=schedule, rng=rng)
+        sample_probability = 1.0
+
+        for selected_positions in sampled_path:
+            x = torch.cat([prompt_tokens[0], suffix], dim=0).unsqueeze(0)
+            logits = model(x, attention_mask=attn).logits[0]
+
+            for p in selected_positions:
+                target_id = int(target_tokens[0, p].item())
+                token_logits = logits[prompt_len + p]
+                scaled_logits = token_logits / temperature if temperature > 0 else token_logits
+                target_prob = float(F.softmax(scaled_logits, dim=-1)[target_id].item())
+                sample_probability *= target_prob
+                suffix[p] = target_tokens[0, p]
+
+        sample_probabilities.append(sample_probability)
+        print(f"[random/path_sampling] sample {sample_idx + 1}/{num_samples}: probability={sample_probability:.12e}")
+
+    probability_mean = float(sum(sample_probabilities) / len(sample_probabilities))
+    print(f"[random/path_sampling] average_probability={probability_mean:.12e}")
+
+    if probability_mean <= 0.0:
+        log_probability = float('-inf')
+    else:
+        log_probability = float(math.log(probability_mean))
+
+    return {
+        'method': 'path_sampling',
+        'estimate': probability_mean,
+        'probability': probability_mean,
+        'log_probability': log_probability,
+        'num_samples': num_samples,
+    }
 
 
 @torch.no_grad()
@@ -553,12 +663,44 @@ def compute_diffusion_probabilistic_extraction(
     model_family = model_family.lower()
     if model_family != 'llada':
         raise ValueError('compute_diffusion_probabilistic_extraction only supports model_family="llada".')
-    if decoding_scheme not in {'full', 'top_k'}:
-        raise ValueError("decoding_scheme must be one of {'full', 'top_k'} for model_family='llada'.")
-    if decoding_scheme == 'top_k' and k <= 0:
+    normalized_decoding_scheme = decoding_scheme.lower()
+    if normalized_decoding_scheme not in {'full', 'top_k', 'elbo', 'random'}:
+        raise ValueError("decoding_scheme must be one of {'full', 'top_k', 'ELBO', 'random'} for model_family='llada'.")
+    if normalized_decoding_scheme == 'top_k' and k <= 0:
         raise ValueError('k must be > 0 when decoding_scheme="top_k".')
 
-    _validate_common_args(remasking=remasking, estimation_method=estimation_method)
+    if normalized_decoding_scheme == 'elbo':
+        result = _elbo_probability(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            mask_id=mask_id,
+        )
+        return {
+            'method': 'elbo',
+            'probability': result['probability'],
+            'log_probability': result['log_probability'],
+            'remasking': remasking,
+            'decoding_scheme': 'ELBO',
+        }
+
+    if normalized_decoding_scheme == 'random':
+        _validate_common_args(remasking=remasking, estimation_method=estimation_method, allow_path_sampling=True)
+        if estimation_method != 'path_sampling':
+            raise ValueError('decoding_scheme="random" only supports estimation_method="path_sampling".')
+        return _path_sampling_probability_random(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            steps=steps,
+            attention_mask=attention_mask,
+            mask_id=mask_id,
+            num_samples=num_samples,
+            seed=seed,
+            temperature=temperature,
+        )
+
+    _validate_common_args(remasking=remasking, estimation_method=estimation_method, allow_path_sampling=False)
 
     if steps <= 0:
         raise ValueError('steps must be > 0.')
