@@ -524,10 +524,6 @@ def _path_sampling_random_probability(
         sample_log_probabilities.append(log_path_probability)
         path_probability = 0.0 if path_is_zero else float(math.exp(log_path_probability))
         sample_probabilities.append(path_probability)
-        print(
-            f"[path_sampling] sample={sample_idx} "
-            f"log_probability={log_path_probability} probability={path_probability}"
-        )
 
     if sample_log_probabilities:
         finite_logs = [lp for lp in sample_log_probabilities if not math.isinf(lp)]
@@ -539,7 +535,7 @@ def _path_sampling_random_probability(
             average_probability = float(math.exp(max_log) * (scaled_sum / len(sample_log_probabilities)))
     else:
         average_probability = 0.0
-    print(f"[path_sampling] average_probability={average_probability}")
+    print(f"[path_sampling] average_probability={average_probability}",sample_probabilities)
 
     return {
         'probability': average_probability,
@@ -679,8 +675,8 @@ def compute_diffusion_probabilistic_extraction(
     if model_family != 'llada':
         raise ValueError('compute_diffusion_probabilistic_extraction only supports model_family="llada".')
     normalized_decoding_scheme = decoding_scheme.lower()
-    if normalized_decoding_scheme not in {'full', 'top_k', 'elbo', 'random'}:
-        raise ValueError("decoding_scheme must be one of {'full', 'top_k', 'ELBO', 'random'} for model_family='llada'.")
+    if normalized_decoding_scheme not in {'full', 'top_k', 'elbo'}:
+        raise ValueError("decoding_scheme must be one of {'full', 'top_k', 'ELBO'} for model_family='llada'.")
     if normalized_decoding_scheme == 'top_k' and k <= 0:
         raise ValueError('k must be > 0 when decoding_scheme="top_k".')
     if normalized_decoding_scheme == 'random' and remasking != 'random':
