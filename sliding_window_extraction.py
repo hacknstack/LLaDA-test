@@ -139,10 +139,8 @@ def main() -> None:
     if args.model_family == 'llada' and args.remasking == 'random':
         if args.mode != 'path_sampling':
             raise ValueError("--mode must be 'path_sampling' when --remasking random.")
-        if decoding_scheme.lower() not in {'random', 'top_k'}:
-            raise ValueError("--decoding-scheme must be one of {'random', 'top_k'} when --remasking random.")
-    if args.model_family == 'llada' and decoding_scheme.lower() == 'random' and args.remasking != 'random':
-        raise ValueError("--remasking must be 'random' when --decoding-scheme random.")
+        if decoding_scheme.lower() not in {'full', 'top_k'}:
+            raise ValueError("--decoding-scheme must be one of {'full', 'top_k'} when --remasking random.")
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 

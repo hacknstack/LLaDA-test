@@ -736,8 +736,8 @@ def compute_diffusion_probabilistic_extraction(
         }
 
     if remasking == 'random':
-        if normalized_decoding_scheme not in {'random', 'top_k'}:
-            raise ValueError('remasking="random" requires decoding_scheme in {"random", "top_k"}.')
+        if normalized_decoding_scheme not in {'full', 'top_k'}:
+            raise ValueError('remasking="random" requires decoding_scheme in {"full", "top_k"}.')
         if estimation_method != 'path_sampling':
             raise ValueError('remasking="random" only supports estimation_method="path_sampling".')
         if num_samples <= 0:
