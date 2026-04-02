@@ -679,10 +679,12 @@ def compute_diffusion_probabilistic_extraction(
     if model_family != 'llada':
         raise ValueError('compute_diffusion_probabilistic_extraction only supports model_family="llada".')
     normalized_decoding_scheme = decoding_scheme.lower()
-    if normalized_decoding_scheme not in {'full', 'top_k', 'elbo'}:
-        raise ValueError("decoding_scheme must be one of {'full', 'top_k', 'ELBO'} for model_family='llada'.")
+    if normalized_decoding_scheme not in {'full', 'top_k', 'elbo', 'random'}:
+        raise ValueError("decoding_scheme must be one of {'full', 'top_k', 'ELBO', 'random'} for model_family='llada'.")
     if normalized_decoding_scheme == 'top_k' and k <= 0:
         raise ValueError('k must be > 0 when decoding_scheme="top_k".')
+    if normalized_decoding_scheme == 'random' and remasking != 'random':
+        raise ValueError('decoding_scheme="random" requires remasking="random".')
 
     if normalized_decoding_scheme == 'elbo':
         result = _elbo_probability(
