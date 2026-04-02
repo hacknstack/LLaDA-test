@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
         description='Sliding-window probabilistic extraction for a single text file.'
     )
     parser.add_argument('txt_path', type=Path, help='Input txt file path (e.g. texts/book.txt)')
-    parser.add_argument('--mode', choices=['exact', 'monte-carlo'], default='exact')
+    parser.add_argument('--mode', choices=['exact', 'monte-carlo', 'path_sampling'], default='exact')
     parser.add_argument('--tau', type=float, default=0.001)
     parser.add_argument('--chunk-chars', type=int, default=800)
     parser.add_argument('--stride-chars', type=int, default=10)
@@ -41,10 +41,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--model-name', type=str, default=None)
     parser.add_argument('--num-samples', type=int, default=20, help='Monte Carlo samples when --mode monte-carlo')
     parser.add_argument('--seed', type=int, default=None, help='Optional Monte Carlo seed')
-    parser.add_argument('--decoding-scheme', choices=['auto', 'full', 'top_k', 'greedy', 'ELBO', 'elbo'], default='auto')
+    parser.add_argument('--decoding-scheme', choices=['auto', 'full', 'top_k', 'greedy', 'ELBO', 'elbo', 'random'], default='auto')
     parser.add_argument('--k', type=int, default=40, help='Top-k value when --decoding-scheme top_k')
     parser.add_argument('--temperature', type=float, default=0.0, help='Temperature for non-greedy llama decoding and llada target-token-confidence remasking')
-    parser.add_argument('--remasking', choices=['low-confidence', 'target-token-confidence'], default='low-confidence',
+    parser.add_argument('--remasking', choices=['low-confidence', 'target-token-confidence', 'random'], default='low-confidence',
                         help='Remasking strategy when --model-family llada')
     return parser.parse_args()
 
@@ -100,7 +100,7 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
         temperature=args.temperature,
     )
 
-    if args.mode == 'exact' or str(decoding_scheme).lower() == 'elbo':
+    if args.mode in {'exact', 'path_sampling'} or str(decoding_scheme).lower() == 'elbo':
         return float(result['probability'])
     return float(result['estimate'])
 
@@ -127,8 +127,8 @@ def main() -> None:
         if decoding_scheme in {'top_k', 'full'} and args.temperature <= 0:
             raise ValueError("--temperature must be > 0 when --model-family llama with --decoding-scheme in {'top_k', 'full'}.")
     else:
-        if decoding_scheme.lower() not in {'top_k', 'full', 'elbo'}:
-            raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'ELBO'} when --model-family llada.")
+        if decoding_scheme.lower() not in {'top_k', 'full', 'elbo', 'random'}:
+            raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'ELBO', 'random'} when --model-family llada.")
     if decoding_scheme == 'top_k' and args.k <= 0:
         raise ValueError("--k must be > 0 when --decoding-scheme top_k.")
     if args.model_family == 'llada' and args.remasking == 'target-token-confidence':
@@ -136,6 +136,13 @@ def main() -> None:
             raise ValueError("--mode must be 'exact' when --remasking target-token-confidence.")
         if args.temperature <= 0:
             raise ValueError("--temperature must be > 0 when --remasking target-token-confidence.")
+    if args.model_family == 'llada' and args.remasking == 'random':
+        if args.mode != 'path_sampling':
+            raise ValueError("--mode must be 'path_sampling' when --remasking random.")
+        if decoding_scheme.lower() not in {'random', 'top_k'}:
+            raise ValueError("--decoding-scheme must be one of {'random', 'top_k'} when --remasking random.")
+    if args.model_family == 'llada' and decoding_scheme.lower() == 'random' and args.remasking != 'random':
+        raise ValueError("--remasking must be 'random' when --decoding-scheme random.")
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
