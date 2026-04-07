@@ -451,7 +451,7 @@ def _monte_carlo_probability_temperature(
 
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def _path_sampling_random_probability(
     model,
     prompt_tokens: torch.Tensor,
@@ -464,15 +464,34 @@ def _path_sampling_random_probability(
     decoding_scheme: str,
     k: int,
     temperature: float,
+    batch_size: int = 64,
 ) -> Dict[str, object]:
+    """
+    Faster batched version of the original estimator.
+
+    Same high-level behavior:
+      - samples a random reveal permutation for each sample
+      - uses the same fixed schedule across steps
+      - computes the path probability of obtaining target_tokens
+      - supports 'top_k' and full-softmax decoding
+      - returns the same output structure
+
+    Assumptions kept from the original code:
+      - prompt_tokens has shape [1, prompt_len]
+      - target_tokens has shape [1, suffix_len]
+      - attention mask produced by _suffix_attention_mask is valid for the full sequence
+    """
     device = _model_device(model)
     prompt_tokens = prompt_tokens.to(device)
     target_tokens = target_tokens.to(device)
+
     suffix_len = target_tokens.shape[1]
     prompt_len = prompt_tokens.shape[1]
+
     attn = _suffix_attention_mask(attention_mask, suffix_len, device)
 
-    rng = torch.Generator(device='cpu')
+    # Keep CPU RNG for seeded reproducibility style close to the original.
+    rng = torch.Generator(device="cpu")
     if seed is not None:
         rng.manual_seed(seed)
 
@@ -480,49 +499,132 @@ def _path_sampling_random_probability(
     rem = suffix_len % steps
     schedule = [base + (1 if i < rem else 0) for i in range(steps)]
 
+    prompt_row = prompt_tokens[0]   # [prompt_len]
+    target_row = target_tokens[0]   # [suffix_len]
+
     sample_log_probabilities: List[float] = []
     sample_probabilities: List[float] = []
-    for sample_idx in range(num_samples):
-        suffix = torch.full((suffix_len,), mask_id, dtype=torch.long, device=device)
-        log_path_probability = 0.0
-        path_is_zero = False
 
-        permutation = torch.randperm(suffix_len, generator=rng).tolist()
+    for batch_start in range(0, num_samples, batch_size):
+        bsz = min(batch_size, num_samples - batch_start)
+
+        # Current suffix states for all samples in this batch.
+        suffix = torch.full(
+            (bsz, suffix_len),
+            mask_id,
+            dtype=torch.long,
+            device=device,
+        )
+
+        # Accumulated log-probability for each sample.
+        log_path_probability = torch.zeros(bsz, dtype=torch.float64, device=device)
+
+        # Whether the sample is still alive (not zero-probability yet).
+        alive = torch.ones(bsz, dtype=torch.bool, device=device)
+
+        # Random reveal permutations, one per sample.
+        # Generated on CPU using the seeded CPU RNG, then moved to device.
+        perm_scores = torch.rand((bsz, suffix_len), generator=rng, device="cpu")
+        permutation = perm_scores.argsort(dim=-1).to(device)  # [bsz, suffix_len]
+
         start = 0
         for step_size in schedule:
-            reveal_positions = permutation[start:start + step_size]
+            reveal_positions = permutation[:, start:start + step_size]  # [bsz, step_size]
             start += step_size
 
-            x = torch.cat([prompt_tokens[0], suffix], dim=0).unsqueeze(0)
-            logits = model(x, attention_mask=attn).logits[0]
+            # Build model input.
+            x = torch.cat(
+                [prompt_row.unsqueeze(0).expand(bsz, -1), suffix],
+                dim=1,
+            )  # [bsz, prompt_len + suffix_len]
 
-            for p in reveal_positions:
-                token_logits = logits[prompt_len + p]
-                scaled_logits = token_logits if temperature <= 0 else (token_logits / temperature)
-                target_id = int(target_tokens[0, p].item())
-
-                if decoding_scheme == 'top_k':
-                    top_k = min(k, scaled_logits.shape[-1])
-                    topk_vals, topk_idx = torch.topk(scaled_logits, k=top_k, dim=-1)
-                    in_topk = bool((topk_idx == target_id).any().item())
-                    if in_topk:
-                        log_step_prob = float((scaled_logits[target_id] - torch.logsumexp(topk_vals, dim=-1)).item())
-                    else:
-                        log_step_prob = float('-inf')
+            # Repeat attention mask across batch if needed.
+            batched_attn = None
+            if attn is not None:
+                if attn.shape[0] == bsz:
+                    batched_attn = attn
                 else:
-                    log_step_prob = float(F.log_softmax(scaled_logits, dim=-1)[target_id].item())
+                    batched_attn = attn.expand(bsz, *attn.shape[1:])
 
-                if math.isinf(log_step_prob) and log_step_prob < 0:
-                    log_path_probability = float('-inf')
-                    path_is_zero = True
-                    break
-                else:
-                    log_path_probability += log_step_prob
-                suffix[p] = target_tokens[0, p]
+            logits = model(x, attention_mask=batched_attn).logits  # [bsz, total_len, vocab]
+            suffix_logits = logits[:, prompt_len:, :]              # [bsz, suffix_len, vocab]
 
-        sample_log_probabilities.append(log_path_probability)
-        path_probability = 0.0 if path_is_zero else float(math.exp(log_path_probability))
-        sample_probabilities.append(path_probability)
+            # Gather logits for all revealed positions in one shot.
+            vocab_size = suffix_logits.shape[-1]
+            gather_index = reveal_positions.unsqueeze(-1).expand(-1, -1, vocab_size)
+            step_logits = torch.gather(suffix_logits, dim=1, index=gather_index)  # [bsz, step_size, vocab]
+
+            target_ids = torch.gather(
+                target_row.unsqueeze(0).expand(bsz, -1),
+                dim=1,
+                index=reveal_positions,
+            )  # [bsz, step_size]
+
+            scaled_logits = step_logits if temperature <= 0 else (step_logits / temperature)
+
+            if decoding_scheme == "top_k":
+                top_k = min(k, scaled_logits.shape[-1])
+                topk_vals, topk_idx = torch.topk(scaled_logits, k=top_k, dim=-1)  # [bsz, step_size, top_k]
+
+                in_topk = (topk_idx == target_ids.unsqueeze(-1)).any(dim=-1)  # [bsz, step_size]
+
+                target_logits = torch.gather(
+                    scaled_logits,
+                    dim=-1,
+                    index=target_ids.unsqueeze(-1),
+                ).squeeze(-1)  # [bsz, step_size]
+
+                token_log_probs = target_logits - torch.logsumexp(topk_vals, dim=-1)
+                token_log_probs = torch.where(
+                    in_topk,
+                    token_log_probs,
+                    torch.full_like(token_log_probs, float("-inf")),
+                )
+            else:
+                target_logits = torch.gather(
+                    scaled_logits,
+                    dim=-1,
+                    index=target_ids.unsqueeze(-1),
+                ).squeeze(-1)  # [bsz, step_size]
+
+                token_log_probs = target_logits - torch.logsumexp(scaled_logits, dim=-1)
+
+            # If any revealed token has zero probability, the whole path becomes zero.
+            step_has_zero = torch.isneginf(token_log_probs).any(dim=-1)  # [bsz]
+
+            # Sum token log-probs for alive paths only.
+            safe_token_log_probs = torch.where(
+                torch.isfinite(token_log_probs),
+                token_log_probs,
+                torch.zeros_like(token_log_probs),
+            )
+            step_log_prob = safe_token_log_probs.sum(dim=-1)  # [bsz]
+
+            log_path_probability = torch.where(
+                alive & (~step_has_zero),
+                log_path_probability + step_log_prob,
+                log_path_probability,
+            )
+
+            alive = alive & (~step_has_zero)
+
+            # Update suffix with the revealed target tokens for all samples.
+            suffix.scatter_(dim=1, index=reveal_positions, src=target_ids)
+
+        batch_log_probs = torch.where(
+            alive,
+            log_path_probability,
+            torch.full_like(log_path_probability, float("-inf")),
+        )
+
+        sample_log_probabilities.extend(batch_log_probs.detach().cpu().tolist())
+
+        batch_probabilities = torch.where(
+            torch.isfinite(batch_log_probs),
+            torch.exp(batch_log_probs),
+            torch.zeros_like(batch_log_probs),
+        )
+        sample_probabilities.extend(batch_probabilities.detach().cpu().tolist())
 
     if sample_log_probabilities:
         finite_logs = [lp for lp in sample_log_probabilities if not math.isinf(lp)]
@@ -531,16 +633,17 @@ def _path_sampling_random_probability(
         else:
             max_log = max(finite_logs)
             scaled_sum = sum(math.exp(lp - max_log) for lp in finite_logs)
-            average_probability = float(math.exp(max_log) * (scaled_sum / len(sample_log_probabilities)))
+            average_probability = float(
+                math.exp(max_log) * (scaled_sum / len(sample_log_probabilities))
+            )
     else:
         average_probability = 0.0
-    #print(f"[path_sampling] average_probability={average_probability}",sample_probabilities)
 
     return {
-        'probability': average_probability,
-        'sample_probabilities': sample_probabilities,
-        'num_samples': num_samples,
-        'estimation_method': 'path_sampling',
+        "probability": average_probability,
+        "sample_probabilities": sample_probabilities,
+        "num_samples": num_samples,
+        "estimation_method": "path_sampling",
     }
 
 
