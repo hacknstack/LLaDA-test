@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/HarryPotterChapter12.txt",
+  "total_chars": 31020,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_chars": 10,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llama",
+    "model_name": "NousResearch/Meta-Llama-3-8B",
+    "remasking": "low-confidence",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 3058,
+  "num_windows_scored": 3058,
+  "num_windows_extracted": 0,
+  "extraction_rate": 0.0,
+  "p_z_distribution": {
+    "min": 4.328932378628326e-78,
+    "median": 1.0816611115477746e-42,
+    "mean": 1.4412692886939762e-08,
+    "max": 1.716895618041157e-05,
+    "q_0.9": 5.818547844928295e-29,
+    "q_0.99": 1.616184119008429e-10,
+    "q_0.999": 2.8049999166829995e-06
+  }
+}
