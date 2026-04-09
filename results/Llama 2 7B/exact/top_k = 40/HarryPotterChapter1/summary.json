@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/HarryPotterChapter1.txt",
+  "total_chars": 26070,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_chars": 10,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llama2",
+    "model_name": "NousResearch/Llama-2-7b-hf",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 2568,
+  "num_windows_scored": 2568,
+  "num_windows_extracted": 13,
+  "extraction_rate": 0.0050623052959501555,
+  "p_z_distribution": {
+    "min": 0.0,
+    "median": 0.0,
+    "mean": 0.00011142933510189487,
+    "max": 0.08225856695428078,
+    "q_0.9": 6.752291576399097e-35,
+    "q_0.99": 3.277043996107313e-05,
+    "q_0.999": 0.03153503336140695
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/MITLicense.txt",
+  "total_chars": 1023,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_chars": 10,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llama2",
+    "model_name": "NousResearch/Llama-2-7b-hf",
+    "remasking": "low-confidence",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 78,
+  "num_windows_scored": 78,
+  "num_windows_extracted": 78,
+  "extraction_rate": 1.0,
+  "p_z_distribution": {
+    "min": 0.00432765391533137,
+    "median": 0.5207883106085966,
+    "mean": 0.47228597920885956,
+    "max": 0.9032987526032474,
+    "q_0.9": 0.8618629952236251,
+    "q_0.99": 0.9030701732029351,
+    "q_0.999": 0.9032758946632162
+  }
+}
