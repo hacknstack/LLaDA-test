@@ -19,7 +19,9 @@ from probabilistic_extraction import (
 
 DEFAULT_LLADA_MODEL = 'GSAI-ML/LLaDA-8B-Base'
 DEFAULT_LLAMA_MODEL = 'NousResearch/Meta-Llama-3-8B'
+DEFAULT_LLAMA2_MODEL = 'NousResearch/Llama-2-7b-hf'
 MASK_ID = 126336
+AUTOREGRESSIVE_MODEL_FAMILIES = {'llama', 'llama2'}
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-windows', type=int, default=None)
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--output-dir', type=Path, default=Path('outputs'))
-    parser.add_argument('--model-family', choices=['llada', 'llama'], default='llada')
+    parser.add_argument('--model-family', choices=['llada', 'llama', 'llama2'], default='llada')
     parser.add_argument('--model-name', type=str, default=None)
     parser.add_argument('--num-samples', type=int, default=20, help='Monte Carlo samples when --mode monte-carlo')
     parser.add_argument('--seed', type=int, default=None, help='Optional Monte Carlo seed')
@@ -72,12 +74,13 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
     target_tokens = torch.tensor([suffix_ids], dtype=torch.long)
     decoding_scheme = _resolve_decoding_scheme(args)
 
-    if args.model_family == 'llama':
+    if args.model_family in AUTOREGRESSIVE_MODEL_FAMILIES:
         result = compute_autoregressive_probabilistic_extraction(
             model=model,
             prompt_tokens=prompt_tokens,
             target_tokens=target_tokens,
             attention_mask=None,
+            model_family=args.model_family,
             decoding_scheme=decoding_scheme,
             k=args.k,
             temperature=args.temperature,
@@ -114,18 +117,23 @@ def main() -> None:
         raise FileNotFoundError(f'Input file not found: {args.txt_path}')
 
     if args.model_name is None:
-        args.model_name = DEFAULT_LLADA_MODEL if args.model_family == 'llada' else DEFAULT_LLAMA_MODEL
+        default_models = {
+            'llada': DEFAULT_LLADA_MODEL,
+            'llama': DEFAULT_LLAMA_MODEL,
+            'llama2': DEFAULT_LLAMA2_MODEL,
+        }
+        args.model_name = default_models[args.model_family]
 
-    if args.model_family == 'llama' and args.mode != 'exact':
-        raise ValueError("--mode must be 'exact' when --model-family llama.")
-    if args.model_family == 'llama' and args.remasking != 'low-confidence':
+    if args.model_family in AUTOREGRESSIVE_MODEL_FAMILIES and args.mode != 'exact':
+        raise ValueError("--mode must be 'exact' when --model-family is 'llama' or 'llama2'.")
+    if args.model_family in AUTOREGRESSIVE_MODEL_FAMILIES and args.remasking != 'low-confidence':
         raise ValueError("--remasking is only used when --model-family llada.")
     decoding_scheme = _resolve_decoding_scheme(args)
-    if args.model_family == 'llama':
+    if args.model_family in AUTOREGRESSIVE_MODEL_FAMILIES:
         if decoding_scheme not in {'top_k', 'full', 'greedy'}:
-            raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'greedy'} when --model-family llama.")
+            raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'greedy'} when --model-family is 'llama' or 'llama2'.")
         if decoding_scheme in {'top_k', 'full'} and args.temperature <= 0:
-            raise ValueError("--temperature must be > 0 when --model-family llama with --decoding-scheme in {'top_k', 'full'}.")
+            raise ValueError("--temperature must be > 0 when --model-family is 'llama' or 'llama2' with --decoding-scheme in {'top_k', 'full'}.")
     else:
         if decoding_scheme.lower() not in {'top_k', 'full', 'elbo', 'random'}:
             raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'ELBO', 'random'} when --model-family llada.")

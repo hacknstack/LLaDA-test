@@ -7,6 +7,8 @@ import torch
 import torch.nn.functional as F
 from get_log_likelihood import get_log_likelihood
 
+AUTOREGRESSIVE_MODEL_FAMILIES = {'llama', 'llama2'}
+
 
 @dataclass
 class MonteCarloResult:
@@ -932,10 +934,10 @@ def compute_autoregressive_probabilistic_extraction(
         raise ValueError('target_tokens must have shape (1, j).')
 
     model_family = model_family.lower()
-    if model_family != 'llama':
-        raise ValueError('compute_autoregressive_probabilistic_extraction only supports model_family="llama".')
+    if model_family not in AUTOREGRESSIVE_MODEL_FAMILIES:
+        raise ValueError('compute_autoregressive_probabilistic_extraction only supports model_family in {"llama", "llama2"}.')
 
-    return _autoregressive_probability(
+    result = _autoregressive_probability(
         model=model,
         prompt_tokens=prompt_tokens,
         target_tokens=target_tokens,
@@ -945,6 +947,8 @@ def compute_autoregressive_probabilistic_extraction(
         temperature=temperature,
         return_token_details=return_token_details,
     )
+    result['model_family'] = model_family
+    return result
 
 
 @torch.no_grad()
@@ -966,7 +970,7 @@ def compute_probabilistic_extraction(
     return_token_details: bool = False,
 ):
     model_family = model_family.lower()
-    if model_family == 'llama':
+    if model_family in AUTOREGRESSIVE_MODEL_FAMILIES:
         ar_decoding_scheme = 'top_k' if decoding_scheme == 'auto' else decoding_scheme
         return compute_autoregressive_probabilistic_extraction(
             model=model,
@@ -997,4 +1001,4 @@ def compute_probabilistic_extraction(
             k=k,
             temperature=temperature,
         )
-    raise ValueError("model_family must be one of {'llada', 'llama'}")
+    raise ValueError("model_family must be one of {'llada', 'llama', 'llama2'}")
