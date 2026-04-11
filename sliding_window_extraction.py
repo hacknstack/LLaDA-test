@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, median
@@ -149,6 +150,11 @@ def main() -> None:
             raise ValueError("--mode must be 'path_sampling' when --remasking random.")
         if decoding_scheme.lower() not in {'full', 'top_k'}:
             raise ValueError("--decoding-scheme must be one of {'full', 'top_k'} when --remasking random.")
+    if args.model_family == 'llada' and args.remasking == 'low-confidence' and args.mode == 'path_sampling':
+        if decoding_scheme.lower() not in {'full', 'top_k'}:
+            raise ValueError("--decoding-scheme must be one of {'full', 'top_k'} when --mode path_sampling with --remasking low-confidence.")
+        if not math.isclose(args.temperature, 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("--temperature must be exactly 1 when --mode path_sampling with --model-family llada and --remasking low-confidence.")
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 

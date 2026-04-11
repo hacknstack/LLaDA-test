@@ -390,7 +390,6 @@ def _path_sampling_probability_temperature1_tie_free(
           _suffix_attention_mask
           MonteCarloResult
     """
-    print("OUUUUUUUUUUUUUUuuuaii")
     if steps <= 0:
         raise ValueError("steps must be positive")
     if num_samples <= 0:
@@ -1263,6 +1262,41 @@ def compute_diffusion_probabilistic_extraction(
             'k': k if normalized_decoding_scheme == 'top_k' else None,
         }
 
+    if estimation_method == 'path_sampling':
+        if normalized_decoding_scheme not in {'full', 'top_k'}:
+            raise ValueError('estimation_method="path_sampling" with remasking="low-confidence" requires decoding_scheme in {"full", "top_k"}.')
+        if not math.isclose(float(temperature), 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError('estimation_method="path_sampling" with remasking="low-confidence" requires temperature == 1.')
+        if num_samples <= 0:
+            raise ValueError('num_samples must be > 0 when estimation_method="path_sampling".')
+
+        path_sampling = _path_sampling_probability_temperature1_tie_free(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            steps=steps,
+            attention_mask=attention_mask,
+            mask_id=mask_id,
+            num_samples=num_samples,
+            seed=seed,
+            decoding_scheme=normalized_decoding_scheme,
+            k=k,
+        )
+        return {
+            'method': 'path_sampling',
+            'probability': path_sampling.estimate,
+            'estimate': path_sampling.estimate,
+            'standard_error': path_sampling.standard_error,
+            'wald_ci': path_sampling.wald_ci,
+            'wilson_ci': path_sampling.wilson_ci,
+            'hits': path_sampling.hits,
+            'num_samples': path_sampling.num_samples,
+            'remasking': 'low-confidence',
+            'temperature': temperature,
+            'decoding_scheme': normalized_decoding_scheme,
+            'k': k if normalized_decoding_scheme == 'top_k' else None,
+        }
+
     if estimation_method == 'exact':
         return {
             'method': 'exact',
@@ -1277,33 +1311,21 @@ def compute_diffusion_probabilistic_extraction(
         }
 
     if temperature > 0:
-        if estimation_method == 'monte-carlo' :
-            mc = _monte_carlo_probability_temperature_fast(
-                model=model,
-                prompt_tokens=prompt_tokens,
-                target_tokens=target_tokens,
-                steps=steps,
-                attention_mask=attention_mask,
-                mask_id=mask_id,
-                num_samples=num_samples,
-                seed=seed,
-                temperature=temperature,
-                decoding_scheme=decoding_scheme,
-                k=k,
-            )
-        else:
+
+        mc = _monte_carlo_probability_temperature_fast(
+            model=model,
+            prompt_tokens=prompt_tokens,
+            target_tokens=target_tokens,
+            steps=steps,
+            attention_mask=attention_mask,
+            mask_id=mask_id,
+            num_samples=num_samples,
+            seed=seed,
+            temperature=temperature,
+            decoding_scheme=decoding_scheme,
+            k=k,
+        )
         
-            mc = _path_sampling_probability_temperature1_tie_free(
-                model=model,
-                prompt_tokens=prompt_tokens,
-                target_tokens=target_tokens,
-                steps=steps,
-                attention_mask=attention_mask,
-                mask_id=mask_id,
-                temperature=temperature,
-                decoding_scheme=decoding_scheme,
-                k=k,
-            )
     else:
         mc = _monte_carlo_probability(
             model=model,
