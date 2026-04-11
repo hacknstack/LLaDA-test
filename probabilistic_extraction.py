@@ -355,11 +355,11 @@ def _monte_carlo_probability(
     )
 
 
-@torch.no_grad()
-def _monte_carlo_probability_temperature(
+@torch.inference_mode()
+def _monte_carlo_probability_temperature_fast(
     model,
-    prompt_tokens: torch.Tensor,
-    target_tokens: torch.Tensor,
+    prompt_tokens: torch.Tensor,      # [1, P]
+    target_tokens: torch.Tensor,      # [1, S]
     steps: int,
     attention_mask: Optional[torch.Tensor],
     mask_id: int,
@@ -368,76 +368,157 @@ def _monte_carlo_probability_temperature(
     temperature: float,
     decoding_scheme: str,
     k: int,
+    mc_batch_size: int = 512,
 ) -> MonteCarloResult:
+    """
+    Fast Monte Carlo estimator for LLaDA low-confidence remasking with:
+      - temperature > 0
+      - one token revealed per step
+      - optional top-k token sampling
+
+    Assumes custom helpers/classes already exist and work:
+      - _model_device
+      - _suffix_attention_mask
+      - _safe_wald_and_wilson
+      - MonteCarloResult
+
+    This implementation is mathematically equivalent to the original for the
+    stated setting, but vectorized across Monte Carlo samples and positions.
+    """
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+
     device = _model_device(model)
-    prompt_tokens = prompt_tokens.to(device)
-    target_tokens = target_tokens.to(device)
+    prompt_tokens = prompt_tokens.to(device, non_blocking=True)
+    target_tokens = target_tokens.to(device, non_blocking=True)
+
+    assert prompt_tokens.ndim == 2 and prompt_tokens.shape[0] == 1
+    assert target_tokens.ndim == 2 and target_tokens.shape[0] == 1
+
+    prefix_len = prompt_tokens.shape[1]
     suffix_len = target_tokens.shape[1]
+
+    # Your requested specialization: one token revealed per step.
+    if steps != suffix_len:
+        raise ValueError(
+            f"This optimized version assumes one token revealed per step, "
+            f"so steps must equal suffix_len. Got steps={steps}, suffix_len={suffix_len}."
+        )
+
     attn = _suffix_attention_mask(attention_mask, suffix_len, device)
 
     rng = torch.Generator(device=device)
     if seed is not None:
         rng.manual_seed(seed)
 
-    base = suffix_len // steps
-    rem = suffix_len % steps
-    schedule = [base + (1 if i < rem else 0) for i in range(steps)]
-
+    # Hoist constants once.
+    target_suffix = target_tokens[0]                            # [S]
     hits = 0
+    vocab_arange_cache = None
 
-    for _ in range(num_samples):
-        suffix = torch.full((suffix_len,), mask_id, dtype=torch.long, device=device)
-        alive = True
+    # Process independent trajectories in GPU batches.
+    for start in range(0, num_samples, mc_batch_size):
+        bsz = min(mc_batch_size, num_samples - start)
 
-        for step_idx in range(steps):
-            if not alive:
+        # suffix: [B, S]
+        suffix = torch.full(
+            (bsz, suffix_len),
+            mask_id,
+            dtype=torch.long,
+            device=device,
+        )
+
+        # alive[b] == True means trajectory b is still consistent with target.
+        alive = torch.ones(bsz, dtype=torch.bool, device=device)
+
+        # Pre-expand prefix once per batch.
+        # prompt_batch: [B, P]
+        prompt_batch = prompt_tokens.expand(bsz, -1)
+
+        # Build model input buffer once and update suffix in-place each step.
+        # x: [B, P+S]
+        x = torch.empty(
+            (bsz, prefix_len + suffix_len),
+            dtype=prompt_tokens.dtype,
+            device=device,
+        )
+        x[:, :prefix_len] = prompt_batch
+
+        for _step_idx in range(steps):
+            # If all trajectories are dead, stop early.
+            if not alive.any():
                 break
 
-            x = torch.cat([prompt_tokens[0], suffix], dim=0).unsqueeze(0)
-            logits = model(x, attention_mask=attn).logits[0]
+            # Update suffix portion in-place.
+            x[:, prefix_len:] = suffix
 
-            masked_positions = (suffix == mask_id).nonzero(as_tuple=False).squeeze(-1).tolist()
-            k_transfer = schedule[step_idx]
+            # Forward one big batch.
+            logits = model(x, attention_mask=attn).logits[:, prefix_len:, :]   # [B, S, V]
+            # Unscaled probs are used for low-confidence ranking in the original code.
+            probs = logits.softmax(dim=-1)                                      # [B, S, V]
 
-            probs = F.softmax(logits, dim=-1)
-            x0 = torch.full((logits.shape[0],), -1, dtype=torch.long, device=device)
-            chosen_prob = torch.zeros((logits.shape[0],), dtype=probs.dtype, device=device)
+            # Current masked positions.
+            masked = (suffix == mask_id) & alive[:, None]                       # [B, S]
 
-            for p in masked_positions:
-                token_logits = logits[prompt_tokens.shape[1] + p]
-                scaled_logits = token_logits / temperature
+            # Sample a token proposal for every (alive, masked) position.
+            scaled_logits = logits / temperature                                # [B, S, V]
 
-                if decoding_scheme == 'top_k':
-                    top_k = min(k, scaled_logits.shape[-1])
-                    candidate_logits, candidate_idx = torch.topk(scaled_logits, k=top_k, dim=-1)
-                else:
-                    candidate_logits = scaled_logits
-                    candidate_idx = torch.arange(scaled_logits.shape[-1], device=device)
+            if decoding_scheme == "top_k":
+                top_k = min(k, scaled_logits.shape[-1])
+                top_vals, top_idx = torch.topk(scaled_logits, k=top_k, dim=-1)  # [B,S,K], [B,S,K]
+                top_probs = top_vals.softmax(dim=-1)                             # [B,S,K]
 
-                candidate_probs = F.softmax(candidate_logits, dim=-1)
-                sampled_local = int(torch.multinomial(candidate_probs, 1, generator=rng).item())
-                sampled_token = int(candidate_idx[sampled_local].item())
+                sampled_local = torch.multinomial(
+                    top_probs.reshape(-1, top_k),
+                    num_samples=1,
+                    generator=rng,
+                ).reshape(bsz, suffix_len)                                       # [B,S]
 
-                x0[prompt_tokens.shape[1] + p] = sampled_token
-                chosen_prob[prompt_tokens.shape[1] + p] = probs[prompt_tokens.shape[1] + p, sampled_token]
+                sampled_tokens = top_idx.gather(
+                    dim=-1,
+                    index=sampled_local.unsqueeze(-1),
+                ).squeeze(-1)                                                    # [B,S]
+            else:
+                vocab_size = scaled_logits.shape[-1]
+                sampled_tokens = torch.multinomial(
+                    scaled_logits.softmax(dim=-1).reshape(-1, vocab_size),
+                    num_samples=1,
+                    generator=rng,
+                ).reshape(bsz, suffix_len)                                       # [B,S]
 
-            masked_confidence = torch.tensor(
-                [chosen_prob[prompt_tokens.shape[1] + p].item() for p in masked_positions],
-                dtype=chosen_prob.dtype,
-                device=device,
-            )
-            top_pos_idx = torch.topk(masked_confidence, k=k_transfer).indices.tolist()
-            selected_suffix_positions = [masked_positions[i] for i in top_pos_idx]
+            # Low-confidence remasking score:
+            # confidence = p_model(sampled_token | current masked context)
+            chosen_prob = probs.gather(
+                dim=-1,
+                index=sampled_tokens.unsqueeze(-1),
+            ).squeeze(-1)                                                        # [B,S]
 
-            for p in selected_suffix_positions:
-                chosen = int(x0[prompt_tokens.shape[1] + p].item())
-                suffix[p] = chosen
-                if chosen != int(target_tokens[0, p].item()):
-                    alive = False
-                    break
+            # Only masked positions are eligible; everything else gets -inf.
+            neg_inf = torch.full_like(chosen_prob, float("-inf"))
+            confidence = torch.where(masked, chosen_prob, neg_inf)               # [B,S]
 
-        if alive and torch.equal(suffix, target_tokens[0]):
-            hits += 1
+            # One token revealed per step => select the single most confident masked position.
+            selected_pos = confidence.argmax(dim=-1)                             # [B]
+
+            batch_idx = torch.arange(bsz, device=device)
+            selected_token = sampled_tokens[batch_idx, selected_pos]             # [B]
+            selected_target = target_suffix[selected_pos]                        # [B]
+
+            # Only alive trajectories participate.
+            active = alive
+
+            # Commit the chosen token for active trajectories.
+            suffix[batch_idx[active], selected_pos[active]] = selected_token[active]
+
+            # Kill trajectories whose committed token mismatches the target.
+            mismatch = active & (selected_token != selected_target)
+            alive = alive & (~mismatch)
+
+        # Surviving trajectories must exactly equal the target suffix.
+        if alive.any():
+            hits += (alive & (suffix == target_suffix.unsqueeze(0)).all(dim=-1)).sum().item()
 
     estimate, se, wald, wilson = _safe_wald_and_wilson(hits, num_samples)
     return MonteCarloResult(
@@ -879,7 +960,7 @@ def compute_diffusion_probabilistic_extraction(
         }
 
     if temperature > 0:
-        mc = _monte_carlo_probability_temperature(
+        mc = _monte_carlo_probability_temperature_fast(
             model=model,
             prompt_tokens=prompt_tokens,
             target_tokens=target_tokens,
