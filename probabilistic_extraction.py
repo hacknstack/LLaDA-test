@@ -354,6 +354,324 @@ def _monte_carlo_probability(
         num_samples=num_samples,
     )
 
+@torch.inference_mode()
+def _path_sampling_probability_temperature1_tie_free(
+    model,
+    prompt_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    num_samples: int,
+    seed: Optional[int],
+    decoding_scheme: str,
+    k: int,
+    sample_batch_size: int = 256,
+) -> MonteCarloResult:
+    """
+    Tie-free Rao-Blackwellized estimator for p_z under:
+      - LLaDA low-confidence remasking
+      - temperature = 1
+      - one token revealed per step
+
+    The estimator samples reveal orders only. It analytically integrates out
+    the token proposals of losing positions.
+
+    Supports:
+      decoding_scheme == "top_k"   (recommended)
+      decoding_scheme == "full"    (exact tie-free full-vocab version, but slow)
+
+    Assumptions:
+      - prompt_tokens shape: [1, P]
+      - target_tokens shape: [1, S]
+      - steps == S
+      - custom helpers/classes already exist and work:
+          _model_device
+          _suffix_attention_mask
+          MonteCarloResult
+    """
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive")
+    if decoding_scheme not in {"top_k", "full"}:
+        raise ValueError("decoding_scheme must be 'top_k' or 'full'")
+
+    device = _model_device(model)
+    prompt_tokens = prompt_tokens.to(device, non_blocking=True)
+    target_tokens = target_tokens.to(device, non_blocking=True)
+
+    if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
+        raise ValueError("prompt_tokens must have shape [1, P]")
+    if target_tokens.ndim != 2 or target_tokens.shape[0] != 1:
+        raise ValueError("target_tokens must have shape [1, S]")
+
+    prefix_len = prompt_tokens.shape[1]
+    suffix_len = target_tokens.shape[1]
+
+    if steps != suffix_len:
+        raise ValueError(
+            f"This implementation assumes one token revealed per step, "
+            f"so steps must equal suffix_len. Got steps={steps}, suffix_len={suffix_len}."
+        )
+
+    attn = _suffix_attention_mask(attention_mask, suffix_len, device)
+    target_suffix = target_tokens[0]  # [S]
+
+    rng = torch.Generator(device=device)
+    if seed is not None:
+        rng.manual_seed(seed)
+
+    all_weights = []
+
+    for start in range(0, num_samples, sample_batch_size):
+        bsz = min(sample_batch_size, num_samples - start)
+
+        # Current partially revealed suffix for each trajectory.
+        suffix = torch.full(
+            (bsz, suffix_len),
+            mask_id,
+            dtype=torch.long,
+            device=device,
+        )
+
+        # Importance weight of each trajectory.
+        weights = torch.ones(bsz, dtype=torch.float64, device=device)
+
+        prompt_batch = prompt_tokens.expand(bsz, -1)
+
+        for _step_idx in range(steps):
+            alive = weights > 0
+            if not alive.any():
+                break
+
+            alive_idx = alive.nonzero(as_tuple=False).squeeze(-1)
+            cur_bsz = alive_idx.numel()
+
+            cur_suffix = suffix.index_select(0, alive_idx)  # [B,S]
+
+            x = torch.empty(
+                (cur_bsz, prefix_len + suffix_len),
+                dtype=prompt_tokens.dtype,
+                device=device,
+            )
+            x[:, :prefix_len] = prompt_batch[:cur_bsz]
+            x[:, prefix_len:] = cur_suffix
+
+            logits = model(x, attention_mask=attn).logits[:, prefix_len:, :]  # [B,S,V]
+            full_probs = logits.softmax(dim=-1)                                # [B,S,V]
+            masked = (cur_suffix == mask_id)                                   # [B,S]
+
+            # Threshold t_i = p_i(z_i), the confidence if position i samples the correct token.
+            target_prob = full_probs.gather(
+                dim=-1,
+                index=target_suffix.view(1, suffix_len, 1).expand(cur_bsz, -1, -1),
+            ).squeeze(-1)  # [B,S]
+
+            # Compute q_i under the tie-free approximation.
+            if decoding_scheme == "top_k":
+                q = _compute_q_topk_tie_free(
+                    logits=logits,
+                    full_probs=full_probs,
+                    target_suffix=target_suffix,
+                    target_prob=target_prob,
+                    masked=masked,
+                    k=k,
+                )  # [B,S], zero on invalid/non-masked positions
+            else:
+                q = _compute_q_full_tie_free(
+                    full_probs=full_probs,
+                    target_suffix=target_suffix,
+                    target_prob=target_prob,
+                    masked=masked,
+                )  # [B,S], exact tie-free full-vocab version
+
+            step_survival = q.sum(dim=-1)  # [B]
+
+            # Update importance weights: multiply by probability of surviving this reveal step.
+            new_weights = weights.index_select(0, alive_idx)
+            new_weights = new_weights * step_survival.to(torch.float64)
+            weights[alive_idx] = new_weights
+
+            # If step_survival == 0, those trajectories are dead.
+            survive = step_survival > 0
+            if not survive.any():
+                break
+
+            surv_idx_local = survive.nonzero(as_tuple=False).squeeze(-1)
+            surv_idx_global = alive_idx.index_select(0, surv_idx_local)
+
+            q_surv = q.index_select(0, surv_idx_local)
+            step_survival_surv = step_survival.index_select(0, surv_idx_local)
+
+            # Sample next revealed index from q / sum(q).
+            reveal_dist = q_surv / step_survival_surv.unsqueeze(-1)  # [B,S]
+            next_pos = torch.multinomial(reveal_dist, num_samples=1, generator=rng).squeeze(-1)  # [B]
+
+            # Reveal the correct target token at that sampled position.
+            row_idx = torch.arange(next_pos.shape[0], device=device)
+            suffix[surv_idx_global[row_idx], next_pos] = target_suffix[next_pos]
+
+            # Zero out dead trajectories explicitly.
+            dead_idx_local = (~survive).nonzero(as_tuple=False).squeeze(-1)
+            if dead_idx_local.numel() > 0:
+                dead_idx_global = alive_idx.index_select(0, dead_idx_local)
+                weights[dead_idx_global] = 0.0
+
+        all_weights.append(weights)
+
+    all_weights = torch.cat(all_weights, dim=0)  # [num_samples]
+    estimate = all_weights.mean().item()
+
+    if num_samples > 1:
+        se = all_weights.std(unbiased=True).item() / math.sqrt(num_samples)
+    else:
+        se = 0.0
+
+    z = 1.96
+    wald_lo = max(0.0, estimate - z * se)
+    wald_hi = min(1.0, estimate + z * se)
+
+    # Wilson is not really the right interval for weighted estimators.
+    # Reuse the Wald interval slot for compatibility.
+    return MonteCarloResult(
+        estimate=estimate,
+        standard_error=se,
+        wald_ci=(wald_lo, wald_hi),
+        wilson_ci=(wald_lo, wald_hi),
+        hits=-1,
+        num_samples=num_samples,
+    )
+
+
+def _compute_q_topk_tie_free(
+    logits: torch.Tensor,          # [B,S,V]
+    full_probs: torch.Tensor,      # [B,S,V]
+    target_suffix: torch.Tensor,   # [S]
+    target_prob: torch.Tensor,     # [B,S], where target_prob[:,i] = p_i(z_i)
+    masked: torch.Tensor,          # [B,S]
+    k: int,
+) -> torch.Tensor:
+    """
+    Tie-free top-k formula:
+
+      q_i = \tilde p_i(z_i) * prod_{j != i} F_j(t_i)
+
+    where
+      t_i = p_i(z_i),
+      \tilde p_j is the top-k truncated/renormalized proposal distribution,
+      F_j(t) = sum_{v in K_j : p_j(v) < t} \tilde p_j(v)
+
+    Returns q of shape [B,S].
+    """
+    B, S, V = logits.shape
+    top_k = min(k, V)
+
+    top_vals, top_idx = torch.topk(logits, k=top_k, dim=-1)   # [B,S,K], [B,S,K]
+    proposal_probs = top_vals.softmax(dim=-1)                 # [B,S,K]
+
+    # Full-softmax confidence values of tokens in top-k support.
+    support_conf = full_probs.gather(dim=-1, index=top_idx)   # [B,S,K]
+
+    # Whether the target token is in the top-k support.
+    target_expanded = target_suffix.view(1, S, 1).expand(B, -1, -1)  # [B,S,1]
+    target_in_support = (top_idx == target_expanded)                  # [B,S,K]
+    has_target = target_in_support.any(dim=-1)                        # [B,S]
+
+    # Proposal probability of the correct token under top-k sampling.
+    proposal_p_correct = torch.where(
+        has_target,
+        (proposal_probs * target_in_support.to(proposal_probs.dtype)).sum(dim=-1),
+        torch.zeros_like(target_prob),
+    )  # [B,S]
+
+    # F[j, i] = probability that competitor position j samples a token with confidence < t_i
+    # Build as tensor over candidate i and competitor j:
+    #
+    # thresholds:      [B, i, 1, 1]
+    # support_conf:    [B, 1, j, K]
+    # proposal_probs:  [B, 1, j, K]
+    thresholds = target_prob.unsqueeze(2).unsqueeze(3)                 # [B,S,1,1]
+    support_conf_exp = support_conf.unsqueeze(1)                       # [B,1,S,K]
+    proposal_probs_exp = proposal_probs.unsqueeze(1)                   # [B,1,S,K]
+
+    competitor_cdf = (
+        proposal_probs_exp * (support_conf_exp < thresholds).to(proposal_probs.dtype)
+    ).sum(dim=-1)  # [B, candidate_i, competitor_j]
+
+    # Exclude unmasked competitors from the product: factor = 1
+    competitor_mask = masked.unsqueeze(1)                              # [B,1,S]
+    competitor_cdf = torch.where(
+        competitor_mask,
+        competitor_cdf,
+        torch.ones_like(competitor_cdf),
+    )
+
+    # Exclude j == i from the product: factor = 1
+    eye = torch.eye(S, dtype=torch.bool, device=logits.device).unsqueeze(0)  # [1,S,S]
+    competitor_cdf = torch.where(
+        eye,
+        torch.ones_like(competitor_cdf),
+        competitor_cdf,
+    )
+
+    product_term = competitor_cdf.prod(dim=-1)  # [B,S]
+
+    q = proposal_p_correct * product_term
+
+    # Candidate i itself must be masked.
+    q = torch.where(masked, q, torch.zeros_like(q))
+    return q
+
+
+def _compute_q_full_tie_free(
+    full_probs: torch.Tensor,      # [B,S,V]
+    target_suffix: torch.Tensor,   # [S]
+    target_prob: torch.Tensor,     # [B,S]
+    masked: torch.Tensor,          # [B,S]
+) -> torch.Tensor:
+    """
+    Exact tie-free full-vocab formula:
+
+      q_i = p_i(z_i) * prod_{j != i} F_j(t_i)
+
+    where
+      t_i = p_i(z_i),
+      F_j(t) = sum_{v : p_j(v) < t} p_j(v)
+
+    This is exact for the tie-free full-vocab case, but usually much slower
+    and more memory-intensive than top-k.
+    """
+    B, S, V = full_probs.shape
+
+    proposal_p_correct = target_prob  # [B,S], because proposal law == full softmax at temperature 1
+
+    thresholds = target_prob.unsqueeze(2).unsqueeze(3)                 # [B,S,1,1]
+    probs_exp = full_probs.unsqueeze(1)                                # [B,1,S,V]
+
+    competitor_cdf = (
+        probs_exp * (probs_exp < thresholds).to(full_probs.dtype)
+    ).sum(dim=-1)  # [B, candidate_i, competitor_j]
+
+    competitor_mask = masked.unsqueeze(1)                              # [B,1,S]
+    competitor_cdf = torch.where(
+        competitor_mask,
+        competitor_cdf,
+        torch.ones_like(competitor_cdf),
+    )
+
+    eye = torch.eye(S, dtype=torch.bool, device=full_probs.device).unsqueeze(0)
+    competitor_cdf = torch.where(
+        eye,
+        torch.ones_like(competitor_cdf),
+        competitor_cdf,
+    )
+
+    product_term = competitor_cdf.prod(dim=-1)  # [B,S]
+    q = proposal_p_correct * product_term
+    q = torch.where(masked, q, torch.zeros_like(q))
+    return q
+
 
 @torch.inference_mode()
 def _monte_carlo_probability_temperature_fast(
@@ -958,19 +1276,33 @@ def compute_diffusion_probabilistic_extraction(
         }
 
     if temperature > 0:
-        mc = _monte_carlo_probability_temperature_fast(
-            model=model,
-            prompt_tokens=prompt_tokens,
-            target_tokens=target_tokens,
-            steps=steps,
-            attention_mask=attention_mask,
-            mask_id=mask_id,
-            num_samples=num_samples,
-            seed=seed,
-            temperature=temperature,
-            decoding_scheme=decoding_scheme,
-            k=k,
-        )
+        if estimation_method == 'monte-carlo' :
+            mc = _monte_carlo_probability_temperature_fast(
+                model=model,
+                prompt_tokens=prompt_tokens,
+                target_tokens=target_tokens,
+                steps=steps,
+                attention_mask=attention_mask,
+                mask_id=mask_id,
+                num_samples=num_samples,
+                seed=seed,
+                temperature=temperature,
+                decoding_scheme=decoding_scheme,
+                k=k,
+            )
+        else:
+        
+            mc = _path_sampling_probability_temperature1_tie_free(
+                model=model,
+                prompt_tokens=prompt_tokens,
+                target_tokens=target_tokens,
+                steps=steps,
+                attention_mask=attention_mask,
+                mask_id=mask_id,
+                temperature=temperature,
+                decoding_scheme=decoding_scheme,
+                k=k,
+            )
     else:
         mc = _monte_carlo_probability(
             model=model,
