@@ -390,6 +390,7 @@ def _path_sampling_probability_temperature1_tie_free(
           _suffix_attention_mask
           MonteCarloResult
     """
+    print("OUUUUUUUUUUUUUUuuuaii")
     if steps <= 0:
         raise ValueError("steps must be positive")
     if num_samples <= 0:
