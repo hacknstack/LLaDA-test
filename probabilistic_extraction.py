@@ -356,7 +356,6 @@ def _monte_carlo_probability(
 
 @torch.inference_mode()
 def _path_sampling_probability_temperature1_tie_free(
-
     model,
     prompt_tokens: torch.Tensor,      # [1, P]
     target_tokens: torch.Tensor,      # [1, S]
@@ -1174,10 +1173,9 @@ def compute_diffusion_probabilistic_extraction(
             mask_id=mask_id,
             num_samples=num_samples,
             seed=seed,
-            decoding_scheme=normalized_decoding_scheme,
-            k=k,
-            temperature=temperature
-        )
+            temperature=temperature,
+            decoding_scheme=decoding_scheme,
+            k=k)
         print("OUIII")
         return {
             'method': 'path_sampling',
