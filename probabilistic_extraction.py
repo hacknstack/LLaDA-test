@@ -1061,6 +1061,7 @@ def compute_diffusion_probabilistic_extraction(
     seed:
         RNG seed for Monte Carlo.
     """
+    print("OKKayy")
     if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
         raise ValueError('prompt_tokens must have shape (1, a).')
     if target_tokens.ndim != 2 or target_tokens.shape[0] != 1:
@@ -1176,6 +1177,7 @@ def compute_diffusion_probabilistic_extraction(
             decoding_scheme=normalized_decoding_scheme,
             k=k,
         )
+        print("OUIII")
         return {
             'method': 'path_sampling',
             'probability': path_sampling_result['probability'],
@@ -1226,6 +1228,7 @@ def compute_diffusion_probabilistic_extraction(
             num_samples=num_samples,
             seed=seed,
         )
+    print("oulala")
     return {
         'method': 'monte-carlo',
         'estimate': mc.estimate,
