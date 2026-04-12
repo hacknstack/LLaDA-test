@@ -1176,6 +1176,7 @@ def compute_diffusion_probabilistic_extraction(
             seed=seed,
             decoding_scheme=normalized_decoding_scheme,
             k=k,
+            temperature=temperature
         )
         print("OUIII")
         return {
