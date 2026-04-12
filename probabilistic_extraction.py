@@ -1061,7 +1061,7 @@ def compute_diffusion_probabilistic_extraction(
     seed:
         RNG seed for Monte Carlo.
     """
-    print("OKKayy")
+    print("OKKayy",estimation_method, remasking, decoding_scheme)
     if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
         raise ValueError('prompt_tokens must have shape (1, a).')
     if target_tokens.ndim != 2 or target_tokens.shape[0] != 1:
