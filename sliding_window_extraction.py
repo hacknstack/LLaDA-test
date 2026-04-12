@@ -103,7 +103,7 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
         k=args.k,
         temperature=args.temperature,
     )
-
+    print("result", result)
     if args.mode in {'exact', 'path_sampling'} or str(decoding_scheme).lower() == 'elbo':
         return float(result['probability'])
     return float(result['estimate'])
@@ -202,6 +202,7 @@ def main() -> None:
 
         try:
             p_z = _compute_probability(model=model, prefix_ids=prefix_ids, suffix_ids=suffix_ids, args=args)
+            print(f"pz {p_z}")
             extracted = int(p_z >= args.tau)
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
