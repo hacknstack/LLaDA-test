@@ -207,6 +207,7 @@ def main() -> None:
             extracted = int(p_z >= args.tau)
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
+            print(error, ":(")
 
         rows.append(
             {
