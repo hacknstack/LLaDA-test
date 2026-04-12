@@ -110,7 +110,6 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
 
 
 def main() -> None:
-    print("Ta grand mere")
     args = parse_args()
 
     if args.prefix_tokens + args.suffix_tokens != args.seq_tokens:
