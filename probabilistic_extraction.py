@@ -431,10 +431,10 @@ def _path_sampling_probability_temperature1_tie_free(
             f"so steps must equal suffix_len. Got steps={steps}, suffix_len={suffix_len}."
         )
 
-    if decoding_scheme not in {"temperature", "top_k"}:
+    if decoding_scheme not in {"full", "top_k"}:
         raise ValueError(
             f"Unsupported decoding_scheme={decoding_scheme!r}. "
-            f"Expected 'temperature' or 'top_k'."
+            f"Expected 'full' or 'top_k'."
         )
 
     attn = _suffix_attention_mask(attention_mask, suffix_len, device)
