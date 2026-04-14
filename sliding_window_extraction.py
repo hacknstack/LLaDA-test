@@ -72,6 +72,21 @@ def _resolve_decoding_scheme(args: argparse.Namespace) -> str:
     return 'full' if args.model_family == 'llada' else 'top_k'
 
 
+def _load_tokenizer(model_name: str):
+    try:
+        return AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    except Exception as exc:
+        print(
+            f"Fast tokenizer load failed for {model_name}: {exc}. "
+            "Retrying with use_fast=False."
+        )
+        return AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            use_fast=False,
+        )
+
+
 def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], args: argparse.Namespace) -> float:
     prompt_tokens = torch.tensor([prefix_ids], dtype=torch.long)
     target_tokens = torch.tensor([suffix_ids], dtype=torch.long)
@@ -162,7 +177,7 @@ def main() -> None:
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    tokenizer = _load_tokenizer(args.model_name)
     model_cls = AutoModel if args.model_family == 'llada' else AutoModelForCausalLM
     model = model_cls.from_pretrained(
         args.model_name,
