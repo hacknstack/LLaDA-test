@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import math
+from importlib.metadata import PackageNotFoundError, version as package_version
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, median
@@ -85,6 +86,34 @@ def _load_tokenizer(model_name: str):
             trust_remote_code=True,
             use_fast=False,
         )
+
+
+def _get_transformers_version() -> str:
+    try:
+        return package_version('transformers')
+    except PackageNotFoundError:
+        return 'unknown'
+
+
+def _load_model(model_name: str, model_family: str, device: str):
+    model_cls = AutoModel if model_family == 'llada' else AutoModelForCausalLM
+    try:
+        return model_cls.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16 if device.startswith('cuda') else torch.float32,
+        ).to(device).eval()
+    except ValueError as exc:
+        error_text = str(exc)
+        if model_family == 'olmo' and "model type `olmo`" in error_text:
+            transformers_version = _get_transformers_version()
+            raise RuntimeError(
+                "Loading OLMo failed because this checkpoint requires a newer Transformers release. "
+                f"Detected transformers=={transformers_version}. "
+                "Please upgrade Transformers to >= 4.40.0 and retry. "
+                "Model: allenai/OLMo-7B-0724-hf."
+            ) from exc
+        raise
 
 
 def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], args: argparse.Namespace) -> float:
@@ -178,12 +207,7 @@ def main() -> None:
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
     tokenizer = _load_tokenizer(args.model_name)
-    model_cls = AutoModel if args.model_family == 'llada' else AutoModelForCausalLM
-    model = model_cls.from_pretrained(
-        args.model_name,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16 if device.startswith('cuda') else torch.float32,
-    ).to(device).eval()
+    model = _load_model(args.model_name, args.model_family, device)
 
     text = args.txt_path.read_text(encoding='utf-8', errors='replace')
 
