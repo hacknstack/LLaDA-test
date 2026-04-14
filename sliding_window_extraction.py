@@ -21,8 +21,10 @@ from probabilistic_extraction import (
 DEFAULT_LLADA_MODEL = 'GSAI-ML/LLaDA-8B-Base'
 DEFAULT_LLAMA_MODEL = 'NousResearch/Meta-Llama-3-8B'
 DEFAULT_LLAMA2_MODEL = 'NousResearch/Llama-2-7b-hf'
+DEFAULT_OLMO_MODEL = 'allenai/OLMo-7B-0724-hf'
+DEFAULT_MISTRAL_MODEL = 'mistralai/Mistral-7B-v0.1'
 MASK_ID = 126336
-AUTOREGRESSIVE_MODEL_FAMILIES = {'llama', 'llama2'}
+AUTOREGRESSIVE_MODEL_FAMILIES = {'llama', 'llama2', 'olmo', 'mistral'}
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-windows', type=int, default=None)
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--output-dir', type=Path, default=Path('outputs'))
-    parser.add_argument('--model-family', choices=['llada', 'llama', 'llama2'], default='llada')
+    parser.add_argument('--model-family', type=str.lower, choices=['llada', 'llama', 'llama2', 'olmo', 'mistral'], default='llada')
     parser.add_argument('--model-name', type=str, default=None)
     parser.add_argument('--num-samples', type=int, default=20, help='Monte Carlo samples when --mode monte-carlo')
     parser.add_argument('--seed', type=int, default=None, help='Optional Monte Carlo seed')
@@ -122,19 +124,21 @@ def main() -> None:
             'llada': DEFAULT_LLADA_MODEL,
             'llama': DEFAULT_LLAMA_MODEL,
             'llama2': DEFAULT_LLAMA2_MODEL,
+            'olmo': DEFAULT_OLMO_MODEL,
+            'mistral': DEFAULT_MISTRAL_MODEL,
         }
         args.model_name = default_models[args.model_family]
 
     if args.model_family in AUTOREGRESSIVE_MODEL_FAMILIES and args.mode != 'exact':
-        raise ValueError("--mode must be 'exact' when --model-family is 'llama' or 'llama2'.")
+        raise ValueError("--mode must be 'exact' when --model-family is one of {'llama', 'llama2', 'olmo', 'mistral'}.")
     if args.model_family in AUTOREGRESSIVE_MODEL_FAMILIES and args.remasking != 'low-confidence':
         raise ValueError("--remasking is only used when --model-family llada.")
     decoding_scheme = _resolve_decoding_scheme(args)
     if args.model_family in AUTOREGRESSIVE_MODEL_FAMILIES:
         if decoding_scheme not in {'top_k', 'full', 'greedy'}:
-            raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'greedy'} when --model-family is 'llama' or 'llama2'.")
+            raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'greedy'} when --model-family is one of {'llama', 'llama2', 'olmo', 'mistral'}.")
         if decoding_scheme in {'top_k', 'full'} and args.temperature <= 0:
-            raise ValueError("--temperature must be > 0 when --model-family is 'llama' or 'llama2' with --decoding-scheme in {'top_k', 'full'}.")
+            raise ValueError("--temperature must be > 0 when --model-family is one of {'llama', 'llama2', 'olmo', 'mistral'} with --decoding-scheme in {'top_k', 'full'}.")
     else:
         if decoding_scheme.lower() not in {'top_k', 'full', 'elbo', 'random'}:
             raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'ELBO', 'random'} when --model-family llada.")

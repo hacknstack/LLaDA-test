@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from get_log_likelihood import get_log_likelihood
 
-AUTOREGRESSIVE_MODEL_FAMILIES = {'llama', 'llama2'}
+AUTOREGRESSIVE_MODEL_FAMILIES = {'llama', 'llama2', 'olmo', 'mistral'}
 
 
 @dataclass
@@ -955,9 +955,9 @@ def _autoregressive_probability(
     target_tokens = target_tokens.to(device)
 
     if prompt_tokens.shape[1] == 0:
-        raise ValueError('For model_family="llama", prompt_tokens must contain at least one token.')
+        raise ValueError('For autoregressive model families, prompt_tokens must contain at least one token.')
     if decoding_scheme not in {'top_k', 'full', 'greedy'}:
-        raise ValueError("decoding_scheme must be one of {'top_k', 'full', 'greedy'} for model_family='llama'.")
+        raise ValueError("decoding_scheme must be one of {'top_k', 'full', 'greedy'} for autoregressive model families.")
     if decoding_scheme == 'top_k' and k <= 0:
         raise ValueError('k must be > 0 when decoding_scheme="top_k".')
     if decoding_scheme in {'top_k', 'full'} and temperature <= 0:
@@ -1257,7 +1257,7 @@ def compute_autoregressive_probabilistic_extraction(
 
     model_family = model_family.lower()
     if model_family not in AUTOREGRESSIVE_MODEL_FAMILIES:
-        raise ValueError('compute_autoregressive_probabilistic_extraction only supports model_family in {"llama", "llama2"}.')
+        raise ValueError('compute_autoregressive_probabilistic_extraction only supports model_family in {"llama", "llama2", "olmo", "mistral"}.')
 
     result = _autoregressive_probability(
         model=model,
@@ -1323,4 +1323,4 @@ def compute_probabilistic_extraction(
             k=k,
             temperature=temperature,
         )
-    raise ValueError("model_family must be one of {'llada', 'llama', 'llama2'}")
+    raise ValueError("model_family must be one of {'llada', 'llama', 'llama2', 'olmo', 'mistral'}")
