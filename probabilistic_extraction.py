@@ -177,6 +177,7 @@ def _elbo_probability_from_partially_masked(
         masked_indexes=masked_pos,
         mask_id=mask_id,
     )
+    print(math.exp(log_probability))
     return {
         'probability': math.exp(log_probability),
         'log_probability': log_probability,
