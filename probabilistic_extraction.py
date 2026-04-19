@@ -154,6 +154,7 @@ def _elbo_probability_from_partially_masked(
     masked_indexes: list[int],         # 1-indexed masked positions
     mask_id: int,
 ) -> Dict[str, float]:
+    print("HUHUHUH")
     if sequence_tokens.ndim != 2 or sequence_tokens.shape[0] != 1:
         raise ValueError('sequence_tokens must have shape (1, 100).')
 
