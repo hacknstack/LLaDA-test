@@ -1687,7 +1687,7 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
 
         alive = torch.ones(bsz, dtype=torch.bool, device=device)
 
-        attn_batch = attn[:bsz] if attn is not None else None
+        attn_batch = torch.ones((bsz, seq_len), dtype=torch.long, device=device)
 
         for _step_idx in range(steps):
             if not alive.any():
