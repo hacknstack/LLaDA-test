@@ -1586,8 +1586,8 @@ def compute_diffusion_probabilistic_extraction(
 @torch.inference_mode()
 def _monte_carlo_probability_temperature_fast_from_partially_masked(
     model,
-    sequence_tokens: torch.Tensor,               # [1, L] ; full target sequence z
-    masked_indexes: list[int],                  # 1-indexed masked positions inside sequence_tokens
+    sequence_tokens: torch.Tensor,               # [1, L] full target sequence z
+    masked_indexes: list[int],                   # 1-indexed masked positions
     steps: int,
     attention_mask: Optional[torch.Tensor],
     mask_id: int,
@@ -1599,79 +1599,68 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     mc_batch_size: int = 512,
 ) -> MonteCarloResult:
     """
-    Monte Carlo estimate of the probability that LLaDA with low-confidence remasking
-    exactly regenerates the masked part of `sequence_tokens`, conditioned on the
-    unmasked part.
+    Monte Carlo estimate of the probability that the sampler exactly regenerates
+    the masked part of `sequence_tokens`, conditioned on the unmasked part.
 
-    This version supports arbitrary masking patterns inside a fixed-length sequence.
-
-    Assumptions / specialization:
-      - sequence length is exactly 100
-      - exactly 50 positions are masked
-      - steps == number of masked positions, i.e. one token revealed per step
-      - low-confidence remasking behavior is approximated by selecting the currently
-        masked position whose sampled token has highest model probability
-
-    Args:
-        model: LLaDA model.
-        sequence_tokens: [1, 100], the full sequence z.
-        masked_indexes: list[int], 1-indexed positions to mask and regenerate.
-        steps: must equal 50.
-        attention_mask: Optional [1, 100] attention mask.
-        mask_id: mask token id.
-        num_samples: number of Monte Carlo rollouts.
-        seed: optional RNG seed.
-        temperature: sampling temperature, must be > 0.
-        decoding_scheme: "top_k" or sampling from full vocab otherwise.
-        k: top-k parameter if decoding_scheme == "top_k".
-        mc_batch_size: MC minibatch size.
-
-    Returns:
-        MonteCarloResult with hit-count estimate.
+    Specialization:
+      - one token is transferred/kept per step
+      - therefore steps must equal the number of masked positions
+      - selection rule is: among currently masked positions, keep the sampled
+        token with highest confidence under the actual decoding distribution
     """
     if temperature <= 0:
         raise ValueError("temperature must be > 0")
     if steps <= 0:
         raise ValueError("steps must be positive")
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive")
+    if mc_batch_size <= 0:
+        raise ValueError("mc_batch_size must be positive")
+    if decoding_scheme not in {"top_k", "full"}:
+        raise ValueError("decoding_scheme must be 'top_k' or 'full'")
+    if decoding_scheme == "top_k" and k <= 0:
+        raise ValueError("k must be >= 1 when decoding_scheme == 'top_k'")
 
     device = _model_device(model)
     sequence_tokens = sequence_tokens.to(device, non_blocking=True)
 
-    assert sequence_tokens.ndim == 2 and sequence_tokens.shape[0] == 1
+    if sequence_tokens.ndim != 2 or sequence_tokens.shape[0] != 1:
+        raise ValueError(
+            f"sequence_tokens must have shape [1, L], got {tuple(sequence_tokens.shape)}"
+        )
 
     seq_len = sequence_tokens.shape[1]
-    if seq_len != 100:
-        raise ValueError(f"This function expects a sequence of length 100, got {seq_len}.")
 
-    # Convert to 0-indexed, deduplicate, sort, validate.
+    # Convert 1-indexed -> 0-indexed, deduplicate, sort, validate.
     masked_pos = sorted(set(int(i) - 1 for i in masked_indexes))
-    if len(masked_pos) != 50:
-        raise ValueError(
-            f"This function expects exactly 50 masked indexes out of 100, got {len(masked_pos)}."
-        )
+    if len(masked_pos) == 0:
+        raise ValueError("masked_indexes must be non-empty")
     if any(pos < 0 or pos >= seq_len for pos in masked_pos):
-        raise ValueError("masked_indexes must be 1-indexed positions in [1, 100].")
-
-    if steps != len(masked_pos):
         raise ValueError(
-            f"This optimized version assumes one token revealed per step, "
-            f"so steps must equal number of masked positions. "
-            f"Got steps={steps}, num_masked={len(masked_pos)}."
+            f"masked_indexes must be 1-indexed positions in [1, {seq_len}]"
         )
 
-    masked_pos_t = torch.tensor(masked_pos, dtype=torch.long, device=device)   # [50]
-    target_masked_tokens = sequence_tokens[0, masked_pos_t]                    # [50]
+    num_masked = len(masked_pos)
+    if steps != num_masked:
+        raise ValueError(
+            "This specialization assumes one token transferred per step, "
+            f"so steps must equal the number of masked positions. "
+            f"Got steps={steps}, num_masked={num_masked}."
+        )
 
-    # Full attention mask, unchanged sequence length.
+    masked_pos_t = torch.tensor(masked_pos, dtype=torch.long, device=device)   # [M]
+    target_masked_tokens = sequence_tokens[0, masked_pos_t]                    # [M]
+
+    # Validate / store base attention mask
+    base_attn = None
     if attention_mask is not None:
         attention_mask = attention_mask.to(device, non_blocking=True)
         if attention_mask.ndim != 2 or attention_mask.shape != (1, seq_len):
             raise ValueError(
-                f"attention_mask must have shape [1, {seq_len}], got {tuple(attention_mask.shape)}"
+                f"attention_mask must have shape [1, {seq_len}], "
+                f"got {tuple(attention_mask.shape)}"
             )
-        attn = attention_mask.expand(mc_batch_size, -1)
-    else:
-        attn = None
+        base_attn = attention_mask
 
     rng = torch.Generator(device=device)
     if seed is not None:
@@ -1682,71 +1671,93 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     for start in range(0, num_samples, mc_batch_size):
         bsz = min(mc_batch_size, num_samples - start)
 
-        x = sequence_tokens.expand(bsz, -1).clone()                            # [B,100]
-        x[:, masked_pos_t] = mask_id                                           # start from partial mask
+        # Start from the observed sequence, with the chosen subset masked out.
+        x = sequence_tokens.expand(bsz, -1).clone()                            # [B,L]
+        x[:, masked_pos_t] = mask_id
 
         alive = torch.ones(bsz, dtype=torch.bool, device=device)
 
-        attn_batch = torch.ones((bsz, seq_len), dtype=torch.long, device=device)
+        attn_batch = None
+        if base_attn is not None:
+            attn_batch = base_attn.expand(bsz, -1)
 
         for _step_idx in range(steps):
             if not alive.any():
                 break
 
-            logits = model(x, attention_mask=attn_batch).logits                # [B,100,V]
-            probs = logits.softmax(dim=-1)                                     # [B,100,V]
-            scaled_logits = logits / temperature                               # [B,100,V]
+            logits = model(x, attention_mask=attn_batch).logits                # [B,L,V]
 
-            masked = (x[:, masked_pos_t] == mask_id) & alive[:, None]          # [B,50]
+            # Restrict to candidate positions only.
+            masked_logits = logits[:, masked_pos_t, :]                         # [B,M,V]
+
+            # Which candidate positions are still masked right now?
+            still_masked = (x[:, masked_pos_t] == mask_id)                     # [B,M]
+
+            # Decode from the actual temperature-scaled distribution.
+            scaled_masked_logits = masked_logits / temperature                 # [B,M,V]
 
             if decoding_scheme == "top_k":
-                top_k = min(k, scaled_logits.shape[-1])
-                masked_scaled_logits = scaled_logits[:, masked_pos_t, :]        # [B,50,V]
+                top_k = min(k, scaled_masked_logits.shape[-1])
 
-                top_vals, top_idx = torch.topk(masked_scaled_logits, k=top_k, dim=-1)  # [B,50,K]
-                top_probs = top_vals.softmax(dim=-1)                            # [B,50,K]
+                top_vals, top_idx = torch.topk(
+                    scaled_masked_logits, k=top_k, dim=-1
+                )                                                              # [B,M,K]
+
+                top_probs = top_vals.softmax(dim=-1)                           # [B,M,K]
 
                 sampled_local = torch.multinomial(
                     top_probs.reshape(-1, top_k),
                     num_samples=1,
                     generator=rng,
-                ).reshape(bsz, len(masked_pos))                                 # [B,50]
+                ).reshape(bsz, num_masked)                                     # [B,M]
 
-                sampled_tokens_masked = top_idx.gather(
+                sampled_tokens = top_idx.gather(
                     dim=-1,
                     index=sampled_local.unsqueeze(-1),
-                ).squeeze(-1)                                                   # [B,50]
-            else:
-                vocab_size = scaled_logits.shape[-1]
-                masked_scaled_logits = scaled_logits[:, masked_pos_t, :]        # [B,50,V]
+                ).squeeze(-1)                                                  # [B,M]
 
-                sampled_tokens_masked = torch.multinomial(
-                    masked_scaled_logits.softmax(dim=-1).reshape(-1, vocab_size),
+                # Confidence must match the actual sampling distribution.
+                chosen_confidence = top_probs.gather(
+                    dim=-1,
+                    index=sampled_local.unsqueeze(-1),
+                ).squeeze(-1)                                                  # [B,M]
+
+            else:  # full-vocab sampling
+                vocab_size = scaled_masked_logits.shape[-1]
+                scaled_probs = scaled_masked_logits.softmax(dim=-1)            # [B,M,V]
+
+                sampled_tokens = torch.multinomial(
+                    scaled_probs.reshape(-1, vocab_size),
                     num_samples=1,
                     generator=rng,
-                ).reshape(bsz, len(masked_pos))                                 # [B,50]
+                ).reshape(bsz, num_masked)                                     # [B,M]
 
-            chosen_prob = probs[:, masked_pos_t, :].gather(
-                dim=-1,
-                index=sampled_tokens_masked.unsqueeze(-1),
-            ).squeeze(-1)                                                       # [B,50]
+                chosen_confidence = scaled_probs.gather(
+                    dim=-1,
+                    index=sampled_tokens.unsqueeze(-1),
+                ).squeeze(-1)                                                  # [B,M]
 
-            neg_inf = torch.full_like(chosen_prob, float("-inf"))
-            confidence = torch.where(masked, chosen_prob, neg_inf)              # [B,50]
+            # Only currently masked positions are eligible for transfer.
+            neg_inf = torch.full_like(chosen_confidence, float("-inf"))
+            confidence = torch.where(still_masked, chosen_confidence, neg_inf) # [B,M]
 
-            # Low-confidence-remasking sampler in generate.py reveals the position with
-            # highest confidence among currently masked positions when one token is transferred.
-            selected_masked_slot = confidence.argmax(dim=-1)                    # [B]
+            selected_slot = confidence.argmax(dim=-1)                          # [B]
             batch_idx = torch.arange(bsz, device=device)
 
-            selected_abs_pos = masked_pos_t[selected_masked_slot]               # [B]
-            selected_token = sampled_tokens_masked[batch_idx, selected_masked_slot]
-            selected_target = sequence_tokens[0, selected_abs_pos]
+            selected_abs_pos = masked_pos_t[selected_slot]                     # [B]
+            selected_token = sampled_tokens[batch_idx, selected_slot]          # [B]
+            selected_target = sequence_tokens[0, selected_abs_pos]             # [B]
 
-            active = alive
-            x[batch_idx[active], selected_abs_pos[active]] = selected_token[active]
+            # Transfer exactly one token for each active rollout.
+            active_idx = batch_idx[alive]
+            active_pos = selected_abs_pos[alive]
+            active_tok = selected_token[alive]
 
-            mismatch = active & (selected_token != selected_target)
+            x[active_idx, active_pos] = active_tok
+
+            # If the transferred token is wrong, this rollout can no longer
+            # exactly match the target sequence.
+            mismatch = alive & (selected_token != selected_target)
             alive = alive & (~mismatch)
 
         if alive.any():
