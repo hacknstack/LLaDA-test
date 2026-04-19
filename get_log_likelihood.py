@@ -98,8 +98,7 @@ def get_log_likelihood_from_partially_masked(
         mask_id: The token id of [MASK] is 126336.
 
     Returns:
-        Monte Carlo estimate of log P(z_masked_positions | z_observed_positions),
-        matching the semantics of the original get_log_likelihood.
+        Monte Carlo estimate of log P(z_masked_positions | z_observed_positions).
     '''
     device = model.device
 
@@ -117,7 +116,7 @@ def get_log_likelihood_from_partially_masked(
     if mc_num % batch_size != 0:
         raise ValueError(f'mc_num ({mc_num}) must be divisible by batch_size ({batch_size})')
 
-    # Convert 1-indexed -> 0-indexed, validate, deduplicate.
+    # Convert 1-indexed -> 0-indexed.
     masked_pos = sorted(set(int(i) - 1 for i in masked_indexes))
     for pos in masked_pos:
         if pos < 0 or pos >= seq_len:
@@ -126,15 +125,14 @@ def get_log_likelihood_from_partially_masked(
             )
 
     if len(masked_pos) == 0:
-        # No generated positions => conditional log-likelihood of empty target is 0.
         return 0.0
 
     seq = prompt[None, :].repeat((batch_size, 1)).to(device)
 
-    # True on observed / conditioning positions, False on target / generated positions.
+    # IMPORTANT: keep this 1D, not batched.
+    # True = observed/conditioning token, False = token whose likelihood we evaluate.
     prompt_index = torch.ones(seq_len, dtype=torch.bool, device=device)
     prompt_index[torch.tensor(masked_pos, dtype=torch.long, device=device)] = False
-    prompt_index = prompt_index.unsqueeze(0).expand(batch_size, -1)
 
     loss_ = []
     for _ in range(mc_num // batch_size):
@@ -148,8 +146,8 @@ def get_log_likelihood_from_partially_masked(
             seq[mask_index],
             reduction='none',
         ) / p_mask[mask_index]
-        loss = loss.sum() / batch_size
 
+        loss = loss.sum() / batch_size
         loss_.append(loss.item())
 
     return -sum(loss_) / len(loss_)
