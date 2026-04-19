@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Any
 
 import torch
 import torch.nn.functional as F
-from get_log_likelihood import get_log_likelihood
+from get_log_likelihood import get_log_likelihood, get_log_likelihood_from_partially_masked
 
 AUTOREGRESSIVE_MODEL_FAMILIES = {'llama', 'llama2', 'olmo', 'mistral'}
 
@@ -18,6 +18,34 @@ class MonteCarloResult:
     wilson_ci: Tuple[float, float]
     hits: int
     num_samples: int
+
+
+def validate_masked_indexes(masked_indexes: Optional[Sequence[int]]) -> Optional[List[int]]:
+    if masked_indexes is None:
+        return None
+
+    normalized = [int(index) for index in masked_indexes]
+    if len(normalized) != 50:
+        raise ValueError('--masked_indexes must contain exactly 50 integers.')
+    if any(index < 1 or index > 100 for index in normalized):
+        raise ValueError('--masked_indexes entries must be 1-indexed positions in [1, 100].')
+    if len(set(normalized)) != len(normalized):
+        raise ValueError('--masked_indexes must not contain duplicates.')
+    return normalized
+
+
+def _unsupported_partially_masked_configuration(
+    remasking: str,
+    estimation_method: str,
+    decoding_scheme: str,
+) -> None:
+    raise ValueError(
+        '--masked_indexes is only supported for LLaDA configurations that use '
+        '_elbo_probability, _path_sampling_random_probability, or '
+        '_monte_carlo_probability_temperature_fast. '
+        f'Got remasking={remasking!r}, estimation_method={estimation_method!r}, '
+        f'decoding_scheme={decoding_scheme!r}.'
+    )
 
 
 def _validate_common_args(remasking: str, estimation_method: str) -> None:
@@ -119,6 +147,39 @@ def _elbo_probability(
         'log_probability': log_probability,
     }
 
+@torch.no_grad()
+def _elbo_probability_from_partially_masked(
+    model,
+    sequence_tokens: torch.Tensor,     # [1, 100]
+    masked_indexes: list[int],         # 1-indexed masked positions
+    mask_id: int,
+) -> Dict[str, float]:
+    if sequence_tokens.ndim != 2 or sequence_tokens.shape[0] != 1:
+        raise ValueError('sequence_tokens must have shape (1, 100).')
+
+    seq_len = sequence_tokens.shape[1]
+    if seq_len != 100:
+        raise ValueError(f'sequence_tokens must have shape (1, 100); got (1, {seq_len}).')
+
+    masked_pos = sorted(set(int(i) for i in masked_indexes))
+    if len(masked_pos) != 50:
+        raise ValueError(
+            f'Expected exactly 50 masked positions out of 100, got {len(masked_pos)}.'
+        )
+    if any(pos < 1 or pos > 100 for pos in masked_pos):
+        raise ValueError('masked_indexes must be 1-indexed positions in [1, 100].')
+
+    sequence_1d = sequence_tokens[0]
+    log_probability = get_log_likelihood_from_partially_masked(
+        model=model,
+        prompt=sequence_1d,
+        masked_indexes=masked_pos,
+        mask_id=mask_id,
+    )
+    return {
+        'probability': math.exp(log_probability),
+        'log_probability': log_probability,
+    }
 
 @torch.no_grad()
 def _exact_probability(
@@ -938,6 +999,218 @@ def _path_sampling_random_probability(
         "estimation_method": "path_sampling",
     }
 
+@torch.inference_mode()
+def _path_sampling_random_probability_from_partially_masked(
+    model,
+    sequence_tokens: torch.Tensor,          # [1, 100]
+    masked_indexes: list[int],              # 1-indexed masked positions in sequence_tokens
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    num_samples: int,
+    seed: Optional[int],
+    decoding_scheme: str,
+    k: int,
+    temperature: float,
+    batch_size: int = 64,
+) -> Dict[str, object]:
+    """
+    Batched path-sampling estimator for partially masked conditioning.
+
+    High-level behavior:
+      - sequence_tokens is the full target sequence z, shape [1, 100]
+      - masked_indexes specifies the 50 positions to regenerate
+      - the other 50 positions are observed / conditioning tokens
+      - samples a random reveal permutation over the 50 masked positions
+      - uses the same fixed schedule across steps
+      - computes the path probability of obtaining the target tokens at those masked positions
+      - supports 'top_k' and full-softmax decoding
+      - returns the same output structure as the suffix-only version
+
+    Assumptions:
+      - sequence_tokens has shape [1, 100]
+      - exactly 50 positions are masked
+      - if steps == 50, this is the one-token-per-step specialization
+      - attention_mask, if provided, has shape [1, 100]
+    """
+    device = _model_device(model)
+    sequence_tokens = sequence_tokens.to(device)
+
+    if sequence_tokens.ndim != 2 or sequence_tokens.shape[0] != 1:
+        raise ValueError(
+            f"sequence_tokens must have shape [1, 100], got {tuple(sequence_tokens.shape)}"
+        )
+
+    seq_len = sequence_tokens.shape[1]
+    if seq_len != 100:
+        raise ValueError(f"Expected sequence length 100, got {seq_len}")
+
+    # Convert 1-indexed -> 0-indexed, deduplicate, sort, validate.
+    masked_pos = sorted(set(int(i) - 1 for i in masked_indexes))
+    if len(masked_pos) != 50:
+        raise ValueError(
+            f"Expected exactly 50 masked positions out of 100, got {len(masked_pos)}"
+        )
+    if any(pos < 0 or pos >= seq_len for pos in masked_pos):
+        raise ValueError("masked_indexes must be 1-indexed positions in [1, 100]")
+
+    masked_len = len(masked_pos)
+    masked_pos_t = torch.tensor(masked_pos, dtype=torch.long, device=device)   # [50]
+
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+        if attention_mask.shape != (1, seq_len):
+            raise ValueError(
+                f"attention_mask must have shape [1, {seq_len}], got {tuple(attention_mask.shape)}"
+            )
+
+    # Keep CPU RNG for seeded reproducibility style close to the original.
+    rng = torch.Generator(device="cpu")
+    if seed is not None:
+        rng.manual_seed(seed)
+
+    base = masked_len // steps
+    rem = masked_len % steps
+    schedule = [base + (1 if i < rem else 0) for i in range(steps)]
+
+    full_target_row = sequence_tokens[0]                 # [100]
+    masked_target_row = full_target_row[masked_pos_t]    # [50]
+
+    sample_log_probabilities: List[float] = []
+    sample_probabilities: List[float] = []
+
+    for batch_start in range(0, num_samples, batch_size):
+        bsz = min(batch_size, num_samples - batch_start)
+
+        # Current sequence states for all samples in this batch.
+        x = sequence_tokens.expand(bsz, -1).clone()      # [bsz, 100]
+        x[:, masked_pos_t] = mask_id
+
+        # Accumulated log-probability for each sample.
+        log_path_probability = torch.zeros(bsz, dtype=torch.float64, device=device)
+
+        # Whether the sample is still alive (not zero-probability yet).
+        alive = torch.ones(bsz, dtype=torch.bool, device=device)
+
+        # Random reveal permutations over the 50 masked slots, one per sample.
+        # Generated on CPU using the seeded CPU RNG, then moved to device.
+        perm_scores = torch.rand((bsz, masked_len), generator=rng, device="cpu")
+        permutation = perm_scores.argsort(dim=-1).to(device)  # [bsz, 50]
+        # permutation indexes into masked_pos_t / masked_target_row, not absolute positions.
+
+        start = 0
+        for step_size in schedule:
+            reveal_slots = permutation[:, start:start + step_size]  # [bsz, step_size], values in [0, 49]
+            start += step_size
+
+            # Repeat attention mask across batch if needed.
+            batched_attn = None
+            if attention_mask is not None:
+                batched_attn = attention_mask.expand(bsz, -1)
+
+            logits = model(x, attention_mask=batched_attn).logits   # [bsz, 100, vocab]
+            vocab_size = logits.shape[-1]
+
+            # Map reveal slots -> absolute sequence positions.
+            reveal_abs_positions = masked_pos_t[reveal_slots]       # [bsz, step_size]
+
+            gather_index = reveal_abs_positions.unsqueeze(-1).expand(-1, -1, vocab_size)
+            step_logits = torch.gather(logits, dim=1, index=gather_index)  # [bsz, step_size, vocab]
+
+            target_ids = torch.gather(
+                masked_target_row.unsqueeze(0).expand(bsz, -1),
+                dim=1,
+                index=reveal_slots,
+            )  # [bsz, step_size]
+
+            scaled_logits = step_logits if temperature <= 0 else (step_logits / temperature)
+
+            if decoding_scheme == "top_k":
+                top_k = min(k, scaled_logits.shape[-1])
+                topk_vals, topk_idx = torch.topk(scaled_logits, k=top_k, dim=-1)  # [bsz, step_size, top_k]
+
+                in_topk = (topk_idx == target_ids.unsqueeze(-1)).any(dim=-1)  # [bsz, step_size]
+
+                target_logits = torch.gather(
+                    scaled_logits,
+                    dim=-1,
+                    index=target_ids.unsqueeze(-1),
+                ).squeeze(-1)  # [bsz, step_size]
+
+                token_log_probs = target_logits - torch.logsumexp(topk_vals, dim=-1)
+                token_log_probs = torch.where(
+                    in_topk,
+                    token_log_probs,
+                    torch.full_like(token_log_probs, float("-inf")),
+                )
+            else:
+                target_logits = torch.gather(
+                    scaled_logits,
+                    dim=-1,
+                    index=target_ids.unsqueeze(-1),
+                ).squeeze(-1)  # [bsz, step_size]
+
+                token_log_probs = target_logits - torch.logsumexp(scaled_logits, dim=-1)
+
+            # If any revealed token has zero probability, the whole path becomes zero.
+            step_has_zero = torch.isneginf(token_log_probs).any(dim=-1)  # [bsz]
+
+            # Sum token log-probs for alive paths only.
+            safe_token_log_probs = torch.where(
+                torch.isfinite(token_log_probs),
+                token_log_probs,
+                torch.zeros_like(token_log_probs),
+            )
+            step_log_prob = safe_token_log_probs.sum(dim=-1)  # [bsz]
+
+            log_path_probability = torch.where(
+                alive & (~step_has_zero),
+                log_path_probability + step_log_prob,
+                log_path_probability,
+            )
+
+            alive = alive & (~step_has_zero)
+
+            # Update x with the revealed target tokens for all samples.
+            x.scatter_(dim=1, index=reveal_abs_positions, src=target_ids)
+
+        batch_log_probs = torch.where(
+            alive,
+            log_path_probability,
+            torch.full_like(log_path_probability, float("-inf")),
+        )
+
+        sample_log_probabilities.extend(batch_log_probs.detach().cpu().tolist())
+
+        batch_probabilities = torch.where(
+            torch.isfinite(batch_log_probs),
+            torch.exp(batch_log_probs),
+            torch.zeros_like(batch_log_probs),
+        )
+        sample_probabilities.extend(batch_probabilities.detach().cpu().tolist())
+
+    if sample_log_probabilities:
+        finite_logs = [lp for lp in sample_log_probabilities if not math.isinf(lp)]
+        if not finite_logs:
+            average_probability = 0.0
+        else:
+            max_log = max(finite_logs)
+            scaled_sum = sum(math.exp(lp - max_log) for lp in finite_logs)
+            average_probability = float(
+                math.exp(max_log) * (scaled_sum / len(sample_log_probabilities))
+            )
+    else:
+        average_probability = 0.0
+
+    return {
+        "probability": average_probability,
+        "sample_probabilities": sample_probabilities,
+        "num_samples": num_samples,
+        "estimation_method": "path_sampling",
+    }
 
 @torch.no_grad()
 def _autoregressive_probability(
@@ -1037,6 +1310,7 @@ def compute_diffusion_probabilistic_extraction(
     decoding_scheme: str = 'full',
     k: int = 40,
     temperature: float = 0.0,
+    masked_indexes: Optional[Sequence[int]] = None,
 ):
     """
     Compute probabilistic extraction under LLaDA Algorithm-5 style low-confidence remasking.
@@ -1065,6 +1339,16 @@ def compute_diffusion_probabilistic_extraction(
     if target_tokens.ndim != 2 or target_tokens.shape[0] != 1:
         raise ValueError('target_tokens must have shape (1, j).')
 
+    normalized_masked_indexes = validate_masked_indexes(masked_indexes)
+    sequence_tokens = None
+    if normalized_masked_indexes is not None:
+        sequence_tokens = torch.cat([prompt_tokens, target_tokens], dim=1)
+        if sequence_tokens.shape[1] != 100:
+            raise ValueError(
+                '--masked_indexes is only supported for 100-token sequences; '
+                f'got total length {sequence_tokens.shape[1]}.'
+            )
+
     model_family = model_family.lower()
     if model_family != 'llada':
         raise ValueError('compute_diffusion_probabilistic_extraction only supports model_family="llada".')
@@ -1077,12 +1361,20 @@ def compute_diffusion_probabilistic_extraction(
         raise ValueError('decoding_scheme="random" requires remasking="random".')
 
     if normalized_decoding_scheme == 'elbo':
-        result = _elbo_probability(
-            model=model,
-            prompt_tokens=prompt_tokens,
-            target_tokens=target_tokens,
-            mask_id=mask_id,
-        )
+        if normalized_masked_indexes is None:
+            result = _elbo_probability(
+                model=model,
+                prompt_tokens=prompt_tokens,
+                target_tokens=target_tokens,
+                mask_id=mask_id,
+            )
+        else:
+            result = _elbo_probability_from_partially_masked(
+                model=model,
+                sequence_tokens=sequence_tokens,
+                masked_indexes=normalized_masked_indexes,
+                mask_id=mask_id,
+            )
         return {
             'method': 'elbo',
             'probability': result['probability'],
@@ -1095,10 +1387,16 @@ def compute_diffusion_probabilistic_extraction(
 
     if steps <= 0:
         raise ValueError('steps must be > 0.')
-    if target_tokens.shape[1] < steps:
+    if normalized_masked_indexes is None and target_tokens.shape[1] < steps:
         raise ValueError('steps must be <= target suffix length for this scheduler.')
 
     if remasking == 'target-token-confidence':
+        if normalized_masked_indexes is not None:
+            _unsupported_partially_masked_configuration(
+                remasking=remasking,
+                estimation_method=estimation_method,
+                decoding_scheme=normalized_decoding_scheme,
+            )
         if estimation_method != 'exact':
             raise ValueError('remasking="target-token-confidence" only supports estimation_method="exact".')
         if temperature <= 0:
@@ -1132,19 +1430,34 @@ def compute_diffusion_probabilistic_extraction(
             raise ValueError('remasking="random" only supports estimation_method="path_sampling".')
         if num_samples <= 0:
             raise ValueError('num_samples must be > 0 when estimation_method="path_sampling".')
-        path_sampling_result = _path_sampling_random_probability(
-            model=model,
-            prompt_tokens=prompt_tokens,
-            target_tokens=target_tokens,
-            steps=steps,
-            attention_mask=attention_mask,
-            mask_id=mask_id,
-            num_samples=num_samples,
-            seed=seed,
-            decoding_scheme=normalized_decoding_scheme,
-            k=k,
-            temperature=temperature,
-        )
+        if normalized_masked_indexes is None:
+            path_sampling_result = _path_sampling_random_probability(
+                model=model,
+                prompt_tokens=prompt_tokens,
+                target_tokens=target_tokens,
+                steps=steps,
+                attention_mask=attention_mask,
+                mask_id=mask_id,
+                num_samples=num_samples,
+                seed=seed,
+                decoding_scheme=normalized_decoding_scheme,
+                k=k,
+                temperature=temperature,
+            )
+        else:
+            path_sampling_result = _path_sampling_random_probability_from_partially_masked(
+                model=model,
+                sequence_tokens=sequence_tokens,
+                masked_indexes=normalized_masked_indexes,
+                steps=steps,
+                attention_mask=attention_mask,
+                mask_id=mask_id,
+                num_samples=num_samples,
+                seed=seed,
+                decoding_scheme=normalized_decoding_scheme,
+                k=k,
+                temperature=temperature,
+            )
         return {
             'method': 'path_sampling',
             'probability': path_sampling_result['probability'],
@@ -1156,6 +1469,12 @@ def compute_diffusion_probabilistic_extraction(
         }
 
     if estimation_method == 'path_sampling':
+        if normalized_masked_indexes is not None:
+            _unsupported_partially_masked_configuration(
+                remasking=remasking,
+                estimation_method=estimation_method,
+                decoding_scheme=normalized_decoding_scheme,
+            )
         if normalized_decoding_scheme not in {'full', 'top_k'}:
             raise ValueError('estimation_method="path_sampling" with remasking="low-confidence" requires decoding_scheme in {"full", "top_k"}.')
         if not math.isclose(float(temperature), 1.0, rel_tol=0.0, abs_tol=1e-9):
@@ -1186,6 +1505,12 @@ def compute_diffusion_probabilistic_extraction(
         }
 
     if estimation_method == 'exact':
+        if normalized_masked_indexes is not None:
+            _unsupported_partially_masked_configuration(
+                remasking=remasking,
+                estimation_method=estimation_method,
+                decoding_scheme=normalized_decoding_scheme,
+            )
         return {
             'method': 'exact',
             'probability': _exact_probability(
@@ -1200,21 +1525,42 @@ def compute_diffusion_probabilistic_extraction(
 
     if temperature > 0:
 
-        mc = _monte_carlo_probability_temperature_fast(
-            model=model,
-            prompt_tokens=prompt_tokens,
-            target_tokens=target_tokens,
-            steps=steps,
-            attention_mask=attention_mask,
-            mask_id=mask_id,
-            num_samples=num_samples,
-            seed=seed,
-            temperature=temperature,
-            decoding_scheme=decoding_scheme,
-            k=k,
-        )
+        if normalized_masked_indexes is None:
+            mc = _monte_carlo_probability_temperature_fast(
+                model=model,
+                prompt_tokens=prompt_tokens,
+                target_tokens=target_tokens,
+                steps=steps,
+                attention_mask=attention_mask,
+                mask_id=mask_id,
+                num_samples=num_samples,
+                seed=seed,
+                temperature=temperature,
+                decoding_scheme=decoding_scheme,
+                k=k,
+            )
+        else:
+            mc = _monte_carlo_probability_temperature_fast_from_partially_masked(
+                model=model,
+                sequence_tokens=sequence_tokens,
+                masked_indexes=normalized_masked_indexes,
+                steps=steps,
+                attention_mask=attention_mask,
+                mask_id=mask_id,
+                num_samples=num_samples,
+                seed=seed,
+                temperature=temperature,
+                decoding_scheme=decoding_scheme,
+                k=k,
+            )
         
     else:
+        if normalized_masked_indexes is not None:
+            _unsupported_partially_masked_configuration(
+                remasking=remasking,
+                estimation_method=estimation_method,
+                decoding_scheme=normalized_decoding_scheme,
+            )
         mc = _monte_carlo_probability(
             model=model,
             prompt_tokens=prompt_tokens,
@@ -1237,7 +1583,185 @@ def compute_diffusion_probabilistic_extraction(
         'k': k if decoding_scheme == 'top_k' else None,
     }
 
+@torch.inference_mode()
+def _monte_carlo_probability_temperature_fast_from_partially_masked(
+    model,
+    sequence_tokens: torch.Tensor,               # [1, L] ; full target sequence z
+    masked_indexes: list[int],                  # 1-indexed masked positions inside sequence_tokens
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    num_samples: int,
+    seed: Optional[int],
+    temperature: float,
+    decoding_scheme: str,
+    k: int,
+    mc_batch_size: int = 512,
+) -> MonteCarloResult:
+    """
+    Monte Carlo estimate of the probability that LLaDA with low-confidence remasking
+    exactly regenerates the masked part of `sequence_tokens`, conditioned on the
+    unmasked part.
 
+    This version supports arbitrary masking patterns inside a fixed-length sequence.
+
+    Assumptions / specialization:
+      - sequence length is exactly 100
+      - exactly 50 positions are masked
+      - steps == number of masked positions, i.e. one token revealed per step
+      - low-confidence remasking behavior is approximated by selecting the currently
+        masked position whose sampled token has highest model probability
+
+    Args:
+        model: LLaDA model.
+        sequence_tokens: [1, 100], the full sequence z.
+        masked_indexes: list[int], 1-indexed positions to mask and regenerate.
+        steps: must equal 50.
+        attention_mask: Optional [1, 100] attention mask.
+        mask_id: mask token id.
+        num_samples: number of Monte Carlo rollouts.
+        seed: optional RNG seed.
+        temperature: sampling temperature, must be > 0.
+        decoding_scheme: "top_k" or sampling from full vocab otherwise.
+        k: top-k parameter if decoding_scheme == "top_k".
+        mc_batch_size: MC minibatch size.
+
+    Returns:
+        MonteCarloResult with hit-count estimate.
+    """
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+
+    device = _model_device(model)
+    sequence_tokens = sequence_tokens.to(device, non_blocking=True)
+
+    assert sequence_tokens.ndim == 2 and sequence_tokens.shape[0] == 1
+
+    seq_len = sequence_tokens.shape[1]
+    if seq_len != 100:
+        raise ValueError(f"This function expects a sequence of length 100, got {seq_len}.")
+
+    # Convert to 0-indexed, deduplicate, sort, validate.
+    masked_pos = sorted(set(int(i) - 1 for i in masked_indexes))
+    if len(masked_pos) != 50:
+        raise ValueError(
+            f"This function expects exactly 50 masked indexes out of 100, got {len(masked_pos)}."
+        )
+    if any(pos < 0 or pos >= seq_len for pos in masked_pos):
+        raise ValueError("masked_indexes must be 1-indexed positions in [1, 100].")
+
+    if steps != len(masked_pos):
+        raise ValueError(
+            f"This optimized version assumes one token revealed per step, "
+            f"so steps must equal number of masked positions. "
+            f"Got steps={steps}, num_masked={len(masked_pos)}."
+        )
+
+    masked_pos_t = torch.tensor(masked_pos, dtype=torch.long, device=device)   # [50]
+    target_masked_tokens = sequence_tokens[0, masked_pos_t]                    # [50]
+
+    # Full attention mask, unchanged sequence length.
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device, non_blocking=True)
+        if attention_mask.ndim != 2 or attention_mask.shape != (1, seq_len):
+            raise ValueError(
+                f"attention_mask must have shape [1, {seq_len}], got {tuple(attention_mask.shape)}"
+            )
+        attn = attention_mask.expand(mc_batch_size, -1)
+    else:
+        attn = None
+
+    rng = torch.Generator(device=device)
+    if seed is not None:
+        rng.manual_seed(seed)
+
+    hits = 0
+
+    for start in range(0, num_samples, mc_batch_size):
+        bsz = min(mc_batch_size, num_samples - start)
+
+        x = sequence_tokens.expand(bsz, -1).clone()                            # [B,100]
+        x[:, masked_pos_t] = mask_id                                           # start from partial mask
+
+        alive = torch.ones(bsz, dtype=torch.bool, device=device)
+
+        attn_batch = attn[:bsz] if attn is not None else None
+
+        for _step_idx in range(steps):
+            if not alive.any():
+                break
+
+            logits = model(x, attention_mask=attn_batch).logits                # [B,100,V]
+            probs = logits.softmax(dim=-1)                                     # [B,100,V]
+            scaled_logits = logits / temperature                               # [B,100,V]
+
+            masked = (x[:, masked_pos_t] == mask_id) & alive[:, None]          # [B,50]
+
+            if decoding_scheme == "top_k":
+                top_k = min(k, scaled_logits.shape[-1])
+                masked_scaled_logits = scaled_logits[:, masked_pos_t, :]        # [B,50,V]
+
+                top_vals, top_idx = torch.topk(masked_scaled_logits, k=top_k, dim=-1)  # [B,50,K]
+                top_probs = top_vals.softmax(dim=-1)                            # [B,50,K]
+
+                sampled_local = torch.multinomial(
+                    top_probs.reshape(-1, top_k),
+                    num_samples=1,
+                    generator=rng,
+                ).reshape(bsz, len(masked_pos))                                 # [B,50]
+
+                sampled_tokens_masked = top_idx.gather(
+                    dim=-1,
+                    index=sampled_local.unsqueeze(-1),
+                ).squeeze(-1)                                                   # [B,50]
+            else:
+                vocab_size = scaled_logits.shape[-1]
+                masked_scaled_logits = scaled_logits[:, masked_pos_t, :]        # [B,50,V]
+
+                sampled_tokens_masked = torch.multinomial(
+                    masked_scaled_logits.softmax(dim=-1).reshape(-1, vocab_size),
+                    num_samples=1,
+                    generator=rng,
+                ).reshape(bsz, len(masked_pos))                                 # [B,50]
+
+            chosen_prob = probs[:, masked_pos_t, :].gather(
+                dim=-1,
+                index=sampled_tokens_masked.unsqueeze(-1),
+            ).squeeze(-1)                                                       # [B,50]
+
+            neg_inf = torch.full_like(chosen_prob, float("-inf"))
+            confidence = torch.where(masked, chosen_prob, neg_inf)              # [B,50]
+
+            # Low-confidence-remasking sampler in generate.py reveals the position with
+            # highest confidence among currently masked positions when one token is transferred.
+            selected_masked_slot = confidence.argmax(dim=-1)                    # [B]
+            batch_idx = torch.arange(bsz, device=device)
+
+            selected_abs_pos = masked_pos_t[selected_masked_slot]               # [B]
+            selected_token = sampled_tokens_masked[batch_idx, selected_masked_slot]
+            selected_target = sequence_tokens[0, selected_abs_pos]
+
+            active = alive
+            x[batch_idx[active], selected_abs_pos[active]] = selected_token[active]
+
+            mismatch = active & (selected_token != selected_target)
+            alive = alive & (~mismatch)
+
+        if alive.any():
+            final_match = (x[:, masked_pos_t] == target_masked_tokens.unsqueeze(0)).all(dim=-1)
+            hits += (alive & final_match).sum().item()
+
+    estimate, se, wald, wilson = _safe_wald_and_wilson(hits, num_samples)
+    return MonteCarloResult(
+        estimate=estimate,
+        standard_error=se,
+        wald_ci=wald,
+        wilson_ci=wilson,
+        hits=hits,
+        num_samples=num_samples,
+    )
 @torch.no_grad()
 def compute_autoregressive_probabilistic_extraction(
     model,
@@ -1290,9 +1814,12 @@ def compute_probabilistic_extraction(
     k: int = 40,
     temperature: float = 0.0,
     return_token_details: bool = False,
+    masked_indexes: Optional[Sequence[int]] = None,
 ):
     model_family = model_family.lower()
     if model_family in AUTOREGRESSIVE_MODEL_FAMILIES:
+        if masked_indexes is not None:
+            raise ValueError('--masked_indexes is only supported when model_family="llada".')
         ar_decoding_scheme = 'top_k' if decoding_scheme == 'auto' else decoding_scheme
         return compute_autoregressive_probabilistic_extraction(
             model=model,
@@ -1322,5 +1849,6 @@ def compute_probabilistic_extraction(
             decoding_scheme=diffusion_decoding_scheme,
             k=k,
             temperature=temperature,
+            masked_indexes=masked_indexes,
         )
     raise ValueError("model_family must be one of {'llada', 'llama', 'llama2', 'olmo', 'mistral'}")

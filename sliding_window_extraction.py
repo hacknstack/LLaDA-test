@@ -16,6 +16,7 @@ from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 from probabilistic_extraction import (
     compute_autoregressive_probabilistic_extraction,
     compute_diffusion_probabilistic_extraction,
+    validate_masked_indexes,
 )
 
 
@@ -52,6 +53,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--temperature', type=float, default=0.0, help='Temperature for non-greedy llama decoding and llada target-token-confidence remasking')
     parser.add_argument('--remasking', choices=['low-confidence', 'target-token-confidence', 'random'], default='low-confidence',
                         help='Remasking strategy when --model-family llada')
+    parser.add_argument(
+        '--masked_indexes',
+        type=int,
+        nargs=50,
+        default=None,
+        help='Exactly 50 1-indexed positions in the 100-token sequence to mask for partially-masked LLaDA conditioning.',
+    )
     return parser.parse_args()
 
 
@@ -122,6 +130,8 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
     decoding_scheme = _resolve_decoding_scheme(args)
 
     if args.model_family in AUTOREGRESSIVE_MODEL_FAMILIES:
+        if args.masked_indexes is not None:
+            raise ValueError('--masked_indexes is only supported when --model-family llada.')
         result = compute_autoregressive_probabilistic_extraction(
             model=model,
             prompt_tokens=prompt_tokens,
@@ -138,7 +148,7 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
         model=model,
         prompt_tokens=prompt_tokens,
         target_tokens=target_tokens,
-        steps=len(suffix_ids),
+        steps=len(args.masked_indexes) if args.masked_indexes is not None else len(suffix_ids),
         attention_mask=None,
         mask_id=MASK_ID,
         remasking=args.remasking,
@@ -148,6 +158,7 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
         decoding_scheme=decoding_scheme,
         k=args.k,
         temperature=args.temperature,
+        masked_indexes=args.masked_indexes,
     )
     print("result", result)
     if args.mode in {'exact', 'path_sampling'} or str(decoding_scheme).lower() == 'elbo':
@@ -157,9 +168,15 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
 
 def main() -> None:
     args = parse_args()
+    args.masked_indexes = validate_masked_indexes(args.masked_indexes)
 
     if args.prefix_tokens + args.suffix_tokens != args.seq_tokens:
         raise ValueError('prefix_tokens + suffix_tokens must equal seq_tokens.')
+    if args.masked_indexes is not None:
+        if args.model_family != 'llada':
+            raise ValueError('--masked_indexes is only supported when --model-family llada.')
+        if args.seq_tokens != 100:
+            raise ValueError('--masked_indexes is only supported when --seq-tokens is exactly 100.')
     if not args.txt_path.exists() or not args.txt_path.is_file():
         raise FileNotFoundError(f'Input file not found: {args.txt_path}')
 
