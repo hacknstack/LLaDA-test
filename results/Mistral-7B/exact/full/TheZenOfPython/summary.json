@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/TheZenOfPython.txt",
+  "total_chars": 822,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_chars": 10,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "mistral",
+    "model_name": "mistralai/Mistral-7B-v0.1",
+    "remasking": "low-confidence",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 46,
+  "num_windows_scored": 46,
+  "num_windows_extracted": 46,
+  "extraction_rate": 1.0,
+  "p_z_distribution": {
+    "min": 0.0032668818805057275,
+    "median": 0.42673199414623786,
+    "mean": 0.4031418753872853,
+    "max": 0.8099820761784312,
+    "q_0.9": 0.676062406860303,
+    "q_0.99": 0.7779821723941533,
+    "q_0.999": 0.8067820858000033
+  }
+}

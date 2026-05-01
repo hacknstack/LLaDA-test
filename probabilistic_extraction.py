@@ -154,7 +154,6 @@ def _elbo_probability_from_partially_masked(
     masked_indexes: list[int],         # 1-indexed masked positions
     mask_id: int,
 ) -> Dict[str, float]:
-    print("HUHUHUH")
     if sequence_tokens.ndim != 2 or sequence_tokens.shape[0] != 1:
         raise ValueError('sequence_tokens must have shape (1, 100).')
 
@@ -177,7 +176,6 @@ def _elbo_probability_from_partially_masked(
         masked_indexes=masked_pos,
         mask_id=mask_id,
     )
-    print(math.exp(log_probability))
     return {
         'probability': math.exp(log_probability),
         'log_probability': log_probability,
@@ -1295,6 +1293,301 @@ def _autoregressive_probability(
         result['token_details'] = token_details
     return result
 
+@torch.inference_mode()
+def _path_sampling_low_confidence_full_topk_probability(
+    model,
+    prompt_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    num_samples: int,
+    seed: Optional[int],
+    k: int,
+    temperature: float,
+    batch_size: int = 64,
+) -> Dict[str, object]:
+    """
+    Approximate path-sampling estimator for the third estimator in the note:
+
+        low-confidence remasking,
+        full-distribution token sampling,
+        temperature = temperature,
+        top-k retained successful transitions.
+
+    This estimates p_z^{(k)}, not the exact full-distribution p_z unless
+    k covers the full vocabulary.
+
+    Estimator:
+        \hat p_z^{(k), full} = prod_t A^{(k)}(S_{t-1})
+
+    where
+
+        A^{(k)}(S) = sum_i a_i^{(k)}(S)
+
+    and
+
+        a_i^{(k)}(S)
+        =
+        1{target_i in top-k at position i}
+        p_i(target_i)
+        prod_{j != i, j masked} F_j(p_i(target_i)).
+
+    Here F_j(c) is the full-distribution confidence CDF:
+
+        F_j(c) = sum_{v : p_j(v) < c} p_j(v).
+
+    Important:
+      - This low-confidence decoder reveals exactly one position per step.
+      - Therefore this implementation requires steps == suffix_len.
+      - The full CDF computation sorts the full vocabulary distribution, so
+        this is more expensive than the random-remasking estimator.
+    """
+    device = _model_device(model)
+    prompt_tokens = prompt_tokens.to(device)
+    target_tokens = target_tokens.to(device)
+
+    suffix_len = target_tokens.shape[1]
+    prompt_len = prompt_tokens.shape[1]
+
+    if steps != suffix_len:
+        raise ValueError(
+            "The low-confidence estimator reveals exactly one suffix token per step, "
+            f"so steps must equal suffix_len. Got steps={steps}, suffix_len={suffix_len}."
+        )
+
+    if k <= 0:
+        return {
+            "probability": 0.0,
+            "sample_probabilities": [0.0 for _ in range(num_samples)],
+            "num_samples": num_samples,
+            "estimation_method": "path_sampling_low_confidence_full_topk",
+        }
+
+    attn = _suffix_attention_mask(attention_mask, suffix_len, device)
+
+    # Keep CPU RNG style close to the random-remasking estimator.
+    rng = torch.Generator(device="cpu")
+    if seed is not None:
+        rng.manual_seed(seed)
+
+    prompt_row = prompt_tokens[0]   # [prompt_len]
+    target_row = target_tokens[0]   # [suffix_len]
+
+    sample_log_probabilities: List[float] = []
+    sample_probabilities: List[float] = []
+
+    for batch_start in range(0, num_samples, batch_size):
+        bsz = min(batch_size, num_samples - batch_start)
+
+        suffix = torch.full(
+            (bsz, suffix_len),
+            mask_id,
+            dtype=torch.long,
+            device=device,
+        )
+
+        # True while this estimator sample has not hit A^{(k)}(S) = 0.
+        alive = torch.ones(bsz, dtype=torch.bool, device=device)
+
+        # Accumulates log prod_t A^{(k)}(S_{t-1}).
+        log_estimate = torch.zeros(bsz, dtype=torch.float64, device=device)
+
+        for _ in range(suffix_len):
+            if not alive.any():
+                break
+
+            masked = suffix.eq(mask_id)  # [bsz, suffix_len]
+
+            x = torch.cat(
+                [prompt_row.unsqueeze(0).expand(bsz, -1), suffix],
+                dim=1,
+            )  # [bsz, prompt_len + suffix_len]
+
+            batched_attn = None
+            if attn is not None:
+                if attn.shape[0] == bsz:
+                    batched_attn = attn
+                else:
+                    batched_attn = attn.expand(bsz, *attn.shape[1:])
+
+            logits = model(x, attention_mask=batched_attn).logits
+            suffix_logits = logits[:, prompt_len:, :]  # [bsz, suffix_len, vocab]
+
+            if temperature <= 0:
+                scaled_logits = suffix_logits.float()
+            else:
+                scaled_logits = suffix_logits.float() / float(temperature)
+
+            bsz_cur, L, vocab_size = scaled_logits.shape
+            top_k = min(k, vocab_size)
+
+            # Full-distribution probabilities p_j(v).
+            probs = torch.softmax(scaled_logits, dim=-1).to(torch.float64)
+            # [bsz, suffix_len, vocab]
+
+            target_ids = target_row.unsqueeze(0).expand(bsz, -1)
+            target_probs = torch.gather(
+                probs,
+                dim=-1,
+                index=target_ids.unsqueeze(-1),
+            ).squeeze(-1)  # [bsz, suffix_len]
+
+            # Retention condition: target token must be in the top-k under
+            # the full distribution at its position.
+            _, topk_idx = torch.topk(scaled_logits, k=top_k, dim=-1)
+            target_in_topk = (topk_idx == target_ids.unsqueeze(-1)).any(dim=-1)
+            # [bsz, suffix_len]
+
+            # Compute full-distribution confidence CDFs:
+            #
+            #   F_j(c) = sum_{v : p_j(v) < c} p_j(v).
+            #
+            # We need F_j(target_probs_i) for every pair (j, i).
+            # Shape convention below:
+            #   j = row/source distribution position
+            #   i = candidate revealed position
+            sorted_probs = torch.sort(probs, dim=-1).values  # [bsz, L, vocab]
+            sorted_cumsum = torch.cumsum(sorted_probs, dim=-1)
+
+            zero_pad = torch.zeros(
+                (bsz, L, 1),
+                dtype=torch.float64,
+                device=device,
+            )
+            cdf_pad = torch.cat([zero_pad, sorted_cumsum], dim=-1)
+            # [bsz, L, vocab + 1]
+
+            # thresholds[b, j, i] = target_probs[b, i].
+            thresholds = target_probs.unsqueeze(1).expand(-1, L, -1)
+            # [bsz, L, L]
+
+            # Number of entries strictly less than each threshold.
+            # right=False gives first index where sorted_probs >= threshold.
+            cdf_indices = torch.searchsorted(
+                sorted_probs.contiguous(),
+                thresholds.contiguous(),
+                right=False,
+            )
+            # [bsz, L, L]
+
+            F_j_i = torch.gather(cdf_pad, dim=-1, index=cdf_indices)
+            # [bsz, j, i]
+
+            # log product over j != i, j masked:
+            #
+            #   sum_{j in M(S), j != i} log F_j(target_prob_i)
+            eye = torch.eye(L, dtype=torch.bool, device=device).unsqueeze(0)
+            pair_mask = (
+                masked.unsqueeze(2)      # j is masked
+                & masked.unsqueeze(1)    # i is masked
+                & (~eye)                 # j != i
+            )
+            # [bsz, j, i]
+
+            log_F_j_i = torch.log(F_j_i)
+            log_F_j_i = torch.where(
+                pair_mask,
+                log_F_j_i,
+                torch.zeros_like(log_F_j_i),
+            )
+
+            log_confidence_product = log_F_j_i.sum(dim=1)
+            # [bsz, i]
+
+            candidate_mask = (
+                alive.unsqueeze(-1)
+                & masked
+                & target_in_topk
+                & (target_probs > 0)
+            )
+
+            log_target_probs = torch.log(target_probs)
+
+            log_a = log_target_probs + log_confidence_product
+            log_a = torch.where(
+                candidate_mask,
+                log_a,
+                torch.full_like(log_a, float("-inf")),
+            )
+            # [bsz, suffix_len]
+
+            # A^{(k)}(S) = sum_i a_i^{(k)}(S).
+            log_A = torch.logsumexp(log_a, dim=-1)  # [bsz]
+
+            has_success_transition = torch.isfinite(log_A)
+            active = alive & has_success_transition
+
+            # For active samples, multiply running weight by A^{(k)}(S).
+            log_estimate = torch.where(
+                active,
+                log_estimate + log_A,
+                log_estimate,
+            )
+
+            # Samples with A^{(k)}(S) = 0 become zero-probability.
+            alive = alive & has_success_transition
+
+            if not active.any():
+                break
+
+            # Proposal:
+            #
+            #   q^{(k)}(i | S) = a_i^{(k)}(S) / A^{(k)}(S).
+            #
+            # Sample on CPU so the provided CPU generator can be used.
+            log_q_active = log_a[active] - log_A[active].unsqueeze(-1)
+            q_active = torch.exp(log_q_active).detach().cpu()
+
+            sampled_pos_cpu = torch.multinomial(
+                q_active,
+                num_samples=1,
+                replacement=True,
+                generator=rng,
+            ).squeeze(-1)
+
+            sampled_pos = sampled_pos_cpu.to(device)
+
+            active_indices = torch.nonzero(active, as_tuple=False).squeeze(-1)
+
+            # Reveal the sampled successful position by writing the target token.
+            sampled_target_tokens = target_row[sampled_pos]
+            suffix[active_indices, sampled_pos] = sampled_target_tokens
+
+        batch_log_probs = torch.where(
+            alive,
+            log_estimate,
+            torch.full_like(log_estimate, float("-inf")),
+        )
+
+        sample_log_probabilities.extend(batch_log_probs.detach().cpu().tolist())
+
+        batch_probabilities = torch.where(
+            torch.isfinite(batch_log_probs),
+            torch.exp(batch_log_probs),
+            torch.zeros_like(batch_log_probs),
+        )
+        sample_probabilities.extend(batch_probabilities.detach().cpu().tolist())
+
+    if sample_log_probabilities:
+        finite_logs = [lp for lp in sample_log_probabilities if not math.isinf(lp)]
+        if not finite_logs:
+            average_probability = 0.0
+        else:
+            max_log = max(finite_logs)
+            scaled_sum = sum(math.exp(lp - max_log) for lp in finite_logs)
+            average_probability = float(
+                math.exp(max_log) * (scaled_sum / len(sample_log_probabilities))
+            )
+    else:
+        average_probability = 0.0
+
+    return {
+        "probability": average_probability,
+        "sample_probabilities": sample_probabilities,
+        "num_samples": num_samples,
+        "estimation_method": "path_sampling_low_confidence_full_topk",
+    }
 
 @torch.no_grad()
 def compute_diffusion_probabilistic_extraction(
@@ -1484,7 +1777,7 @@ def compute_diffusion_probabilistic_extraction(
         if num_samples <= 0:
             raise ValueError('num_samples must be > 0 when estimation_method="path_sampling".')
 
-        path_sampling_result = _path_sampling_probability_temperature1_tie_free(
+        path_sampling_result = _path_sampling_low_confidence_full_topk_probability(
             model=model,
             prompt_tokens=prompt_tokens,
             target_tokens=target_tokens,
@@ -1493,9 +1786,9 @@ def compute_diffusion_probabilistic_extraction(
             mask_id=mask_id,
             num_samples=num_samples,
             seed=seed,
-            temperature=temperature,
-            decoding_scheme=decoding_scheme,
-            k=k)
+            k=k,
+            temperature=temperature
+            )
         return {
             'method': 'path_sampling',
             'probability': path_sampling_result['probability'],

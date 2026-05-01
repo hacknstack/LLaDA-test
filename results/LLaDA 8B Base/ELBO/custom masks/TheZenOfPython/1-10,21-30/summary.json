@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/TheZenOfPython.txt",
+  "total_chars": 822,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_chars": 10,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "low-confidence",
+    "decoding_scheme": "ELBO",
+    "k": 40,
+    "temperature": 0.0
+  },
+  "num_windows_total": 43,
+  "num_windows_scored": 43,
+  "num_windows_extracted": 0,
+  "extraction_rate": 0.0,
+  "p_z_distribution": {
+    "min": 1.6244805930927562e-26,
+    "median": 3.1789171249951805e-23,
+    "mean": 2.6345412220537672e-20,
+    "max": 6.724164672161916e-19,
+    "q_0.9": 4.2268080224241116e-20,
+    "q_0.99": 4.623587390985975e-19,
+    "q_0.999": 6.514106944044315e-19
+  }
+}

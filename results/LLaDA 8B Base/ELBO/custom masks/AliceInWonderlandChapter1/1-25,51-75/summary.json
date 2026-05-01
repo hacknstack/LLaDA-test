@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/AliceInWonderlandChapter1.txt",
+  "total_chars": 11286,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_chars": 10,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "low-confidence",
+    "decoding_scheme": "ELBO",
+    "k": 40,
+    "temperature": 0.0
+  },
+  "num_windows_total": 1088,
+  "num_windows_scored": 1088,
+  "num_windows_extracted": 0,
+  "extraction_rate": 0.0,
+  "p_z_distribution": {
+    "min": 1.4366557617197734e-75,
+    "median": 6.334200424613977e-54,
+    "mean": 2.1551899015919228e-39,
+    "max": 8.965624544594488e-37,
+    "q_0.9": 6.114539750214672e-44,
+    "q_0.99": 3.7853324353443934e-38,
+    "q_0.999": 3.991461243108293e-37
+  }
+}

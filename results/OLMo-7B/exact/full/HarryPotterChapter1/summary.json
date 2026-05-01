@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/HarryPotterChapter1.txt",
+  "total_chars": 26070,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_chars": 10,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "olmo",
+    "model_name": "allenai/OLMo-7B-0724-hf",
+    "remasking": "low-confidence",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 2565,
+  "num_windows_scored": 2565,
+  "num_windows_extracted": 0,
+  "extraction_rate": 0.0,
+  "p_z_distribution": {
+    "min": 2.3973597566618377e-83,
+    "median": 1.7716186551504334e-49,
+    "mean": 1.0468321589610306e-19,
+    "max": 2.684803168568826e-16,
+    "q_0.9": 5.785086202053281e-39,
+    "q_0.99": 2.57277311054292e-33,
+    "q_0.999": 2.984150713984792e-24
+  }
+}

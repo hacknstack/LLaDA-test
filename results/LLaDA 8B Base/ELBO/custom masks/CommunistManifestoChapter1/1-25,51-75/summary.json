@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/CommunistManifestoChapter1.txt",
+  "total_chars": 27736,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_chars": 10,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "low-confidence",
+    "decoding_scheme": "ELBO",
+    "k": 40,
+    "temperature": 0.0
+  },
+  "num_windows_total": 2728,
+  "num_windows_scored": 2728,
+  "num_windows_extracted": 0,
+  "extraction_rate": 0.0,
+  "p_z_distribution": {
+    "min": 1.0189696264467498e-81,
+    "median": 2.2047707692578284e-57,
+    "mean": 2.6399736989062606e-39,
+    "max": 1.9648647721128166e-36,
+    "q_0.9": 3.1086014148994326e-47,
+    "q_0.99": 2.635382017939754e-40,
+    "q_0.999": 7.54372347362565e-37
+  }
+}
