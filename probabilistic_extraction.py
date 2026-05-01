@@ -1306,19 +1306,18 @@ def _path_sampling_low_confidence_full_topk_probability(
     k: int,
     temperature: float,
     batch_size: int = 64,
+    warn_if_A_exceeds_one: bool = True,
+    clamp_log_A: bool = True,
 ) -> Dict[str, object]:
     """
-    Approximate path-sampling estimator for the third estimator in the note:
+    Approximate path-sampling estimator for:
 
         low-confidence remasking,
         full-distribution token sampling,
-        temperature = temperature,
         top-k retained successful transitions.
 
-    This estimates p_z^{(k)}, not the exact full-distribution p_z unless
-    k covers the full vocabulary.
+    This implements the third estimator:
 
-    Estimator:
         \hat p_z^{(k), full} = prod_t A^{(k)}(S_{t-1})
 
     where
@@ -1333,15 +1332,19 @@ def _path_sampling_low_confidence_full_topk_probability(
         p_i(target_i)
         prod_{j != i, j masked} F_j(p_i(target_i)).
 
-    Here F_j(c) is the full-distribution confidence CDF:
+    Here
 
-        F_j(c) = sum_{v : p_j(v) < c} p_j(v).
+        F_j(c) = sum_{v : p_j(v) < c} p_j(v)
 
-    Important:
-      - This low-confidence decoder reveals exactly one position per step.
-      - Therefore this implementation requires steps == suffix_len.
-      - The full CDF computation sorts the full vocabulary distribution, so
-        this is more expensive than the random-remasking estimator.
+    is computed under the full softmax distribution.
+
+    Notes:
+      - This estimates p_z^{(k)}, not necessarily the exact p_z.
+      - It becomes exact for the full-distribution decoder only when k covers
+        the full vocabulary.
+      - The low-confidence decoder reveals exactly one suffix position per step,
+        so this function requires steps == suffix_len.
+      - All probability/CDF computations are done in float64 for stability.
     """
     device = _model_device(model)
     prompt_tokens = prompt_tokens.to(device)
@@ -1360,22 +1363,25 @@ def _path_sampling_low_confidence_full_topk_probability(
         return {
             "probability": 0.0,
             "sample_probabilities": [0.0 for _ in range(num_samples)],
+            "sample_log_probabilities": [float("-inf") for _ in range(num_samples)],
             "num_samples": num_samples,
             "estimation_method": "path_sampling_low_confidence_full_topk",
         }
 
     attn = _suffix_attention_mask(attention_mask, suffix_len, device)
 
-    # Keep CPU RNG style close to the random-remasking estimator.
     rng = torch.Generator(device="cpu")
     if seed is not None:
         rng.manual_seed(seed)
 
-    prompt_row = prompt_tokens[0]   # [prompt_len]
-    target_row = target_tokens[0]   # [suffix_len]
+    prompt_row = prompt_tokens[0]  # [prompt_len]
+    target_row = target_tokens[0]  # [suffix_len]
 
     sample_log_probabilities: List[float] = []
     sample_probabilities: List[float] = []
+
+    global_max_A = 0.0
+    global_num_A_exceeds_one = 0
 
     for batch_start in range(0, num_samples, batch_size):
         bsz = min(batch_size, num_samples - batch_start)
@@ -1387,13 +1393,15 @@ def _path_sampling_low_confidence_full_topk_probability(
             device=device,
         )
 
-        # True while this estimator sample has not hit A^{(k)}(S) = 0.
         alive = torch.ones(bsz, dtype=torch.bool, device=device)
 
-        # Accumulates log prod_t A^{(k)}(S_{t-1}).
+        # log_estimate[b] accumulates:
+        #
+        #   sum_t log A^{(k)}(S_{t-1})
+        #
         log_estimate = torch.zeros(bsz, dtype=torch.float64, device=device)
 
-        for _ in range(suffix_len):
+        for _step in range(suffix_len):
             if not alive.any():
                 break
 
@@ -1402,7 +1410,7 @@ def _path_sampling_low_confidence_full_topk_probability(
             x = torch.cat(
                 [prompt_row.unsqueeze(0).expand(bsz, -1), suffix],
                 dim=1,
-            )  # [bsz, prompt_len + suffix_len]
+            )
 
             batched_attn = None
             if attn is not None:
@@ -1414,39 +1422,41 @@ def _path_sampling_low_confidence_full_topk_probability(
             logits = model(x, attention_mask=batched_attn).logits
             suffix_logits = logits[:, prompt_len:, :]  # [bsz, suffix_len, vocab]
 
-            if temperature <= 0:
-                scaled_logits = suffix_logits.float()
-            else:
-                scaled_logits = suffix_logits.float() / float(temperature)
+            # Important:
+            # Convert to float64 BEFORE softmax.
+            # Casting probabilities after a float32 softmax can leave row-sum
+            # error that may produce tiny impossible A > 1 values.
+            scaled_logits = suffix_logits.to(torch.float64)
+            if temperature > 0:
+                scaled_logits = scaled_logits / float(temperature)
 
-            bsz_cur, L, vocab_size = scaled_logits.shape
+            probs = torch.softmax(scaled_logits, dim=-1)  # float64
+            bsz_cur, L, vocab_size = probs.shape
+
             top_k = min(k, vocab_size)
 
-            # Full-distribution probabilities p_j(v).
-            probs = torch.softmax(scaled_logits, dim=-1).to(torch.float64)
-            # [bsz, suffix_len, vocab]
+            target_ids = target_row.unsqueeze(0).expand(bsz, -1)  # [bsz, L]
 
-            target_ids = target_row.unsqueeze(0).expand(bsz, -1)
             target_probs = torch.gather(
                 probs,
                 dim=-1,
                 index=target_ids.unsqueeze(-1),
-            ).squeeze(-1)  # [bsz, suffix_len]
+            ).squeeze(-1)  # [bsz, L]
 
-            # Retention condition: target token must be in the top-k under
-            # the full distribution at its position.
+            # Retention condition:
+            # target token must be among top-k tokens under the full distribution.
             _, topk_idx = torch.topk(scaled_logits, k=top_k, dim=-1)
             target_in_topk = (topk_idx == target_ids.unsqueeze(-1)).any(dim=-1)
-            # [bsz, suffix_len]
+            # [bsz, L]
 
-            # Compute full-distribution confidence CDFs:
+            # Compute F_j(c) for all pairs (j, i):
             #
-            #   F_j(c) = sum_{v : p_j(v) < c} p_j(v).
+            #   F_j(target_prob_i)
+            #   =
+            #   sum_{v : p_j(v) < target_prob_i} p_j(v).
             #
-            # We need F_j(target_probs_i) for every pair (j, i).
-            # Shape convention below:
-            #   j = row/source distribution position
-            #   i = candidate revealed position
+            # We sort each position's full probability distribution and use
+            # searchsorted + prefix sums.
             sorted_probs = torch.sort(probs, dim=-1).values  # [bsz, L, vocab]
             sorted_cumsum = torch.cumsum(sorted_probs, dim=-1)
 
@@ -1462,8 +1472,10 @@ def _path_sampling_low_confidence_full_topk_probability(
             thresholds = target_probs.unsqueeze(1).expand(-1, L, -1)
             # [bsz, L, L]
 
-            # Number of entries strictly less than each threshold.
-            # right=False gives first index where sorted_probs >= threshold.
+            # Number of probabilities strictly less than threshold.
+            #
+            # right=False returns the first index where sorted_probs >= threshold,
+            # so entries before that index are strictly < threshold.
             cdf_indices = torch.searchsorted(
                 sorted_probs.contiguous(),
                 thresholds.contiguous(),
@@ -1472,12 +1484,12 @@ def _path_sampling_low_confidence_full_topk_probability(
             # [bsz, L, L]
 
             F_j_i = torch.gather(cdf_pad, dim=-1, index=cdf_indices)
+            F_j_i = F_j_i.clamp(min=0.0, max=1.0)
             # [bsz, j, i]
 
-            # log product over j != i, j masked:
-            #
-            #   sum_{j in M(S), j != i} log F_j(target_prob_i)
+            # For candidate i, multiply over all other currently masked positions j.
             eye = torch.eye(L, dtype=torch.bool, device=device).unsqueeze(0)
+
             pair_mask = (
                 masked.unsqueeze(2)      # j is masked
                 & masked.unsqueeze(1)    # i is masked
@@ -1499,7 +1511,7 @@ def _path_sampling_low_confidence_full_topk_probability(
                 alive.unsqueeze(-1)
                 & masked
                 & target_in_topk
-                & (target_probs > 0)
+                & (target_probs > 0.0)
             )
 
             log_target_probs = torch.log(target_probs)
@@ -1510,22 +1522,35 @@ def _path_sampling_low_confidence_full_topk_probability(
                 log_a,
                 torch.full_like(log_a, float("-inf")),
             )
-            # [bsz, suffix_len]
+            # [bsz, L]
 
-            # A^{(k)}(S) = sum_i a_i^{(k)}(S).
+            # log A^{(k)}(S) = log sum_i a_i^{(k)}(S).
             log_A = torch.logsumexp(log_a, dim=-1)  # [bsz]
+
+            if warn_if_A_exceeds_one:
+                with torch.no_grad():
+                    A = torch.exp(log_A)
+                    bad = A > 1.0 + 1e-8
+                    if bad.any():
+                        global_num_A_exceeds_one += int(bad.sum().item())
+                        global_max_A = max(global_max_A, float(A.max().item()))
+
+            # Mathematically A^{(k)}(S) <= 1.
+            # This clamp only protects against tiny numerical overshoot.
+            if clamp_log_A:
+                log_A = torch.minimum(log_A, torch.zeros_like(log_A))
 
             has_success_transition = torch.isfinite(log_A)
             active = alive & has_success_transition
 
-            # For active samples, multiply running weight by A^{(k)}(S).
+            # Accumulate log product of A-values.
             log_estimate = torch.where(
                 active,
                 log_estimate + log_A,
                 log_estimate,
             )
 
-            # Samples with A^{(k)}(S) = 0 become zero-probability.
+            # If A^{(k)}(S) = 0, the estimator returns zero from this point.
             alive = alive & has_success_transition
 
             if not active.any():
@@ -1535,9 +1560,32 @@ def _path_sampling_low_confidence_full_topk_probability(
             #
             #   q^{(k)}(i | S) = a_i^{(k)}(S) / A^{(k)}(S).
             #
-            # Sample on CPU so the provided CPU generator can be used.
+            # Sampling is done on CPU to use the CPU RNG consistently.
             log_q_active = log_a[active] - log_A[active].unsqueeze(-1)
             q_active = torch.exp(log_q_active).detach().cpu()
+
+            # Numerical cleanup for multinomial.
+            q_active = torch.nan_to_num(q_active, nan=0.0, posinf=0.0, neginf=0.0)
+
+            q_sums = q_active.sum(dim=-1, keepdim=True)
+
+            # This should not happen for active rows, but keep it safe.
+            valid_q = q_sums.squeeze(-1) > 0.0
+            if not valid_q.all():
+                active_indices_all = torch.nonzero(active, as_tuple=False).squeeze(-1)
+                invalid_active_indices = active_indices_all[~valid_q.to(device)]
+
+                alive[invalid_active_indices] = False
+
+                if valid_q.any():
+                    q_active = q_active[valid_q]
+                    active_indices = active_indices_all[valid_q.to(device)]
+                else:
+                    continue
+            else:
+                active_indices = torch.nonzero(active, as_tuple=False).squeeze(-1)
+
+            q_active = q_active / q_active.sum(dim=-1, keepdim=True)
 
             sampled_pos_cpu = torch.multinomial(
                 q_active,
@@ -1548,9 +1596,6 @@ def _path_sampling_low_confidence_full_topk_probability(
 
             sampled_pos = sampled_pos_cpu.to(device)
 
-            active_indices = torch.nonzero(active, as_tuple=False).squeeze(-1)
-
-            # Reveal the sampled successful position by writing the target token.
             sampled_target_tokens = target_row[sampled_pos]
             suffix[active_indices, sampled_pos] = sampled_target_tokens
 
@@ -1569,6 +1614,15 @@ def _path_sampling_low_confidence_full_topk_probability(
         )
         sample_probabilities.extend(batch_probabilities.detach().cpu().tolist())
 
+    if warn_if_A_exceeds_one and global_num_A_exceeds_one > 0:
+        print(
+            "Warning: encountered A^(k)(S) > 1 before clamping. "
+            f"max_A={global_max_A:.12g}, "
+            f"num_occurrences={global_num_A_exceeds_one}. "
+            "This should only be tiny numerical overshoot; if max_A is far above 1, "
+            "inspect the a_i computation."
+        )
+
     if sample_log_probabilities:
         finite_logs = [lp for lp in sample_log_probabilities if not math.isinf(lp)]
         if not finite_logs:
@@ -1582,9 +1636,14 @@ def _path_sampling_low_confidence_full_topk_probability(
     else:
         average_probability = 0.0
 
+    # Final defensive clamp. Mathematically this should already be <= 1.
+    if average_probability > 1.0 and average_probability <= 1.0 + 1e-8:
+        average_probability = 1.0
+
     return {
         "probability": average_probability,
         "sample_probabilities": sample_probabilities,
+        "sample_log_probabilities": sample_log_probabilities,
         "num_samples": num_samples,
         "estimation_method": "path_sampling_low_confidence_full_topk",
     }
