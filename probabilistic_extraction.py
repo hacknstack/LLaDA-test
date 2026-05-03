@@ -1309,27 +1309,52 @@ def _path_sampling_low_confidence_probability(
     """
     Batched unbiased successful-path estimator for low-confidence remasking.
 
-    This matches the second estimator from the document:
+    This implements the tie-aware version of the successful-path estimator.
+
+    Decoder assumptions:
       - all suffix positions start masked;
-      - at each step, compute the successful-transition probabilities a_i(S);
-      - compute A(S) = sum_i a_i(S);
-      - sample the next revealed index from q(i | S) = a_i(S) / A(S);
-      - multiply the running estimator by A(S).
+      - exactly one suffix token is revealed per step;
+      - at each step, every masked position samples one candidate token from
+        softmax(logits / temperature);
+      - confidence is the temperature-adjusted probability of the sampled token;
+      - the position with highest sampled-token confidence is revealed;
+      - if multiple positions tie for highest confidence, the decoder chooses
+        uniformly at random among the tied positions.
 
-    The returned Monte Carlo estimate is the average of
+    The estimator samples successful reveal paths from
 
-        prod_t A(S_{t-1})
+        q(i | S) = a_i(S) / A(S)
 
-    over `num_samples` proposal paths.
+    and returns the Monte Carlo average of
 
-    Assumptions:
-      - prompt_tokens has shape [1, prompt_len]
-      - target_tokens has shape [1, suffix_len]
-      - attention_mask, if provided, is compatible with the full sequence
-      - this estimator is for the one-token-per-step low-confidence decoder,
-        so `steps` must equal `suffix_len`
-      - temperature must be strictly positive
-      - no confidence ties, matching the derivation
+        prod_t A(S_{t-1}).
+
+    Tie-aware transition probability:
+
+        a_i(S)
+        =
+        p_i(z_i)
+        *
+        E[ 1 / (1 + K_i(c_i)) * 1{all other confidences <= c_i} ],
+
+    where K_i(c_i) is the number of other positions whose sampled confidence
+    equals c_i, and c_i = p_i(z_i).
+
+    Equivalently, for each other position j,
+
+        L_j(c) = P(conf_j < c)
+        E_j(c) = P(conf_j = c)
+
+    and
+
+        tie_factor_i
+        =
+        sum_{B subset others}
+            1 / (1 + |B|)
+            prod_{j in B} E_j(c_i)
+            prod_{j notin B} L_j(c_i).
+
+    This code computes that tie factor by polynomial DP.
     """
     if temperature <= 0:
         raise ValueError(
@@ -1353,7 +1378,6 @@ def _path_sampling_low_confidence_probability(
 
     attn = _suffix_attention_mask(attention_mask, suffix_len, device)
 
-    # CPU RNG, matching the style of the random-remasking implementation.
     rng = torch.Generator(device="cpu")
     if seed is not None:
         rng.manual_seed(seed)
@@ -1394,7 +1418,7 @@ def _path_sampling_low_confidence_probability(
             x = torch.cat(
                 [prompt_row.unsqueeze(0).expand(bsz, -1), suffix],
                 dim=1,
-            )  # [bsz, prompt_len + suffix_len]
+            )
 
             batched_attn = None
             if attn is not None:
@@ -1408,28 +1432,34 @@ def _path_sampling_low_confidence_probability(
 
             vocab_size = suffix_logits.shape[-1]
 
-            # Current masked positions for every sample.
-            # Shape: [bsz, remaining]
-            all_positions = torch.arange(suffix_len, device=device).expand(bsz, -1)
+            all_positions = torch.arange(
+                suffix_len,
+                device=device,
+            ).expand(bsz, -1)
+
             masked_positions = all_positions[unrevealed].view(bsz, remaining)
 
             gather_index = masked_positions.unsqueeze(-1).expand(
-                -1, -1, vocab_size
+                -1,
+                -1,
+                vocab_size,
             )
 
             masked_logits = torch.gather(
                 suffix_logits,
                 dim=1,
                 index=gather_index,
-            ).float()  # [bsz, remaining, vocab]
+            ).double()  # [bsz, remaining, vocab]
 
             masked_logits = masked_logits / temperature
 
-            # Full temperature-adjusted distributions over vocabulary.
-            masked_probs = torch.softmax(
+            # Numerically stable full temperature-adjusted distributions.
+            masked_log_probs = torch.log_softmax(
                 masked_logits,
                 dim=-1,
-            )  # [bsz, remaining, vocab]
+            )  # [bsz, remaining, vocab], float64
+
+            masked_probs = masked_log_probs.exp()  # float64
 
             target_ids = torch.gather(
                 target_row.unsqueeze(0).expand(bsz, -1),
@@ -1437,35 +1467,39 @@ def _path_sampling_low_confidence_probability(
                 index=masked_positions,
             )  # [bsz, remaining]
 
-            target_probs = torch.gather(
-                masked_probs,
+            target_log_probs = torch.gather(
+                masked_log_probs,
                 dim=-1,
                 index=target_ids.unsqueeze(-1),
             ).squeeze(-1)  # [bsz, remaining]
 
-            # We compute:
-            #
-            #   log a_i(S)
-            #   =
-            #   log p_theta(z_i | x_S, i)
-            #   +
-            #   sum_{j != i} log F_j(c_i^star)
-            #
-            # where
-            #
-            #   F_j(c) = sum_{v: p_theta(v | x_S, j) < c}
-            #            p_theta(v | x_S, j).
-            #
-            # To avoid a huge [bsz, remaining, remaining, vocab] tensor,
-            # process the j dimension in chunks.
-            log_a = torch.log(target_probs.double())  # [bsz, remaining]
+            target_probs = target_log_probs.exp()  # c_i^star, [bsz, remaining]
 
-            # Chunk over masked positions j. This keeps memory controlled.
-            c_targets = target_probs.float()  # thresholds c_i^star, [bsz, remaining]
+            # For tie-aware transitions we need, for every masked position j
+            # and every candidate successful index i:
+            #
+            #   L[j, i]  = P_j(conf < c_i)
+            #   Eq[j, i] = P_j(conf = c_i)
+            #
+            # where c_i = p_i(z_i).
+            L_all = torch.empty(
+                (bsz, remaining, remaining),
+                dtype=torch.float64,
+                device=device,
+            )
+
+            Eq_all = torch.empty(
+                (bsz, remaining, remaining),
+                dtype=torch.float64,
+                device=device,
+            )
+
+            c_targets = target_probs  # [bsz, remaining]
             cdf_chunk_size = 8
 
             for j_start in range(0, remaining, cdf_chunk_size):
                 j_end = min(j_start + cdf_chunk_size, remaining)
+                chunk = j_end - j_start
 
                 probs_j = masked_probs[:, j_start:j_end, :]  # [bsz, chunk, vocab]
 
@@ -1481,7 +1515,7 @@ def _path_sampling_low_confidence_probability(
 
                 zero_pad = torch.zeros(
                     (*cdf_j.shape[:-1], 1),
-                    dtype=cdf_j.dtype,
+                    dtype=torch.float64,
                     device=device,
                 )
 
@@ -1490,38 +1524,94 @@ def _path_sampling_low_confidence_probability(
                     dim=-1,
                 )  # [bsz, chunk, vocab + 1]
 
-                # For every j in this chunk and every target confidence c_i,
-                # find how many vocab probabilities are strictly smaller than c_i.
-                #
-                # right=False gives strict less-than for sorted boundaries.
-                #
-                # idx shape: [bsz, chunk, remaining]
-                idx = torch.searchsorted(
+                thresholds = c_targets[:, None, :].expand(
+                    -1,
+                    chunk,
+                    -1,
+                ).contiguous()  # [bsz, chunk, remaining]
+
+                # Strictly less than c.
+                idx_left = torch.searchsorted(
                     sorted_probs_j.contiguous(),
-                    c_targets[:, None, :].expand(-1, j_end - j_start, -1).contiguous(),
+                    thresholds,
                     right=False,
                 )
 
-                F = torch.gather(
-                    cdf_j_padded,
-                    dim=-1,
-                    index=idx,
-                ).double()  # [bsz, chunk, remaining]
-
-                # Exclude j = i from the product by setting that factor to 1.
-                local_js = torch.arange(
-                    j_start,
-                    j_end,
-                    device=device,
+                # Less than or equal to c.
+                idx_right = torch.searchsorted(
+                    sorted_probs_j.contiguous(),
+                    thresholds,
+                    right=True,
                 )
 
-                F[:, torch.arange(j_end - j_start, device=device), local_js] = 1.0
+                L = torch.gather(
+                    cdf_j_padded,
+                    dim=-1,
+                    index=idx_left,
+                )  # [bsz, chunk, remaining]
 
-                log_a += torch.log(F).sum(dim=1)
+                LE = torch.gather(
+                    cdf_j_padded,
+                    dim=-1,
+                    index=idx_right,
+                )  # [bsz, chunk, remaining]
+
+                Eq = LE - L
+
+                L_all[:, j_start:j_end, :] = L
+                Eq_all[:, j_start:j_end, :] = Eq
+
+            # Tie-aware factor for each candidate successful index i.
+            #
+            # For fixed i, define the polynomial
+            #
+            #   prod_{j != i} (L[j, i] + Eq[j, i] x).
+            #
+            # The coefficient of x^k is the probability that exactly k other
+            # positions tie with i while all remaining positions have lower
+            # confidence. With uniform tie-breaking, i wins with probability
+            # 1 / (k + 1). Therefore:
+            #
+            #   tie_factor[i] = sum_k coeff[k] / (k + 1).
+            coeff = torch.zeros(
+                (bsz, remaining, remaining + 1),
+                dtype=torch.float64,
+                device=device,
+            )
+            coeff[:, :, 0] = 1.0
+
+            for j in range(remaining):
+                L_j = L_all[:, j, :].clone()    # [bsz, remaining]
+                Eq_j = Eq_all[:, j, :].clone()  # [bsz, remaining]
+
+                # Exclude j = i from the product.
+                L_j[:, j] = 1.0
+                Eq_j[:, j] = 0.0
+
+                new_coeff = coeff * L_j.unsqueeze(-1)
+                new_coeff[:, :, 1:] += coeff[:, :, :-1] * Eq_j.unsqueeze(-1)
+                coeff = new_coeff
+
+            denominators = torch.arange(
+                1,
+                remaining + 2,
+                dtype=torch.float64,
+                device=device,
+            )  # [1, 2, ..., remaining + 1]
+
+            tie_factor = (coeff / denominators).sum(dim=-1)  # [bsz, remaining]
+
+            # a_i(S) = p_i(z_i) * tie_factor_i
+            log_tie_factor = torch.where(
+                tie_factor > 0,
+                torch.log(tie_factor),
+                torch.full_like(tie_factor, neg_inf),
+            )
+
+            log_a = target_log_probs + log_tie_factor  # [bsz, remaining]
 
             # A(S) = sum_i a_i(S)
             log_A = torch.logsumexp(log_a, dim=-1)  # [bsz]
-
             finite_A = torch.isfinite(log_A)
 
             log_estimator = torch.where(
@@ -1543,12 +1633,11 @@ def _path_sampling_low_confidence_probability(
                     dim=-1,
                 )
 
-            # Dead samples have A(S)=0. Their estimator is already zero.
-            # Give them an arbitrary valid proposal to keep tensor code simple.
+            # Dead samples already have estimator zero. Use arbitrary proposal
+            # only to keep tensor updates valid.
             if (~finite_A).any():
                 q[~finite_A] = 1.0 / remaining
 
-            # torch.multinomial supports a CPU generator, so sample on CPU.
             sampled_local = torch.multinomial(
                 q.detach().cpu(),
                 num_samples=1,
@@ -1568,7 +1657,6 @@ def _path_sampling_low_confidence_probability(
                 index=sampled_positions,
             )  # [bsz, 1]
 
-            # Reveal the sampled successful index with its target token.
             suffix.scatter_(
                 dim=1,
                 index=sampled_positions,
@@ -1581,9 +1669,8 @@ def _path_sampling_low_confidence_probability(
                 src=torch.zeros_like(sampled_positions, dtype=torch.bool),
             )
 
-        sample_log_probabilities.extend(
-            log_estimator.detach().cpu().tolist()
-        )
+        batch_log_probs = log_estimator.detach().cpu().tolist()
+        sample_log_probabilities.extend(batch_log_probs)
 
         batch_probabilities = torch.exp(log_estimator)
         sample_probabilities.extend(
@@ -1592,6 +1679,7 @@ def _path_sampling_low_confidence_probability(
 
     if sample_log_probabilities:
         max_log = max(sample_log_probabilities)
+
         if math.isinf(max_log) and max_log < 0:
             average_probability = 0.0
         else:
@@ -1605,13 +1693,13 @@ def _path_sampling_low_confidence_probability(
     else:
         average_probability = 0.0
 
-    print(", ".join(str(p_hat) for p_hat in sample_probabilities))
-
     return {
         "probability": average_probability,
         "sample_probabilities": sample_probabilities,
+        "sample_log_probabilities": sample_log_probabilities,
         "num_samples": num_samples,
-        "estimation_method": "path_sampling_low_confidence",
+        "estimation_method": "path_sampling_low_confidence_tie_aware",
+        "tie_breaking": "uniform_among_max_confidence_positions",
     }
 
 
