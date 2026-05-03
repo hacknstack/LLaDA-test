@@ -1294,7 +1294,7 @@ def _autoregressive_probability(
     return result
 
 @torch.inference_mode()
-def _path_sampling_low_confidence_full_topk_probability(
+def _path_sampling_low_confidence_probability(
     model,
     prompt_tokens: torch.Tensor,
     target_tokens: torch.Tensor,
@@ -1303,49 +1303,40 @@ def _path_sampling_low_confidence_full_topk_probability(
     mask_id: int,
     num_samples: int,
     seed: Optional[int],
-    k: int,
     temperature: float,
     batch_size: int = 64,
-    warn_if_A_exceeds_one: bool = True,
-    clamp_log_A: bool = True,
 ) -> Dict[str, object]:
     """
-    Approximate path-sampling estimator for:
+    Batched unbiased successful-path estimator for low-confidence remasking.
 
-        low-confidence remasking,
-        full-distribution token sampling,
-        top-k retained successful transitions.
+    This matches the second estimator from the document:
+      - all suffix positions start masked;
+      - at each step, compute the successful-transition probabilities a_i(S);
+      - compute A(S) = sum_i a_i(S);
+      - sample the next revealed index from q(i | S) = a_i(S) / A(S);
+      - multiply the running estimator by A(S).
 
-    This implements the third estimator:
+    The returned Monte Carlo estimate is the average of
 
-        \hat p_z^{(k), full} = prod_t A^{(k)}(S_{t-1})
+        prod_t A(S_{t-1})
 
-    where
+    over `num_samples` proposal paths.
 
-        A^{(k)}(S) = sum_i a_i^{(k)}(S)
-
-    and
-
-        a_i^{(k)}(S)
-        =
-        1{target_i in top-k at position i}
-        p_i(target_i)
-        prod_{j != i, j masked} F_j(p_i(target_i)).
-
-    Here
-
-        F_j(c) = sum_{v : p_j(v) < c} p_j(v)
-
-    is computed under the full softmax distribution.
-
-    Notes:
-      - This estimates p_z^{(k)}, not necessarily the exact p_z.
-      - It becomes exact for the full-distribution decoder only when k covers
-        the full vocabulary.
-      - The low-confidence decoder reveals exactly one suffix position per step,
-        so this function requires steps == suffix_len.
-      - All probability/CDF computations are done in float64 for stability.
+    Assumptions:
+      - prompt_tokens has shape [1, prompt_len]
+      - target_tokens has shape [1, suffix_len]
+      - attention_mask, if provided, is compatible with the full sequence
+      - this estimator is for the one-token-per-step low-confidence decoder,
+        so `steps` must equal `suffix_len`
+      - temperature must be strictly positive
+      - no confidence ties, matching the derivation
     """
+    if temperature <= 0:
+        raise ValueError(
+            "The low-confidence full-distribution estimator requires "
+            "temperature > 0."
+        )
+
     device = _model_device(model)
     prompt_tokens = prompt_tokens.to(device)
     target_tokens = target_tokens.to(device)
@@ -1355,21 +1346,14 @@ def _path_sampling_low_confidence_full_topk_probability(
 
     if steps != suffix_len:
         raise ValueError(
-            "The low-confidence estimator reveals exactly one suffix token per step, "
-            f"so steps must equal suffix_len. Got steps={steps}, suffix_len={suffix_len}."
+            "This low-confidence estimator implements the one-token-per-step "
+            f"successful-path estimator, so steps must equal suffix_len. "
+            f"Got steps={steps}, suffix_len={suffix_len}."
         )
-
-    if k <= 0:
-        return {
-            "probability": 0.0,
-            "sample_probabilities": [0.0 for _ in range(num_samples)],
-            "sample_log_probabilities": [float("-inf") for _ in range(num_samples)],
-            "num_samples": num_samples,
-            "estimation_method": "path_sampling_low_confidence_full_topk",
-        }
 
     attn = _suffix_attention_mask(attention_mask, suffix_len, device)
 
+    # CPU RNG, matching the style of the random-remasking implementation.
     rng = torch.Generator(device="cpu")
     if seed is not None:
         rng.manual_seed(seed)
@@ -1380,8 +1364,7 @@ def _path_sampling_low_confidence_full_topk_probability(
     sample_log_probabilities: List[float] = []
     sample_probabilities: List[float] = []
 
-    global_max_A = 0.0
-    global_num_A_exceeds_one = 0
+    neg_inf = -float("inf")
 
     for batch_start in range(0, num_samples, batch_size):
         bsz = min(batch_size, num_samples - batch_start)
@@ -1393,24 +1376,25 @@ def _path_sampling_low_confidence_full_topk_probability(
             device=device,
         )
 
-        alive = torch.ones(bsz, dtype=torch.bool, device=device)
+        unrevealed = torch.ones(
+            (bsz, suffix_len),
+            dtype=torch.bool,
+            device=device,
+        )
 
-        # log_estimate[b] accumulates:
-        #
-        #   sum_t log A^{(k)}(S_{t-1})
-        #
-        log_estimate = torch.zeros(bsz, dtype=torch.float64, device=device)
+        log_estimator = torch.zeros(
+            bsz,
+            dtype=torch.float64,
+            device=device,
+        )
 
-        for _step in range(suffix_len):
-            if not alive.any():
-                break
-
-            masked = suffix.eq(mask_id)  # [bsz, suffix_len]
+        for t in range(suffix_len):
+            remaining = suffix_len - t
 
             x = torch.cat(
                 [prompt_row.unsqueeze(0).expand(bsz, -1), suffix],
                 dim=1,
-            )
+            )  # [bsz, prompt_len + suffix_len]
 
             batched_attn = None
             if attn is not None:
@@ -1422,231 +1406,214 @@ def _path_sampling_low_confidence_full_topk_probability(
             logits = model(x, attention_mask=batched_attn).logits
             suffix_logits = logits[:, prompt_len:, :]  # [bsz, suffix_len, vocab]
 
-            # Important:
-            # Convert to float64 BEFORE softmax.
-            # Casting probabilities after a float32 softmax can leave row-sum
-            # error that may produce tiny impossible A > 1 values.
-            scaled_logits = suffix_logits.to(torch.float64)
-            if temperature > 0:
-                scaled_logits = scaled_logits / float(temperature)
+            vocab_size = suffix_logits.shape[-1]
 
-            probs = torch.softmax(scaled_logits, dim=-1)  # float64
-            bsz_cur, L, vocab_size = probs.shape
+            # Current masked positions for every sample.
+            # Shape: [bsz, remaining]
+            all_positions = torch.arange(suffix_len, device=device).expand(bsz, -1)
+            masked_positions = all_positions[unrevealed].view(bsz, remaining)
 
-            top_k = min(k, vocab_size)
+            gather_index = masked_positions.unsqueeze(-1).expand(
+                -1, -1, vocab_size
+            )
 
-            target_ids = target_row.unsqueeze(0).expand(bsz, -1)  # [bsz, L]
+            masked_logits = torch.gather(
+                suffix_logits,
+                dim=1,
+                index=gather_index,
+            ).float()  # [bsz, remaining, vocab]
+
+            masked_logits = masked_logits / temperature
+
+            # Full temperature-adjusted distributions over vocabulary.
+            masked_probs = torch.softmax(
+                masked_logits,
+                dim=-1,
+            )  # [bsz, remaining, vocab]
+
+            target_ids = torch.gather(
+                target_row.unsqueeze(0).expand(bsz, -1),
+                dim=1,
+                index=masked_positions,
+            )  # [bsz, remaining]
 
             target_probs = torch.gather(
-                probs,
+                masked_probs,
                 dim=-1,
                 index=target_ids.unsqueeze(-1),
-            ).squeeze(-1)  # [bsz, L]
+            ).squeeze(-1)  # [bsz, remaining]
 
-            # Retention condition:
-            # target token must be among top-k tokens under the full distribution.
-            _, topk_idx = torch.topk(scaled_logits, k=top_k, dim=-1)
-            target_in_topk = (topk_idx == target_ids.unsqueeze(-1)).any(dim=-1)
-            # [bsz, L]
-
-            # Compute F_j(c) for all pairs (j, i):
+            # We compute:
             #
-            #   F_j(target_prob_i)
+            #   log a_i(S)
             #   =
-            #   sum_{v : p_j(v) < target_prob_i} p_j(v).
+            #   log p_theta(z_i | x_S, i)
+            #   +
+            #   sum_{j != i} log F_j(c_i^star)
             #
-            # We sort each position's full probability distribution and use
-            # searchsorted + prefix sums.
-            sorted_probs = torch.sort(probs, dim=-1).values  # [bsz, L, vocab]
-            sorted_cumsum = torch.cumsum(sorted_probs, dim=-1)
-
-            zero_pad = torch.zeros(
-                (bsz, L, 1),
-                dtype=torch.float64,
-                device=device,
-            )
-            cdf_pad = torch.cat([zero_pad, sorted_cumsum], dim=-1)
-            # [bsz, L, vocab + 1]
-
-            # thresholds[b, j, i] = target_probs[b, i].
-            thresholds = target_probs.unsqueeze(1).expand(-1, L, -1)
-            # [bsz, L, L]
-
-            # Number of probabilities strictly less than threshold.
+            # where
             #
-            # right=False returns the first index where sorted_probs >= threshold,
-            # so entries before that index are strictly < threshold.
-            cdf_indices = torch.searchsorted(
-                sorted_probs.contiguous(),
-                thresholds.contiguous(),
-                right=False,
-            )
-            # [bsz, L, L]
+            #   F_j(c) = sum_{v: p_theta(v | x_S, j) < c}
+            #            p_theta(v | x_S, j).
+            #
+            # To avoid a huge [bsz, remaining, remaining, vocab] tensor,
+            # process the j dimension in chunks.
+            log_a = torch.log(target_probs.double())  # [bsz, remaining]
 
-            F_j_i = torch.gather(cdf_pad, dim=-1, index=cdf_indices)
-            F_j_i = F_j_i.clamp(min=0.0, max=1.0)
-            # [bsz, j, i]
+            # Chunk over masked positions j. This keeps memory controlled.
+            c_targets = target_probs.float()  # thresholds c_i^star, [bsz, remaining]
+            cdf_chunk_size = 8
 
-            # For candidate i, multiply over all other currently masked positions j.
-            eye = torch.eye(L, dtype=torch.bool, device=device).unsqueeze(0)
+            for j_start in range(0, remaining, cdf_chunk_size):
+                j_end = min(j_start + cdf_chunk_size, remaining)
 
-            pair_mask = (
-                masked.unsqueeze(2)      # j is masked
-                & masked.unsqueeze(1)    # i is masked
-                & (~eye)                 # j != i
-            )
-            # [bsz, j, i]
+                probs_j = masked_probs[:, j_start:j_end, :]  # [bsz, chunk, vocab]
 
-            log_F_j_i = torch.log(F_j_i)
-            log_F_j_i = torch.where(
-                pair_mask,
-                log_F_j_i,
-                torch.zeros_like(log_F_j_i),
-            )
+                sorted_probs_j, _ = torch.sort(
+                    probs_j,
+                    dim=-1,
+                )  # [bsz, chunk, vocab]
 
-            log_confidence_product = log_F_j_i.sum(dim=1)
-            # [bsz, i]
+                cdf_j = torch.cumsum(
+                    sorted_probs_j,
+                    dim=-1,
+                )  # [bsz, chunk, vocab]
 
-            candidate_mask = (
-                alive.unsqueeze(-1)
-                & masked
-                & target_in_topk
-                & (target_probs > 0.0)
-            )
+                zero_pad = torch.zeros(
+                    (*cdf_j.shape[:-1], 1),
+                    dtype=cdf_j.dtype,
+                    device=device,
+                )
 
-            log_target_probs = torch.log(target_probs)
+                cdf_j_padded = torch.cat(
+                    [zero_pad, cdf_j],
+                    dim=-1,
+                )  # [bsz, chunk, vocab + 1]
 
-            log_a = log_target_probs + log_confidence_product
-            log_a = torch.where(
-                candidate_mask,
-                log_a,
-                torch.full_like(log_a, float("-inf")),
-            )
-            # [bsz, L]
+                # For every j in this chunk and every target confidence c_i,
+                # find how many vocab probabilities are strictly smaller than c_i.
+                #
+                # right=False gives strict less-than for sorted boundaries.
+                #
+                # idx shape: [bsz, chunk, remaining]
+                idx = torch.searchsorted(
+                    sorted_probs_j.contiguous(),
+                    c_targets[:, None, :].expand(-1, j_end - j_start, -1).contiguous(),
+                    right=False,
+                )
 
-            # log A^{(k)}(S) = log sum_i a_i^{(k)}(S).
+                F = torch.gather(
+                    cdf_j_padded,
+                    dim=-1,
+                    index=idx,
+                ).double()  # [bsz, chunk, remaining]
+
+                # Exclude j = i from the product by setting that factor to 1.
+                local_js = torch.arange(
+                    j_start,
+                    j_end,
+                    device=device,
+                )
+
+                F[:, torch.arange(j_end - j_start, device=device), local_js] = 1.0
+
+                log_a += torch.log(F).sum(dim=1)
+
+            # A(S) = sum_i a_i(S)
             log_A = torch.logsumexp(log_a, dim=-1)  # [bsz]
 
-            if warn_if_A_exceeds_one:
-                with torch.no_grad():
-                    A = torch.exp(log_A)
-                    bad = A > 1.0 + 1e-8
-                    if bad.any():
-                        global_num_A_exceeds_one += int(bad.sum().item())
-                        global_max_A = max(global_max_A, float(A.max().item()))
+            finite_A = torch.isfinite(log_A)
 
-            # Mathematically A^{(k)}(S) <= 1.
-            # This clamp only protects against tiny numerical overshoot.
-            if clamp_log_A:
-                log_A = torch.minimum(log_A, torch.zeros_like(log_A))
-
-            has_success_transition = torch.isfinite(log_A)
-            active = alive & has_success_transition
-
-            # Accumulate log product of A-values.
-            log_estimate = torch.where(
-                active,
-                log_estimate + log_A,
-                log_estimate,
+            log_estimator = torch.where(
+                finite_A,
+                log_estimator + log_A,
+                torch.full_like(log_estimator, neg_inf),
             )
 
-            # If A^{(k)}(S) = 0, the estimator returns zero from this point.
-            alive = alive & has_success_transition
+            # Proposal q(i | S) = a_i(S) / A(S).
+            q = torch.zeros(
+                (bsz, remaining),
+                dtype=torch.float32,
+                device=device,
+            )
 
-            if not active.any():
-                break
+            if finite_A.any():
+                q[finite_A] = torch.softmax(
+                    log_a[finite_A].float(),
+                    dim=-1,
+                )
 
-            # Proposal:
-            #
-            #   q^{(k)}(i | S) = a_i^{(k)}(S) / A^{(k)}(S).
-            #
-            # Sampling is done on CPU to use the CPU RNG consistently.
-            log_q_active = log_a[active] - log_A[active].unsqueeze(-1)
-            q_active = torch.exp(log_q_active).detach().cpu()
+            # Dead samples have A(S)=0. Their estimator is already zero.
+            # Give them an arbitrary valid proposal to keep tensor code simple.
+            if (~finite_A).any():
+                q[~finite_A] = 1.0 / remaining
 
-            # Numerical cleanup for multinomial.
-            q_active = torch.nan_to_num(q_active, nan=0.0, posinf=0.0, neginf=0.0)
-
-            q_sums = q_active.sum(dim=-1, keepdim=True)
-
-            # This should not happen for active rows, but keep it safe.
-            valid_q = q_sums.squeeze(-1) > 0.0
-            if not valid_q.all():
-                active_indices_all = torch.nonzero(active, as_tuple=False).squeeze(-1)
-                invalid_active_indices = active_indices_all[~valid_q.to(device)]
-
-                alive[invalid_active_indices] = False
-
-                if valid_q.any():
-                    q_active = q_active[valid_q]
-                    active_indices = active_indices_all[valid_q.to(device)]
-                else:
-                    continue
-            else:
-                active_indices = torch.nonzero(active, as_tuple=False).squeeze(-1)
-
-            q_active = q_active / q_active.sum(dim=-1, keepdim=True)
-
-            sampled_pos_cpu = torch.multinomial(
-                q_active,
+            # torch.multinomial supports a CPU generator, so sample on CPU.
+            sampled_local = torch.multinomial(
+                q.detach().cpu(),
                 num_samples=1,
                 replacement=True,
                 generator=rng,
-            ).squeeze(-1)
+            ).to(device)  # [bsz, 1]
 
-            sampled_pos = sampled_pos_cpu.to(device)
+            sampled_positions = torch.gather(
+                masked_positions,
+                dim=1,
+                index=sampled_local,
+            )  # [bsz, 1]
 
-            sampled_target_tokens = target_row[sampled_pos]
-            suffix[active_indices, sampled_pos] = sampled_target_tokens
+            sampled_target_ids = torch.gather(
+                target_row.unsqueeze(0).expand(bsz, -1),
+                dim=1,
+                index=sampled_positions,
+            )  # [bsz, 1]
 
-        batch_log_probs = torch.where(
-            alive,
-            log_estimate,
-            torch.full_like(log_estimate, float("-inf")),
+            # Reveal the sampled successful index with its target token.
+            suffix.scatter_(
+                dim=1,
+                index=sampled_positions,
+                src=sampled_target_ids,
+            )
+
+            unrevealed.scatter_(
+                dim=1,
+                index=sampled_positions,
+                src=torch.zeros_like(sampled_positions, dtype=torch.bool),
+            )
+
+        sample_log_probabilities.extend(
+            log_estimator.detach().cpu().tolist()
         )
 
-        sample_log_probabilities.extend(batch_log_probs.detach().cpu().tolist())
-
-        batch_probabilities = torch.where(
-            torch.isfinite(batch_log_probs),
-            torch.exp(batch_log_probs),
-            torch.zeros_like(batch_log_probs),
-        )
-        sample_probabilities.extend(batch_probabilities.detach().cpu().tolist())
-
-    if warn_if_A_exceeds_one and global_num_A_exceeds_one > 0:
-        print(
-            "Warning: encountered A^(k)(S) > 1 before clamping. "
-            f"max_A={global_max_A:.12g}, "
-            f"num_occurrences={global_num_A_exceeds_one}. "
-            "This should only be tiny numerical overshoot; if max_A is far above 1, "
-            "inspect the a_i computation."
+        batch_probabilities = torch.exp(log_estimator)
+        sample_probabilities.extend(
+            batch_probabilities.detach().cpu().tolist()
         )
 
     if sample_log_probabilities:
-        finite_logs = [lp for lp in sample_log_probabilities if not math.isinf(lp)]
-        if not finite_logs:
+        max_log = max(sample_log_probabilities)
+        if math.isinf(max_log) and max_log < 0:
             average_probability = 0.0
         else:
-            max_log = max(finite_logs)
-            scaled_sum = sum(math.exp(lp - max_log) for lp in finite_logs)
+            scaled_sum = sum(
+                math.exp(lp - max_log)
+                for lp in sample_log_probabilities
+            )
             average_probability = float(
                 math.exp(max_log) * (scaled_sum / len(sample_log_probabilities))
             )
     else:
         average_probability = 0.0
 
-    # Final defensive clamp. Mathematically this should already be <= 1.
-    if average_probability > 1.0 and average_probability <= 1.0 + 1e-8:
-        average_probability = 1.0
+    print(", ".join(str(p_hat) for p_hat in sample_probabilities))
 
     return {
         "probability": average_probability,
         "sample_probabilities": sample_probabilities,
-        "sample_log_probabilities": sample_log_probabilities,
         "num_samples": num_samples,
-        "estimation_method": "path_sampling_low_confidence_full_topk",
+        "estimation_method": "path_sampling_low_confidence",
     }
+
 
 @torch.no_grad()
 def compute_diffusion_probabilistic_extraction(
@@ -1836,7 +1803,7 @@ def compute_diffusion_probabilistic_extraction(
         if num_samples <= 0:
             raise ValueError('num_samples must be > 0 when estimation_method="path_sampling".')
 
-        path_sampling_result = _path_sampling_low_confidence_full_topk_probability(
+        path_sampling_result = _path_sampling_low_confidence_probability(
             model=model,
             prompt_tokens=prompt_tokens,
             target_tokens=target_tokens,
@@ -1845,7 +1812,6 @@ def compute_diffusion_probabilistic_extraction(
             mask_id=mask_id,
             num_samples=num_samples,
             seed=seed,
-            k=k,
             temperature=temperature
             )
         return {
