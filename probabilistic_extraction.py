@@ -1429,6 +1429,7 @@ def _path_sampling_low_confidence_probability(
         )
 
     rng = torch.Generator(device="cpu")
+    seed = None
     if seed is not None:
         rng.manual_seed(seed)
 
