@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/MITLicense.txt",
+  "total_chars": 1023,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_chars": 10,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "path_sampling",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "low-confidence",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 51,
+  "num_windows_scored": 51,
+  "num_windows_extracted": 47,
+  "extraction_rate": 0.9215686274509803,
+  "p_z_distribution": {
+    "min": 3.862958124338757e-06,
+    "median": 0.9507746839597426,
+    "mean": 0.6686816608757098,
+    "max": 0.9995765686370647,
+    "q_0.9": 0.9989604162931995,
+    "q_0.99": 0.9994891551284447,
+    "q_0.999": 0.9995678272862026
+  }
+}
