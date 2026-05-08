@@ -1,4 +1,4 @@
-# LLaDA-test
+# Assessing the Privacy of Large Language Diffusion Models
 
 This repository contains code and result artifacts for running sliding-window extraction experiments for LLaDA and other autoregressive language models.
 
