@@ -255,7 +255,7 @@ def main() -> None:
         tokenized = tokenizer(chunk, add_special_tokens=False)
         token_ids = tokenized["input_ids"]
         n_tokens = len(token_ids)
-
+        '''
         print("\n" + "=" * 80)
         print(f"Window index: {window_index}")
         print(f"Position: {pos}")
@@ -267,11 +267,11 @@ def main() -> None:
 
         print("\nDecoded first 100 tokens:")
         print(tokenizer.decode(token_ids[:100]))
-
+        '''
         if n_tokens < args.seq_tokens:
             pbar.update(1)
             break
-
+            
         z = token_ids[:args.seq_tokens]
         prefix_ids = z[:args.prefix_tokens]
         suffix_ids = z[args.prefix_tokens: args.prefix_tokens + args.suffix_tokens]
