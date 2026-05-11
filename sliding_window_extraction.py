@@ -248,16 +248,25 @@ def main() -> None:
 
         # If this chunk starts in the middle of a word, drop that partial first word.
         # Example: "osoft windows..." -> "windows..."
-        # But: "Microsoft windows..." stays unchanged.
-        if pos > 0 and chunk and not text[pos - 1].isspace():
-            first_space = chunk.find(" ")
-            if first_space == -1:
-                pbar.update(1)
-                break
-            chunk = chunk[first_space + 1:]
+        # But:     "Microsoft windows..." -> unchanged
+        if pos > 0 and text[pos - 1].isalnum() and chunk and chunk[0].isalnum():
+            chunk = chunk.split(maxsplit=1)[1] if len(chunk.split(maxsplit=1)) > 1 else ""
 
-        token_ids = tokenizer(chunk, add_special_tokens=False)["input_ids"]
+        tokenized = tokenizer(chunk, add_special_tokens=False)
+        token_ids = tokenized["input_ids"]
         n_tokens = len(token_ids)
+
+        print("\n" + "=" * 80)
+        print(f"Window index: {window_index}")
+        print(f"Position: {pos}")
+        print("Cleaned chunk:")
+        print(chunk)
+
+        print("\nFirst 100 token IDs:")
+        print(token_ids[:100])
+
+        print("\nDecoded first 100 tokens:")
+        print(tokenizer.decode(token_ids[:100]))
 
         if n_tokens < args.seq_tokens:
             pbar.update(1)
@@ -278,9 +287,11 @@ def main() -> None:
                 suffix_ids=suffix_ids,
                 args=args,
             )
+            print(f"pz {p_z}")
             extracted = int(p_z >= args.tau)
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
+            print(error, ":(")
 
         rows.append(
             {
