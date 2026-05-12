@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--decoding-scheme', choices=['auto', 'full', 'top_k', 'greedy', 'ELBO', 'elbo', 'random'], default='auto')
     parser.add_argument('--k', type=int, default=40, help='Top-k value when --decoding-scheme top_k')
     parser.add_argument('--temperature', type=float, default=0.0, help='Temperature for non-greedy llama decoding and llada target-token-confidence remasking')
-    parser.add_argument('--remasking', choices=['low-confidence', 'target-token-confidence', 'random'], default='low-confidence',
+    parser.add_argument('--remasking', choices=['low-confidence', 'target-token-confidence', 'random', 'highest-index'], default='low-confidence',
                         help='Remasking strategy when --model-family llada')
     parser.add_argument(
         '--masked_indexes',
@@ -210,6 +210,9 @@ def main() -> None:
             raise ValueError("--mode must be 'exact' when --remasking target-token-confidence.")
         if args.temperature <= 0:
             raise ValueError("--temperature must be > 0 when --remasking target-token-confidence.")
+    if args.model_family == 'llada' and args.remasking == 'highest-index':
+        if args.mode != 'exact':
+            raise ValueError("--mode must be 'exact' when --remasking highest-index.")
     if args.model_family == 'llada' and args.remasking == 'random':
         if args.mode != 'path_sampling':
             raise ValueError("--mode must be 'path_sampling' when --remasking random.")

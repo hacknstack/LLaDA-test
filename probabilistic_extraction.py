@@ -49,7 +49,7 @@ def _unsupported_partially_masked_configuration(
 
 
 def _validate_common_args(remasking: str, estimation_method: str) -> None:
-    allowed_remasking = {'low-confidence', 'target-token-confidence', 'random'}
+    allowed_remasking = {'low-confidence', 'target-token-confidence', 'random', 'highest-index'}
     if remasking not in allowed_remasking:
         raise NotImplementedError(
             f"Unsupported remasking strategy: {remasking!r}. Supported strategies: {sorted(allowed_remasking)}"
@@ -2394,6 +2394,43 @@ def compute_diffusion_probabilistic_extraction(
             'remasking': 'random',
             'decoding_scheme': normalized_decoding_scheme,
             'k': k if normalized_decoding_scheme == 'top_k' else None,
+        }
+
+    if remasking == 'highest-index':
+        if estimation_method != 'exact':
+            raise ValueError('remasking="highest-index" only supports estimation_method="exact".')
+        if normalized_masked_indexes is None:
+            result = highest_index_probability(
+                model=model,
+                prompt_tokens=prompt_tokens,
+                target_tokens=target_tokens,
+                steps=steps,
+                attention_mask=attention_mask,
+                mask_id=mask_id,
+                decoding_scheme=decoding_scheme,
+                k=k,
+                temperature=temperature,
+            )
+        else:
+            result = highest_index_probability_from_partially_masked(
+                model=model,
+                sequence_tokens=sequence_tokens,
+                masked_indexes=normalized_masked_indexes,
+                steps=steps,
+                attention_mask=attention_mask,
+                mask_id=mask_id,
+                decoding_scheme=decoding_scheme,
+                k=k,
+                temperature=temperature,
+            )
+        return {
+            'method': 'exact',
+            'probability': result['probability'],
+            'log_probability': result['log_probability'],
+            'remasking': 'highest-index',
+            'decoding_scheme': decoding_scheme,
+            'k': k if decoding_scheme == 'top_k' else None,
+            'temperature': temperature if temperature > 0 else None,
         }
 
     if estimation_method == 'path_sampling':
