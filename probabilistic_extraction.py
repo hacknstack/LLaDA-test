@@ -801,9 +801,370 @@ def _monte_carlo_probability_temperature_fast(
     )
 
 
+@torch.inference_mode()
+def highest_index_probability(
+    model,
+    prompt_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    decoding_scheme: str,
+    k: int,
+    temperature: float,
+) -> Dict[str, object]:
+    """
+    Exact probability for the deterministic reveal path:
+        suffix position 0, then 1, then 2, ..., then suffix_len - 1.
 
+    If steps == suffix_len, this reveals one token per step.
+    If steps < suffix_len, this reveals contiguous chunks from left to right.
+    """
 
+    if steps <= 0:
+        raise ValueError("steps must be positive")
 
+    device = _model_device(model)
+    prompt_tokens = prompt_tokens.to(device)
+    target_tokens = target_tokens.to(device)
+
+    suffix_len = target_tokens.shape[1]
+    prompt_len = prompt_tokens.shape[1]
+
+    attn = _suffix_attention_mask(attention_mask, suffix_len, device)
+
+    base = suffix_len // steps
+    rem = suffix_len % steps
+    schedule = [base + (1 if i < rem else 0) for i in range(steps)]
+
+    prompt_row = prompt_tokens[0]  # [prompt_len]
+    target_row = target_tokens[0]  # [suffix_len]
+
+    suffix = torch.full(
+        (1, suffix_len),
+        mask_id,
+        dtype=torch.long,
+        device=device,
+    )
+
+    log_probability = torch.zeros((), dtype=torch.float64, device=device)
+    alive = True
+
+    start = 0
+
+    for step_size in schedule:
+        if step_size == 0:
+            continue
+
+        # Deterministic left-to-right reveal positions.
+        reveal_positions = torch.arange(
+            start,
+            start + step_size,
+            device=device,
+            dtype=torch.long,
+        ).unsqueeze(0)  # [1, step_size]
+
+        start += step_size
+
+        x = torch.cat(
+            [prompt_row.unsqueeze(0), suffix],
+            dim=1,
+        )  # [1, prompt_len + suffix_len]
+
+        batched_attn = None
+        if attn is not None:
+            if attn.shape[0] == 1:
+                batched_attn = attn
+            else:
+                batched_attn = attn[:1]
+
+        logits = model(x, attention_mask=batched_attn).logits
+        suffix_logits = logits[:, prompt_len:, :]  # [1, suffix_len, vocab]
+
+        vocab_size = suffix_logits.shape[-1]
+        gather_index = reveal_positions.unsqueeze(-1).expand(-1, -1, vocab_size)
+
+        step_logits = torch.gather(
+            suffix_logits,
+            dim=1,
+            index=gather_index,
+        )  # [1, step_size, vocab]
+
+        target_ids = torch.gather(
+            target_row.unsqueeze(0),
+            dim=1,
+            index=reveal_positions,
+        )  # [1, step_size]
+
+        scaled_logits = step_logits if temperature <= 0 else step_logits / temperature
+
+        if decoding_scheme == "top_k":
+            top_k = min(k, scaled_logits.shape[-1])
+
+            if top_k <= 0:
+                alive = False
+                break
+
+            topk_vals, topk_idx = torch.topk(
+                scaled_logits,
+                k=top_k,
+                dim=-1,
+            )  # [1, step_size, top_k]
+
+            in_topk = (topk_idx == target_ids.unsqueeze(-1)).any(dim=-1)
+
+            target_logits = torch.gather(
+                scaled_logits,
+                dim=-1,
+                index=target_ids.unsqueeze(-1),
+            ).squeeze(-1)  # [1, step_size]
+
+            token_log_probs = target_logits - torch.logsumexp(topk_vals, dim=-1)
+
+            token_log_probs = torch.where(
+                in_topk,
+                token_log_probs,
+                torch.full_like(token_log_probs, float("-inf")),
+            )
+
+        else:
+            target_logits = torch.gather(
+                scaled_logits,
+                dim=-1,
+                index=target_ids.unsqueeze(-1),
+            ).squeeze(-1)  # [1, step_size]
+
+            token_log_probs = target_logits - torch.logsumexp(
+                scaled_logits,
+                dim=-1,
+            )
+
+        if torch.isneginf(token_log_probs).any():
+            alive = False
+            break
+
+        log_probability = log_probability + token_log_probs.double().sum()
+
+        # Reveal the true target tokens into the suffix.
+        suffix.scatter_(
+            dim=1,
+            index=reveal_positions,
+            src=target_ids,
+        )
+
+    if alive:
+        probability = float(torch.exp(log_probability).detach().cpu())
+        log_probability_value = float(log_probability.detach().cpu())
+    else:
+        probability = 0.0
+        log_probability_value = float("-inf")
+
+    return {
+        "probability": probability,
+        "log_probability": log_probability_value,
+        "sample_probabilities": [probability],
+        "num_samples": 1,
+        "estimation_method": "highest_index_exact",
+    }
+
+@torch.inference_mode()
+def highest_index_probability_from_partially_masked(
+    model,
+    sequence_tokens: torch.Tensor,          # [1, 100]
+    masked_indexes: list[int],              # 1-indexed masked positions in sequence_tokens
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    decoding_scheme: str,
+    k: int,
+    temperature: float,
+) -> Dict[str, object]:
+    """
+    Exact probability for partially masked conditioning using the deterministic
+    lowest-index-to-highest-index reveal path.
+
+    High-level behavior:
+      - sequence_tokens is the full target sequence z, shape [1, 100]
+      - masked_indexes specifies the positions to regenerate, using 1-indexing
+      - unmasked positions remain observed / conditioning tokens
+      - masked positions are revealed from lowest absolute index to highest
+      - if steps == number of masked positions, this reveals one token per step
+      - supports 'top_k' and full-softmax decoding
+
+    Example:
+      masked_indexes = [51, 52, ..., 100]
+      steps = 50
+
+      Reveal order is:
+        51, 52, 53, ..., 100
+
+      using 1-indexed sequence positions.
+    """
+
+    device = _model_device(model)
+    sequence_tokens = sequence_tokens.to(device)
+
+    if sequence_tokens.ndim != 2 or sequence_tokens.shape[0] != 1:
+        raise ValueError(
+            f"sequence_tokens must have shape [1, 100], got {tuple(sequence_tokens.shape)}"
+        )
+
+    seq_len = sequence_tokens.shape[1]
+    if seq_len != 100:
+        raise ValueError(f"Expected sequence length 100, got {seq_len}")
+
+    if steps <= 0:
+        raise ValueError("steps must be positive")
+
+    # Convert 1-indexed masked positions to 0-indexed absolute positions.
+    # Sorting gives the deterministic lowest-index-to-highest-index reveal path.
+    masked_pos = sorted(set(int(i) - 1 for i in masked_indexes))
+
+    if len(masked_pos) != 50:
+        raise ValueError(
+            f"Expected exactly 50 masked positions out of 100, got {len(masked_pos)}"
+        )
+
+    if any(pos < 0 or pos >= seq_len for pos in masked_pos):
+        raise ValueError("masked_indexes must be 1-indexed positions in [1, 100]")
+
+    masked_len = len(masked_pos)
+    masked_pos_t = torch.tensor(masked_pos, dtype=torch.long, device=device)  # [50]
+
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+        if attention_mask.shape != (1, seq_len):
+            raise ValueError(
+                f"attention_mask must have shape [1, {seq_len}], got {tuple(attention_mask.shape)}"
+            )
+
+    base = masked_len // steps
+    rem = masked_len % steps
+    schedule = [base + (1 if i < rem else 0) for i in range(steps)]
+
+    full_target_row = sequence_tokens[0]               # [100]
+    masked_target_row = full_target_row[masked_pos_t]  # [50]
+
+    # Current sequence state.
+    # Observed positions stay fixed. Masked positions start as mask_id.
+    x = sequence_tokens.clone()                        # [1, 100]
+    x[:, masked_pos_t] = mask_id
+
+    log_probability = torch.zeros((), dtype=torch.float64, device=device)
+    alive = True
+
+    start = 0
+
+    for step_size in schedule:
+        if step_size == 0:
+            continue
+
+        # Deterministic reveal slots into masked_pos_t / masked_target_row.
+        # Since masked_pos_t is sorted, this reveals lowest absolute index first.
+        reveal_slots = torch.arange(
+            start,
+            start + step_size,
+            device=device,
+            dtype=torch.long,
+        ).unsqueeze(0)  # [1, step_size]
+
+        start += step_size
+
+        logits = model(x, attention_mask=attention_mask).logits  # [1, 100, vocab]
+        vocab_size = logits.shape[-1]
+
+        # Map masked slots to absolute sequence positions.
+        reveal_abs_positions = masked_pos_t[reveal_slots]        # [1, step_size]
+
+        gather_index = reveal_abs_positions.unsqueeze(-1).expand(
+            -1,
+            -1,
+            vocab_size,
+        )
+
+        step_logits = torch.gather(
+            logits,
+            dim=1,
+            index=gather_index,
+        )  # [1, step_size, vocab]
+
+        target_ids = torch.gather(
+            masked_target_row.unsqueeze(0),
+            dim=1,
+            index=reveal_slots,
+        )  # [1, step_size]
+
+        scaled_logits = step_logits if temperature <= 0 else step_logits / temperature
+
+        if decoding_scheme == "top_k":
+            top_k = min(k, scaled_logits.shape[-1])
+
+            if top_k <= 0:
+                alive = False
+                break
+
+            topk_vals, topk_idx = torch.topk(
+                scaled_logits,
+                k=top_k,
+                dim=-1,
+            )  # [1, step_size, top_k]
+
+            in_topk = (topk_idx == target_ids.unsqueeze(-1)).any(dim=-1)
+
+            target_logits = torch.gather(
+                scaled_logits,
+                dim=-1,
+                index=target_ids.unsqueeze(-1),
+            ).squeeze(-1)  # [1, step_size]
+
+            token_log_probs = target_logits - torch.logsumexp(topk_vals, dim=-1)
+
+            token_log_probs = torch.where(
+                in_topk,
+                token_log_probs,
+                torch.full_like(token_log_probs, float("-inf")),
+            )
+
+        else:
+            target_logits = torch.gather(
+                scaled_logits,
+                dim=-1,
+                index=target_ids.unsqueeze(-1),
+            ).squeeze(-1)  # [1, step_size]
+
+            token_log_probs = target_logits - torch.logsumexp(
+                scaled_logits,
+                dim=-1,
+            )
+
+        # If any token has zero probability, this deterministic path has probability 0.
+        if torch.isneginf(token_log_probs).any():
+            alive = False
+            break
+
+        log_probability = log_probability + token_log_probs.double().sum()
+
+        # Reveal the true target tokens into x.
+        x.scatter_(
+            dim=1,
+            index=reveal_abs_positions,
+            src=target_ids,
+        )
+
+    if alive:
+        probability = float(torch.exp(log_probability).detach().cpu())
+        log_probability_value = float(log_probability.detach().cpu())
+    else:
+        probability = 0.0
+        log_probability_value = float("-inf")
+
+    return {
+        "probability": probability,
+        "log_probability": log_probability_value,
+        "sample_probabilities": [probability],
+        "num_samples": 1,
+        "estimation_method": "highest_index_exact_from_partially_masked",
+    }
 @torch.inference_mode()
 def _path_sampling_random_probability(
     model,
@@ -819,21 +1180,6 @@ def _path_sampling_random_probability(
     temperature: float,
     batch_size: int = 64,
 ) -> Dict[str, object]:
-    """
-    Faster batched version of the original estimator.
-
-    Same high-level behavior:
-      - samples a random reveal permutation for each sample
-      - uses the same fixed schedule across steps
-      - computes the path probability of obtaining target_tokens
-      - supports 'top_k' and full-softmax decoding
-      - returns the same output structure
-
-    Assumptions kept from the original code:
-      - prompt_tokens has shape [1, prompt_len]
-      - target_tokens has shape [1, suffix_len]
-      - attention mask produced by _suffix_attention_mask is valid for the full sequence
-    """
     device = _model_device(model)
     prompt_tokens = prompt_tokens.to(device)
     target_tokens = target_tokens.to(device)
