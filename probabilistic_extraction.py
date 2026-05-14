@@ -1680,70 +1680,29 @@ def _path_sampling_low_confidence_probability(
     num_samples: int,
     seed: Optional[int],
     temperature: float,
-    batch_size: int = 64,
-    *,
-    exact_tail_size: int = 7,
-    cdf_chunk_size: int = 8,
+    batch_size: int = 64
 ) -> Dict[str, object]:
     """
-    Unbiased successful-path estimator for the low-confidence full-distribution
-    decoder, improved with exact tail recursion.
+    Unbiased path-sampling estimator for the full-distribution low-confidence
+    remasking decoder.
 
-    Main variance-reduction idea:
-        Once the number of unrevealed positions is <= exact_tail_size,
-        stop sampling and compute the remaining continuation probability exactly:
+    This implements the estimator
 
-            p_z(S) = sum_i a_i(S) p_z(S union {i})
+        \hat p_z = prod_t A(S_{t-1}),
 
-        This is a Rao-Blackwellization of the original path estimator and
-        preserves unbiasedness.
+    where
 
-    Practical notes:
-        - exact_tail_size=0 recovers the original pure path-sampling estimator.
-        - exact_tail_size around 6--8 is often a good starting point.
-        - exact_tail_size too large can become expensive because the exact
-          recursion may visit up to 2^exact_tail_size states per distinct tail.
+        a_i(S) =
+            p_theta(z_i | x_S, i)
+            prod_{j in M(S), j != i} F_j(c_i^*(S)),
+
+        A(S) = sum_i a_i(S),
+
+        q(i | S) = a_i(S) / A(S).
+
+    The sampled path is drawn from q, not from the original low-confidence
+    decoder path law.
     """
-    if temperature <= 0:
-        raise ValueError(
-            "The low-confidence full-distribution estimator requires "
-            "temperature > 0."
-        )
-
-    if num_samples < 0:
-        raise ValueError(f"num_samples must be nonnegative. Got {num_samples}.")
-
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive. Got {batch_size}.")
-
-    if exact_tail_size < 0:
-        raise ValueError(
-            f"exact_tail_size must be nonnegative. Got {exact_tail_size}."
-        )
-
-    if cdf_chunk_size <= 0:
-        raise ValueError(
-            f"cdf_chunk_size must be positive. Got {cdf_chunk_size}."
-        )
-
-    if prompt_tokens.ndim != 2:
-        raise ValueError(
-            f"prompt_tokens must have shape [batch, prompt_len]. "
-            f"Got shape {tuple(prompt_tokens.shape)}."
-        )
-
-    if target_tokens.ndim != 2:
-        raise ValueError(
-            f"target_tokens must have shape [batch, suffix_len]. "
-            f"Got shape {tuple(target_tokens.shape)}."
-        )
-
-    if prompt_tokens.shape[0] != 1 or target_tokens.shape[0] != 1:
-        raise ValueError(
-            "This estimator supports exactly one prompt/target pair. "
-            f"Got prompt batch={prompt_tokens.shape[0]}, "
-            f"target batch={target_tokens.shape[0]}."
-        )
 
     device = _model_device(model)
     prompt_tokens = prompt_tokens.to(device)
@@ -1754,279 +1713,30 @@ def _path_sampling_low_confidence_probability(
 
     if steps != suffix_len:
         raise ValueError(
-            "This low-confidence estimator implements the one-token-per-step "
-            f"successful-path estimator, so steps must equal suffix_len. "
-            f"Got steps={steps}, suffix_len={suffix_len}."
+            "Low-confidence path estimator currently assumes exactly one "
+            "revealed token per step, so steps must equal suffix_len."
         )
 
-    if suffix_len > 63:
+
+    if temperature <= 0:
         raise ValueError(
-            "This implementation uses int64 bitmasks for memoized states, "
-            f"so suffix_len must be <= 63. Got suffix_len={suffix_len}."
+            "Low-confidence full-distribution estimator requires temperature > 0."
         )
 
     attn = _suffix_attention_mask(attention_mask, suffix_len, device)
 
-    if attn is not None and attn.shape[0] != 1:
-        raise ValueError(
-            "This estimator supports exactly one attention-mask row, matching "
-            "the single prompt/target pair. "
-            f"Got attention_mask batch={attn.shape[0]}."
-        )
-
+    # Keep CPU RNG for seeded reproducibility style close to the random estimator.
     rng = torch.Generator(device="cpu")
-    seed = None
     if seed is not None:
         rng.manual_seed(seed)
 
-    prompt_row = prompt_tokens[0]  # [prompt_len]
-    target_row = target_tokens[0]  # [suffix_len]
+    prompt_row = prompt_tokens[0]   # [prompt_len]
+    target_row = target_tokens[0]   # [suffix_len]
 
-    neg_inf = -float("inf")
-
-    def _compute_log_a(
-        suffix: torch.Tensor,
-        unrevealed: torch.Tensor,
-        remaining: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Computes log a_i(S) for each row and each currently unrevealed position.
-
-        Args:
-            suffix:
-                [bsz, suffix_len], with revealed target tokens and mask_id
-                elsewhere.
-            unrevealed:
-                [bsz, suffix_len] bool.
-            remaining:
-                Number of unrevealed positions per row.
-
-        Returns:
-            log_a:
-                [bsz, remaining].
-            masked_positions:
-                [bsz, remaining], global suffix indices of candidates.
-        """
-        bsz = suffix.shape[0]
-
-        x = torch.cat(
-            [prompt_row.unsqueeze(0).expand(bsz, -1), suffix],
-            dim=1,
-        )
-
-        batched_attn = None
-        if attn is not None:
-            batched_attn = attn.expand(bsz, *attn.shape[1:])
-
-        logits = model(x, attention_mask=batched_attn).logits
-        suffix_logits = logits[:, prompt_len:, :]  # [bsz, suffix_len, vocab]
-        vocab_size = suffix_logits.shape[-1]
-
-        all_positions = torch.arange(
-            suffix_len,
-            device=device,
-        ).expand(bsz, -1)
-
-        masked_positions = all_positions[unrevealed].view(bsz, remaining)
-
-        gather_index = masked_positions.unsqueeze(-1).expand(
-            -1,
-            -1,
-            vocab_size,
-        )
-
-        masked_logits = torch.gather(
-            suffix_logits,
-            dim=1,
-            index=gather_index,
-        ).double()  # [bsz, remaining, vocab]
-
-        masked_logits = masked_logits / temperature
-
-        masked_log_probs = torch.log_softmax(
-            masked_logits,
-            dim=-1,
-        )  # [bsz, remaining, vocab]
-
-        masked_probs = masked_log_probs.exp()
-
-        target_ids = torch.gather(
-            target_row.unsqueeze(0).expand(bsz, -1),
-            dim=1,
-            index=masked_positions,
-        )  # [bsz, remaining]
-
-        target_log_probs = torch.gather(
-            masked_log_probs,
-            dim=-1,
-            index=target_ids.unsqueeze(-1),
-        ).squeeze(-1)  # [bsz, remaining]
-
-        target_probs = target_log_probs.exp()  # c_i^star
-
-        # L_all[:, j, i] = P_j(conf_j < c_i)
-        L_all = torch.empty(
-            (bsz, remaining, remaining),
-            dtype=torch.float64,
-            device=device,
-        )
-
-        for j_start in range(0, remaining, cdf_chunk_size):
-            j_end = min(j_start + cdf_chunk_size, remaining)
-            chunk = j_end - j_start
-
-            probs_j = masked_probs[:, j_start:j_end, :]  # [bsz, chunk, vocab]
-
-            sorted_probs_j, _ = torch.sort(
-                probs_j,
-                dim=-1,
-            )
-
-            cdf_j = torch.cumsum(
-                sorted_probs_j,
-                dim=-1,
-            )
-
-            zero_pad = torch.zeros(
-                (*cdf_j.shape[:-1], 1),
-                dtype=torch.float64,
-                device=device,
-            )
-
-            cdf_j_padded = torch.cat(
-                [zero_pad, cdf_j],
-                dim=-1,
-            )  # [bsz, chunk, vocab + 1]
-
-            thresholds = target_probs[:, None, :].expand(
-                -1,
-                chunk,
-                -1,
-            ).contiguous()  # [bsz, chunk, remaining]
-
-            # Strictly less than c_i, matching the no-ties estimator.
-            idx_left = torch.searchsorted(
-                sorted_probs_j.contiguous(),
-                thresholds,
-                right=False,
-            )
-
-            L = torch.gather(
-                cdf_j_padded,
-                dim=-1,
-                index=idx_left,
-            )  # [bsz, chunk, remaining]
-
-            L_all[:, j_start:j_end, :] = L
-
-        log_L_all = torch.where(
-            L_all > 0,
-            torch.log(L_all),
-            torch.full_like(L_all, neg_inf),
-        )
-
-        eye = torch.eye(
-            remaining,
-            dtype=torch.bool,
-            device=device,
-        ).unsqueeze(0)
-
-        # Exclude j = i from prod_{j != i}.
-        log_L_all = log_L_all.masked_fill(eye, 0.0)
-
-        log_success_factor = log_L_all.sum(dim=1)  # [bsz, remaining]
-        log_a = target_log_probs + log_success_factor
-
-        return log_a, masked_positions
-
-    exact_tail_cache: Dict[int, float] = {}
-
-    def _suffix_and_unrevealed_from_revealed_mask(
-        revealed_mask: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """
-        Builds a single-row suffix tensor and unrevealed mask from an int bitmask.
-
-        Bit i == 1 means suffix position i has already been revealed.
-        """
-        positions = torch.arange(suffix_len, device=device)
-        revealed = torch.tensor(
-            [(revealed_mask >> i) & 1 for i in range(suffix_len)],
-            dtype=torch.bool,
-            device=device,
-        )
-
-        suffix = torch.full(
-            (1, suffix_len),
-            mask_id,
-            dtype=torch.long,
-            device=device,
-        )
-
-        suffix[0, revealed] = target_row[revealed]
-        unrevealed = ~revealed
-        remaining = int(unrevealed.sum().item())
-
-        return suffix, unrevealed.unsqueeze(0), remaining
-
-    def _exact_log_continuation(revealed_mask: int) -> float:
-        """
-        Exact log p_z(S) for the remaining unrevealed positions, using
-
-            p_z(S) = sum_i a_i(S) p_z(S union {i}).
-
-        The cache key is the revealed-position bitmask.
-        """
-        if revealed_mask in exact_tail_cache:
-            return exact_tail_cache[revealed_mask]
-
-        revealed_count = revealed_mask.bit_count()
-        remaining = suffix_len - revealed_count
-
-        if remaining == 0:
-            exact_tail_cache[revealed_mask] = 0.0
-            return 0.0
-
-        suffix, unrevealed, remaining = _suffix_and_unrevealed_from_revealed_mask(
-            revealed_mask
-        )
-
-        log_a, masked_positions = _compute_log_a(
-            suffix=suffix,
-            unrevealed=unrevealed,
-            remaining=remaining,
-        )
-
-        log_terms: List[float] = []
-
-        positions_cpu = masked_positions[0].detach().cpu().tolist()
-        log_a_cpu = log_a[0].detach().cpu().tolist()
-
-        for local_idx, pos in enumerate(positions_cpu):
-            child_mask = revealed_mask | (1 << int(pos))
-            child_log_p = _exact_log_continuation(child_mask)
-
-            if math.isinf(log_a_cpu[local_idx]) and log_a_cpu[local_idx] < 0:
-                continue
-
-            if math.isinf(child_log_p) and child_log_p < 0:
-                continue
-
-            log_terms.append(float(log_a_cpu[local_idx]) + child_log_p)
-
-        if not log_terms:
-            out = neg_inf
-        else:
-            m = max(log_terms)
-            out = m + math.log(sum(math.exp(x - m) for x in log_terms))
-
-        exact_tail_cache[revealed_mask] = float(out)
-        return float(out)
+    eye = torch.eye(suffix_len, dtype=torch.bool, device=device)
 
     sample_log_probabilities: List[float] = []
     sample_probabilities: List[float] = []
-
-    exact_tail_hits = 0
 
     for batch_start in range(0, num_samples, batch_size):
         bsz = min(batch_size, num_samples - batch_start)
@@ -2038,187 +1748,229 @@ def _path_sampling_low_confidence_probability(
             device=device,
         )
 
-        unrevealed = torch.ones(
+        revealed = torch.zeros(
             (bsz, suffix_len),
             dtype=torch.bool,
             device=device,
         )
 
-        alive = torch.ones(
-            bsz,
-            dtype=torch.bool,
-            device=device,
-        )
+        log_weight = torch.zeros(bsz, dtype=torch.float64, device=device)
+        alive = torch.ones(bsz, dtype=torch.bool, device=device)
 
-        log_estimator = torch.zeros(
-            bsz,
-            dtype=torch.float64,
-            device=device,
-        )
+        for _ in range(suffix_len):
+            masked = ~revealed  # [bsz, suffix_len]
 
-        # CPU-side bitmasks. Bit i == 1 means position i has been revealed.
-        revealed_masks: List[int] = [0 for _ in range(bsz)]
+            x = torch.cat(
+                [prompt_row.unsqueeze(0).expand(bsz, -1), suffix],
+                dim=1,
+            )
 
-        t = 0
-        while t < suffix_len:
-            remaining = suffix_len - t
+            batched_attn = None
+            if attn is not None:
+                if attn.shape[0] == bsz:
+                    batched_attn = attn
+                else:
+                    batched_attn = attn.expand(bsz, *attn.shape[1:])
 
-            # Rao-Blackwellized exact tail.
+            logits = model(x, attention_mask=batched_attn).logits
+            suffix_logits = logits[:, prompt_len:, :]  # [bsz, suffix_len, vocab]
+
+            scaled_logits = suffix_logits.float() / temperature
+
+            # Full temperature-adjusted distribution p_{theta,tau}.
+            probs = torch.softmax(scaled_logits, dim=-1)  # [bsz, suffix_len, vocab]
+
+            vocab_size = probs.shape[-1]
+
+            target_ids = target_row.unsqueeze(0).expand(bsz, -1)  # [bsz, suffix_len]
+
+            target_probs = torch.gather(
+                probs,
+                dim=-1,
+                index=target_ids.unsqueeze(-1),
+            ).squeeze(-1)  # [bsz, suffix_len]
+
+            # Compute F_j(c_i) exactly for all j, i.
             #
-            # Instead of sampling the last `exact_tail_size` steps, compute the
-            # exact continuation probability from each current state.
-            if exact_tail_size > 0 and remaining <= exact_tail_size:
-                tail_logs = torch.full(
-                    (bsz,),
-                    neg_inf,
-                    dtype=torch.float64,
-                    device=device,
-                )
+            # F_j(c) = sum_{v : p_j(v) < c} p_j(v).
+            #
+            # We sort each distribution once, then use searchsorted to evaluate
+            # the CDF at every target-token confidence c_i.
+            sorted_probs, _ = torch.sort(probs, dim=-1)          # [bsz, suffix_len, vocab]
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-                for row in range(bsz):
-                    if bool(alive[row].item()):
-                        tail_logs[row] = _exact_log_continuation(
-                            revealed_masks[row]
-                        )
-                        exact_tail_hits += 1
-
-                finite_tail = torch.isfinite(tail_logs)
-                alive_now = alive & finite_tail
-
-                log_estimator = torch.where(
-                    alive_now,
-                    log_estimator + tail_logs,
-                    torch.full_like(log_estimator, neg_inf),
-                )
-
-                alive = alive_now
-                break
-
-            log_a, masked_positions = _compute_log_a(
-                suffix=suffix,
-                unrevealed=unrevealed,
-                remaining=remaining,
-            )
-
-            # A(S) = sum_i a_i(S)
-            log_A = torch.logsumexp(log_a, dim=-1)  # [bsz]
-            finite_A = torch.isfinite(log_A)
-            alive_now = alive & finite_A
-
-            log_estimator = torch.where(
-                alive_now,
-                log_estimator + log_A,
-                torch.full_like(log_estimator, neg_inf),
-            )
-
-            alive = alive_now
-
-            # Proposal q(i | S) = a_i(S) / A(S).
-            q = torch.zeros(
-                (bsz, remaining),
-                dtype=torch.float64,
+            F = torch.empty(
+                (bsz, suffix_len, suffix_len),
+                dtype=torch.float32,
                 device=device,
+            )  # F[:, j, i] = F_j(c_i)
+
+            for j in range(suffix_len):
+                # For each batch row and each candidate i, find the number of
+                # vocabulary entries with probability strictly smaller than c_i.
+                insertion_idx = torch.searchsorted(
+                    sorted_probs[:, j, :].contiguous(),
+                    target_probs,
+                    right=False,
+                )  # [bsz, suffix_len]
+
+                gather_idx = (insertion_idx - 1).clamp_min(0)
+
+                cdf_vals = torch.gather(
+                    cumulative_probs[:, j, :],
+                    dim=-1,
+                    index=gather_idx,
+                )
+
+                cdf_vals = torch.where(
+                    insertion_idx > 0,
+                    cdf_vals,
+                    torch.zeros_like(cdf_vals),
+                )
+
+                F[:, j, :] = cdf_vals
+
+            # log a_i(S)
+            #
+            # a_i(S) =
+            #   p_target_i * prod_{j in M(S), j != i} F_j(c_i).
+            F64 = F.to(torch.float64)
+
+            log_F = torch.where(
+                F64 > 0,
+                torch.log(F64),
+                torch.full_like(F64, float("-inf")),
             )
+
+            include_j = masked.unsqueeze(-1) & (~eye.unsqueeze(0))
+            # include_j has shape [bsz, j, i].
+            # It includes current masked positions j, excluding j == i.
+
+            log_product = torch.where(
+                include_j,
+                log_F,
+                torch.zeros_like(log_F),
+            ).sum(dim=1)  # [bsz, suffix_len]
+
+            target_probs64 = target_probs.to(torch.float64)
+
+            log_target_probs = torch.where(
+                target_probs64 > 0,
+                torch.log(target_probs64),
+                torch.full_like(target_probs64, float("-inf")),
+            )
+
+            log_a = log_target_probs + log_product
+
+            # Only still-masked indices are valid candidates i.
+            log_a = torch.where(
+                masked,
+                log_a,
+                torch.full_like(log_a, float("-inf")),
+            )
+
+            # A(S) = sum_i a_i(S), computed stably.
+            log_A = torch.logsumexp(log_a, dim=-1)  # [bsz]
+
+            still_alive = alive & torch.isfinite(log_A)
+
+            log_weight = torch.where(
+                still_alive,
+                log_weight + log_A,
+                log_weight,
+            )
+
+            alive = still_alive
+
+            # Sample next index from q(i | S) = a_i(S) / A(S).
+            #
+            # For dead rows, sample a dummy remaining masked index so tensor
+            # shapes stay consistent; those rows will contribute probability 0.
+            q = torch.zeros_like(log_a, dtype=torch.float64)
 
             if alive.any():
-                q[alive] = torch.exp(log_a[alive] - log_A[alive, None])
+                q_alive = torch.exp(log_a[alive] - log_A[alive].unsqueeze(-1))
+                q[alive] = q_alive
 
-                # Clean up numerical drift for multinomial.
-                q[alive] = torch.clamp(q[alive], min=0.0)
-                row_sums = q[alive].sum(dim=-1, keepdim=True)
+            dead = ~alive
+            if dead.any():
+                dummy_probs = masked[dead].to(torch.float64)
+                dummy_probs = dummy_probs / dummy_probs.sum(dim=-1, keepdim=True)
+                q[dead] = dummy_probs
 
-                valid_rows = row_sums.squeeze(-1) > 0
-                alive_indices = torch.nonzero(alive, as_tuple=False).squeeze(-1)
+            q = torch.where(
+                masked,
+                q,
+                torch.zeros_like(q),
+            )
 
-                if valid_rows.any():
-                    q[alive_indices[valid_rows]] = (
-                        q[alive_indices[valid_rows]]
-                        / row_sums[valid_rows]
-                    )
+            # Normalize defensively against tiny numerical drift.
+            q_sum = q.sum(dim=-1, keepdim=True)
+            q = q / q_sum.clamp_min(torch.finfo(q.dtype).tiny)
 
-                if (~valid_rows).any():
-                    bad = alive_indices[~valid_rows]
-                    q[bad] = 1.0 / remaining
-                    alive[bad] = False
-                    log_estimator[bad] = neg_inf
-
-            # Dead samples have zero estimator. Sample arbitrary valid positions
-            # only to keep tensor updates well-defined.
-            if (~alive).any():
-                q[~alive] = 1.0 / remaining
-
-            sampled_local = torch.multinomial(
+            next_indices_cpu = torch.multinomial(
                 q.detach().cpu(),
                 num_samples=1,
                 replacement=True,
                 generator=rng,
-            ).to(device)  # [bsz, 1]
+            ).squeeze(-1)
 
-            sampled_positions = torch.gather(
-                masked_positions,
-                dim=1,
-                index=sampled_local,
-            )  # [bsz, 1]
+            next_indices = next_indices_cpu.to(device)  # [bsz]
 
-            sampled_target_ids = torch.gather(
+            next_target_ids = torch.gather(
                 target_row.unsqueeze(0).expand(bsz, -1),
                 dim=1,
-                index=sampled_positions,
+                index=next_indices.unsqueeze(-1),
             )  # [bsz, 1]
 
             suffix.scatter_(
                 dim=1,
-                index=sampled_positions,
-                src=sampled_target_ids,
+                index=next_indices.unsqueeze(-1),
+                src=next_target_ids,
             )
 
-            unrevealed.scatter_(
+            revealed.scatter_(
                 dim=1,
-                index=sampled_positions,
-                src=torch.zeros_like(sampled_positions, dtype=torch.bool),
+                index=next_indices.unsqueeze(-1),
+                src=torch.ones((bsz, 1), dtype=torch.bool, device=device),
             )
 
-            # Update CPU-side revealed bitmasks.
-            sampled_positions_cpu = (
-                sampled_positions.squeeze(-1).detach().cpu().tolist()
-            )
-            for row, pos in enumerate(sampled_positions_cpu):
-                revealed_masks[row] |= 1 << int(pos)
-
-            t += 1
-
-        batch_log_probs = log_estimator.detach().cpu().tolist()
-        sample_log_probabilities.extend(batch_log_probs)
-
-        # Diagnostic only. Individual probabilities can underflow.
-        batch_probabilities = torch.exp(log_estimator)
-        sample_probabilities.extend(
-            batch_probabilities.detach().cpu().tolist()
+        batch_log_probs = torch.where(
+            alive,
+            log_weight,
+            torch.full_like(log_weight, float("-inf")),
         )
 
-    average_probability, standard_error = _logmeanexp_and_stderr(
-        sample_log_probabilities
-    )
+        sample_log_probabilities.extend(batch_log_probs.detach().cpu().tolist())
+
+        batch_probabilities = torch.where(
+            torch.isfinite(batch_log_probs),
+            torch.exp(batch_log_probs),
+            torch.zeros_like(batch_log_probs),
+        )
+
+        sample_probabilities.extend(batch_probabilities.detach().cpu().tolist())
+
+    if sample_log_probabilities:
+        finite_logs = [lp for lp in sample_log_probabilities if not math.isinf(lp)]
+
+        if not finite_logs:
+            average_probability = 0.0
+        else:
+            max_log = max(finite_logs)
+            scaled_sum = sum(math.exp(lp - max_log) for lp in finite_logs)
+            average_probability = float(
+                math.exp(max_log) * (scaled_sum / len(sample_log_probabilities))
+            )
+    else:
+        average_probability = 0.0
 
     return {
         "probability": average_probability,
-        "standard_error": standard_error,
-        "relative_standard_error": (
-            float(standard_error / average_probability)
-            if average_probability > 0 and math.isfinite(standard_error)
-            else float("nan")
-        ),
         "sample_probabilities": sample_probabilities,
         "sample_log_probabilities": sample_log_probabilities,
         "num_samples": num_samples,
-        "estimation_method": (
-            "path_sampling_low_confidence_no_ties_exact_tail"
-        ),
-        "tie_breaking": "assumes_no_ties",
-        "temperature": temperature,
-        "exact_tail_size": exact_tail_size,
-        "exact_tail_cache_size": len(exact_tail_cache),
-        "exact_tail_hits": exact_tail_hits,
+        "estimation_method": "path_sampling_low_confidence",
     }
 
 
