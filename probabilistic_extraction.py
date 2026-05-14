@@ -58,41 +58,13 @@ def _validate_common_args(remasking: str, estimation_method: str) -> None:
         raise ValueError("estimation_method must be one of {'exact', 'monte-carlo', 'path_sampling'}")
 
 
-def _suffix_attention_mask(
-    attention_mask: Optional[torch.Tensor],
-    suffix_len: int,
-    device: torch.device,
-    prompt_len: Optional[int] = None,
-) -> Optional[torch.Tensor]:
-    if attention_mask is None:
+def _suffix_attention_mask(prompt_attention_mask: Optional[torch.Tensor], suffix_len: int, device: torch.device) -> Optional[torch.Tensor]:
+    if prompt_attention_mask is None:
         return None
-
-    attention_mask = attention_mask.to(device)
-
-    if attention_mask.ndim != 2:
-        raise ValueError("Expected attention_mask with shape [batch, seq_len].")
-
-    if prompt_len is not None:
-        expected_prompt_len = prompt_len
-        expected_full_len = prompt_len + suffix_len
-
-        if attention_mask.shape[1] == expected_full_len:
-            return attention_mask
-
-        if attention_mask.shape[1] != expected_prompt_len:
-            raise ValueError(
-                f"attention_mask length must be either prompt_len={expected_prompt_len} "
-                f"or prompt_len + suffix_len={expected_full_len}, "
-                f"got {attention_mask.shape[1]}."
-            )
-
-    suffix_attention = torch.ones(
-        (attention_mask.shape[0], suffix_len),
-        dtype=attention_mask.dtype,
-        device=device,
+    return torch.cat(
+        [prompt_attention_mask.to(device), torch.ones((1, suffix_len), dtype=prompt_attention_mask.dtype, device=device)],
+        dim=-1,
     )
-
-    return torch.cat([attention_mask, suffix_attention], dim=-1)
 
 
 def _uniform_cutoff_subsets(mask_positions: Sequence[int], confidences: Sequence[float], k: int) -> List[Tuple[Tuple[int, ...], float]]:
