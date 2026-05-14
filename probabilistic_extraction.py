@@ -1688,7 +1688,7 @@ def _path_sampling_low_confidence_probability(
     temperature: float,
     batch_size: int = 10,
     validate_no_ties: bool = True,
-    exact_tail_steps: int = 8,
+    exact_tail_steps: int = 5,
     proposal: str = "lookahead",  # "local" or "lookahead"
     lookahead_power: float = 1.0,
     topk_exact_children: int = 1,
