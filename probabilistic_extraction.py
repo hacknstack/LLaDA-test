@@ -1669,6 +1669,12 @@ def _logmeanexp_and_stderr(log_values: List[float]) -> Tuple[float, float]:
     return float(mean), float(stderr)
 
 
+import math
+from typing import Dict, List, Optional
+
+import torch
+
+
 @torch.inference_mode()
 def _path_sampling_low_confidence_probability(
     model,
@@ -1680,36 +1686,50 @@ def _path_sampling_low_confidence_probability(
     num_samples: int,
     seed: Optional[int],
     temperature: float,
-    batch_size: int = 64,
+    batch_size: int = 10,
     validate_no_ties: bool = True,
+    exact_tail_steps: int = 6,
+    proposal: str = "lookahead",  # "local" or "lookahead"
+    lookahead_power: float = 1.0,
+    topk_exact_children: int = 0,
+    rb_tail_depth: int = 0,
 ) -> Dict[str, object]:
     """
     Unbiased path-sampling estimator for the full-distribution low-confidence
     remasking decoder.
 
-    This implements
+    Implements the estimator for
 
-        \hat p_z = prod_t A(S_{t-1}),
+        p_z = P_{theta, phi}(z_suffix | z_prefix)
 
-    where
+    under the full-distribution low-confidence remasking decoder.
 
-        a_i(S) =
-            p_theta(z_i | x_S, i)
-            prod_{j in M(S), j != i} F_j(c_i^*(S)),
+    Improvements over the basic implementation:
+    1. Computes F_j(c) in log-space using log_softmax + logcumsumexp.
+    2. Uses exact-tail Rao-Blackwellization:
+           if remaining <= exact_tail_steps,
+           compute p_z(S) exactly by dynamic programming over remaining states.
+    3. Supports a lookahead proposal:
+           q(i | S) proportional to a_i(S) * h_i(S),
+       with h_i(S) approximately log A(S union {i}), or exact tail probability
+       when the child state is inside the exact tail.
+    4. Supports optional top-k Rao-Blackwellization near the tail via
+       topk_exact_children and rb_tail_depth.
 
-        F_j(c) = P_{V_j ~ p_theta(. | x_S, j)}[
-            p_theta(V_j | x_S, j) < c
-        ],
+    Unbiasedness:
+    - For proposal="local", this reduces to the original proposal
+          q(i | S) = a_i(S) / A(S).
+    - For proposal="lookahead", the estimator uses the exact importance ratio
+          a_i(S) / q(i | S),
+      so it remains unbiased.
+    - Exact-tail and top-k Rao-Blackwellization also preserve unbiasedness.
 
-        A(S) = sum_i a_i(S),
-
-        q(i | S) = a_i(S) / A(S).
-
-    Important:
-    - This estimates the full-distribution low-confidence decoder.
-    - It assumes strict no-ties in confidence comparisons.
-    - If validate_no_ties=True, the function raises if it detects a positive
-      probability tie that would invalidate the strict no-ties estimator.
+    Practical defaults:
+    - exact_tail_steps=6 is usually a good first setting.
+    - proposal="lookahead" improves per-sample precision but costs extra model
+      calls.
+    - topk_exact_children=0 disables top-k branching. Try 1 or 2 with
+      rb_tail_depth=1 or 2 if you can afford more computation.
     """
 
     device = _model_device(model)
@@ -1737,7 +1757,6 @@ def _path_sampling_low_confidence_probability(
             "per step, so steps must equal suffix_len."
         )
 
-
     if temperature <= 0:
         raise ValueError(
             "Low-confidence full-distribution estimator requires temperature > 0."
@@ -1749,6 +1768,21 @@ def _path_sampling_low_confidence_probability(
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
 
+    if exact_tail_steps < 0 or exact_tail_steps > suffix_len:
+        raise ValueError("exact_tail_steps must satisfy 0 <= exact_tail_steps <= suffix_len.")
+
+    if proposal not in {"local", "lookahead"}:
+        raise ValueError('proposal must be either "local" or "lookahead".')
+
+    if lookahead_power < 0:
+        raise ValueError("lookahead_power must be nonnegative.")
+
+    if topk_exact_children < 0:
+        raise ValueError("topk_exact_children must be nonnegative.")
+
+    if rb_tail_depth < 0:
+        raise ValueError("rb_tail_depth must be nonnegative.")
+
     attn = _suffix_attention_mask(attention_mask, suffix_len, device)
 
     rng = torch.Generator(device="cpu")
@@ -1759,9 +1793,556 @@ def _path_sampling_low_confidence_probability(
     target_row = target_tokens[0]  # [suffix_len]
 
     eye = torch.eye(suffix_len, dtype=torch.bool, device=device)
+    full_revealed_bits = (1 << suffix_len) - 1
+
+    def _logsumexp_floats(values: List[float]) -> float:
+        values = [v for v in values if math.isfinite(v)]
+        if not values:
+            return float("-inf")
+        m = max(values)
+        return m + math.log(sum(math.exp(v - m) for v in values))
+
+    def _mask_bits_from_revealed_row(revealed_row: torch.Tensor) -> int:
+        idxs = torch.nonzero(
+            revealed_row.detach().cpu(),
+            as_tuple=False,
+        ).flatten().tolist()
+
+        bits = 0
+        for idx in idxs:
+            bits |= 1 << int(idx)
+        return bits
+
+    def _state_from_mask_bits(mask_bits: int):
+        revealed_vec = torch.tensor(
+            [(mask_bits >> i) & 1 for i in range(suffix_len)],
+            dtype=torch.bool,
+            device=device,
+        )
+
+        suffix_vec = torch.full(
+            (suffix_len,),
+            mask_id,
+            dtype=torch.long,
+            device=device,
+        )
+
+        if revealed_vec.any():
+            suffix_vec[revealed_vec] = target_row[revealed_vec]
+
+        return suffix_vec.unsqueeze(0), revealed_vec.unsqueeze(0)
+
+    def _batched_attention(bsz: int):
+        if attn is None:
+            return None
+        if attn.shape[0] == bsz:
+            return attn
+        return attn.expand(bsz, *attn.shape[1:])
+
+    def _compute_log_a_for_batch(
+        suffix: torch.Tensor,
+        revealed: torch.Tensor,
+        active_rows: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Returns log_a with shape [bsz, suffix_len].
+
+        log_a[:, i] =
+            log p_theta(z_i | x_S, i)
+            + sum_{j in M(S), j != i} log F_j(c_i^*(S))
+
+        Already revealed positions receive -inf.
+        """
+
+        bsz = suffix.shape[0]
+        masked = ~revealed
+
+        if active_rows is None:
+            active_rows = torch.ones(bsz, dtype=torch.bool, device=device)
+
+        x = torch.cat(
+            [
+                prompt_row.unsqueeze(0).expand(bsz, -1),
+                suffix,
+            ],
+            dim=1,
+        )
+
+        logits = model(x, attention_mask=_batched_attention(bsz)).logits
+        suffix_logits = logits[:, prompt_len:, :]  # [bsz, suffix_len, vocab]
+
+        scaled_logits = suffix_logits.to(torch.float64) / float(temperature)
+
+        # Log-domain distribution.
+        log_probs = torch.log_softmax(
+            scaled_logits,
+            dim=-1,
+        )  # [bsz, suffix_len, vocab]
+
+        target_ids = target_row.unsqueeze(0).expand(bsz, -1)
+
+        target_log_probs = torch.gather(
+            log_probs,
+            dim=-1,
+            index=target_ids.unsqueeze(-1),
+        ).squeeze(-1)  # [bsz, suffix_len]
+
+        sorted_log_probs, _ = torch.sort(log_probs, dim=-1)
+        log_cdf = torch.logcumsumexp(sorted_log_probs, dim=-1)
+
+        log_F = torch.empty(
+            (bsz, suffix_len, suffix_len),
+            dtype=torch.float64,
+            device=device,
+        )
+
+        tie_flags = None
+        if validate_no_ties:
+            tie_flags = torch.zeros(
+                (bsz, suffix_len, suffix_len),
+                dtype=torch.bool,
+                device=device,
+            )
+
+        for j in range(suffix_len):
+            sorted_j = sorted_log_probs[:, j, :].contiguous()
+            log_cdf_j = log_cdf[:, j, :]
+
+            # Strict CDF:
+            # F_j(c_i) = P_{V_j}[log p_j(V_j) < log c_i]
+            left_idx = torch.searchsorted(
+                sorted_j,
+                target_log_probs,
+                right=False,
+            )  # [bsz, suffix_len]
+
+            left_gather_idx = (left_idx - 1).clamp_min(0)
+
+            log_F_less = torch.gather(
+                log_cdf_j,
+                dim=-1,
+                index=left_gather_idx,
+            )
+
+            log_F_less = torch.where(
+                left_idx > 0,
+                log_F_less,
+                torch.full_like(log_F_less, float("-inf")),
+            )
+
+            log_F[:, j, :] = log_F_less
+
+            if validate_no_ties:
+                # A positive-probability tie exists when some token at j has
+                # exactly the same confidence as c_i^*, and c_i^* > 0.
+                right_idx = torch.searchsorted(
+                    sorted_j,
+                    target_log_probs,
+                    right=True,
+                )
+
+                positive_confidence = torch.isfinite(target_log_probs)
+                tie_flags[:, j, :] = (right_idx > left_idx) & positive_confidence
+
+        if validate_no_ties:
+            tie_competitor_mask = (
+                masked.unsqueeze(-1)      # j is masked
+                & masked.unsqueeze(1)     # i is masked
+                & (~eye.unsqueeze(0))     # j != i
+                & active_rows.view(bsz, 1, 1)
+            )
+
+            detected_tie = (tie_competitor_mask & tie_flags).any()
+
+            if bool(detected_tie.item()):
+                raise ValueError(
+                    "Detected a positive-probability confidence tie. "
+                    "The strict no-ties formula uses "
+                    "F_j(c) = P(confidence < c). To estimate the decoder under "
+                    "ties, implement the decoder's exact tie-breaking rule "
+                    "inside a_i(S)."
+                )
+
+        include_j = masked.unsqueeze(-1) & (~eye.unsqueeze(0))
+
+        log_product = torch.where(
+            include_j,
+            log_F,
+            torch.zeros_like(log_F),
+        ).sum(dim=1)  # [bsz, suffix_len]
+
+        log_a = target_log_probs + log_product
+
+        log_a = torch.where(
+            masked,
+            log_a,
+            torch.full_like(log_a, float("-inf")),
+        )
+
+        return log_a
+
+    exact_cache: Dict[int, float] = {}
+
+    def _exact_log_p_from_mask_bits(mask_bits: int) -> float:
+        """
+        Exact dynamic-programming computation of
+
+            p_z(S) = sum_i a_i(S) p_z(S union {i})
+
+        for a small number of remaining masked positions.
+        """
+
+        if mask_bits == full_revealed_bits:
+            return 0.0
+
+        cached = exact_cache.get(mask_bits)
+        if cached is not None:
+            return cached
+
+        suffix, revealed = _state_from_mask_bits(mask_bits)
+        log_a = _compute_log_a_for_batch(suffix, revealed)[0]
+
+        terms: List[float] = []
+
+        for i in range(suffix_len):
+            if (mask_bits >> i) & 1:
+                continue
+
+            lai = float(log_a[i].detach().cpu().item())
+            if not math.isfinite(lai):
+                continue
+
+            child_bits = mask_bits | (1 << i)
+            child_log_p = _exact_log_p_from_mask_bits(child_bits)
+
+            if math.isfinite(child_log_p):
+                terms.append(lai + child_log_p)
+
+        out = _logsumexp_floats(terms)
+        exact_cache[mask_bits] = out
+        return out
+
+    def _compute_log_h_lookahead_for_batch(
+        suffix: torch.Tensor,
+        revealed: torch.Tensor,
+        log_a: torch.Tensor,
+        active_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Approximate future-success score h_i(S).
+
+        If child state is inside the exact tail, use exact log p_z(S union {i}).
+        Otherwise use log A(S union {i}).
+        """
+
+        bsz = suffix.shape[0]
+        masked = ~revealed
+
+        log_h = torch.full_like(log_a, float("-inf"))
+
+        for i in range(suffix_len):
+            rows = active_rows & masked[:, i] & torch.isfinite(log_a[:, i])
+
+            if not bool(rows.any().item()):
+                continue
+
+            child_suffix = suffix[rows].clone()
+            child_revealed = revealed[rows].clone()
+
+            child_suffix[:, i] = target_row[i]
+            child_revealed[:, i] = True
+
+            child_remaining = int((~child_revealed[0]).sum().detach().cpu().item())
+
+            if child_remaining <= exact_tail_steps:
+                vals: List[float] = []
+
+                for r in range(child_revealed.shape[0]):
+                    child_bits = _mask_bits_from_revealed_row(child_revealed[r])
+                    vals.append(_exact_log_p_from_mask_bits(child_bits))
+
+                log_h[rows, i] = torch.tensor(
+                    vals,
+                    dtype=torch.float64,
+                    device=device,
+                )
+            else:
+                child_log_a = _compute_log_a_for_batch(child_suffix, child_revealed)
+                child_log_A = torch.logsumexp(child_log_a, dim=-1)
+                log_h[rows, i] = child_log_A
+
+        return log_h
+
+    def _make_log_proposal_for_batch(
+        suffix: torch.Tensor,
+        revealed: torch.Tensor,
+        log_a: torch.Tensor,
+        active_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Returns log q(i | S) with shape [bsz, suffix_len].
+
+        For proposal="local":
+            q(i | S) proportional to a_i(S).
+
+        For proposal="lookahead":
+            q(i | S) proportional to a_i(S) * h_i(S)^lookahead_power.
+        """
+
+        log_q = torch.full_like(log_a, float("-inf"))
+        log_A = torch.logsumexp(log_a, dim=-1)
+
+        live = active_rows & torch.isfinite(log_A)
+
+        if not bool(live.any().item()):
+            return log_q
+
+        if proposal == "local" or lookahead_power == 0:
+            log_q[live] = log_a[live] - log_A[live].unsqueeze(-1)
+            return log_q
+
+        log_h = _compute_log_h_lookahead_for_batch(
+            suffix=suffix,
+            revealed=revealed,
+            log_a=log_a,
+            active_rows=live,
+        )
+
+        log_unnorm = log_a + float(lookahead_power) * log_h
+        log_Z = torch.logsumexp(log_unnorm, dim=-1)
+
+        # If the heuristic kills all candidates on a row, fall back to local q.
+        fallback = live & (~torch.isfinite(log_Z))
+
+        if bool(fallback.any().item()):
+            log_unnorm[fallback] = log_a[fallback]
+            log_Z[fallback] = log_A[fallback]
+
+        live = live & torch.isfinite(log_Z)
+
+        if bool(live.any().item()):
+            log_q[live] = log_unnorm[live] - log_Z[live].unsqueeze(-1)
+
+        return log_q
+
+    def _compute_log_a_single(mask_bits: int) -> torch.Tensor:
+        suffix, revealed = _state_from_mask_bits(mask_bits)
+        return _compute_log_a_for_batch(suffix, revealed)[0]
+
+    def _single_log_proposal(
+        mask_bits: int,
+        log_a: torch.Tensor,
+        allowed_indices: Optional[List[int]] = None,
+    ) -> Dict[int, float]:
+        allowed_set = None
+        if allowed_indices is not None:
+            allowed_set = set(int(i) for i in allowed_indices)
+
+        valid: List[int] = []
+        for i in range(suffix_len):
+            if (mask_bits >> i) & 1:
+                continue
+            if allowed_set is not None and i not in allowed_set:
+                continue
+            lai = float(log_a[i].detach().cpu().item())
+            if math.isfinite(lai):
+                valid.append(i)
+
+        if not valid:
+            return {}
+
+        if proposal == "local" or lookahead_power == 0:
+            scores = {
+                i: float(log_a[i].detach().cpu().item())
+                for i in valid
+            }
+        else:
+            scores = {}
+
+            for i in valid:
+                child_bits = mask_bits | (1 << i)
+                child_remaining = suffix_len - child_bits.bit_count()
+
+                if child_remaining <= exact_tail_steps:
+                    log_h_i = _exact_log_p_from_mask_bits(child_bits)
+                else:
+                    child_log_a = _compute_log_a_single(child_bits)
+                    log_h_i = float(
+                        torch.logsumexp(child_log_a, dim=-1)
+                        .detach()
+                        .cpu()
+                        .item()
+                    )
+
+                lai = float(log_a[i].detach().cpu().item())
+
+                if math.isfinite(log_h_i):
+                    scores[i] = lai + float(lookahead_power) * log_h_i
+                else:
+                    scores[i] = float("-inf")
+
+            if not any(math.isfinite(v) for v in scores.values()):
+                scores = {
+                    i: float(log_a[i].detach().cpu().item())
+                    for i in valid
+                }
+
+        log_Z = _logsumexp_floats(list(scores.values()))
+
+        if not math.isfinite(log_Z):
+            return {}
+
+        return {
+            i: scores[i] - log_Z
+            for i in valid
+            if math.isfinite(scores[i])
+        }
+
+    def _sample_from_log_q(log_q_dict: Dict[int, float]) -> int:
+        if not log_q_dict:
+            raise RuntimeError("Cannot sample from an empty proposal.")
+
+        indices = list(log_q_dict.keys())
+        logps = torch.tensor(
+            [log_q_dict[i] for i in indices],
+            dtype=torch.float64,
+            device="cpu",
+        )
+
+        probs = torch.exp(logps)
+        probs = probs / probs.sum().clamp_min(torch.finfo(probs.dtype).tiny)
+
+        chosen_pos = torch.multinomial(
+            probs,
+            num_samples=1,
+            replacement=True,
+            generator=rng,
+        ).item()
+
+        return int(indices[chosen_pos])
+
+    def _single_sample_log_estimate_from_mask_bits(mask_bits: int) -> float:
+        """
+        Single unbiased continuation estimate from a state S.
+        Used inside optional top-k Rao-Blackwellization.
+        """
+
+        log_w = 0.0
+        current_bits = mask_bits
+
+        while current_bits != full_revealed_bits:
+            remaining = suffix_len - current_bits.bit_count()
+
+            if remaining <= exact_tail_steps:
+                tail = _exact_log_p_from_mask_bits(current_bits)
+                return log_w + tail
+
+            log_a = _compute_log_a_single(current_bits)
+            log_q_dict = _single_log_proposal(current_bits, log_a)
+
+            if not log_q_dict:
+                return float("-inf")
+
+            j = _sample_from_log_q(log_q_dict)
+
+            lai = float(log_a[j].detach().cpu().item())
+            lqj = log_q_dict[j]
+
+            if not math.isfinite(lai) or not math.isfinite(lqj):
+                return float("-inf")
+
+            log_w += lai - lqj
+            current_bits |= 1 << j
+
+        return log_w
+
+    def _rb_log_estimate_from_mask_bits(mask_bits: int, depth: int) -> float:
+        """
+        Optional top-k Rao-Blackwellized continuation estimator.
+
+        At each state:
+        - exactly branch over topk_exact_children high-a_i children;
+        - sample one child from the complement using the chosen proposal;
+        - recurse for at most `depth` top-k levels;
+        - fall back to single-sample continuation afterward.
+
+        This remains unbiased but can become expensive if depth and top-k are large.
+        """
+
+        if mask_bits == full_revealed_bits:
+            return 0.0
+
+        remaining = suffix_len - mask_bits.bit_count()
+
+        if remaining <= exact_tail_steps:
+            return _exact_log_p_from_mask_bits(mask_bits)
+
+        if depth <= 0 or topk_exact_children <= 0:
+            return _single_sample_log_estimate_from_mask_bits(mask_bits)
+
+        log_a = _compute_log_a_single(mask_bits)
+
+        valid: List[int] = []
+        for i in range(suffix_len):
+            if (mask_bits >> i) & 1:
+                continue
+            lai = float(log_a[i].detach().cpu().item())
+            if math.isfinite(lai):
+                valid.append(i)
+
+        if not valid:
+            return float("-inf")
+
+        valid_sorted = sorted(
+            valid,
+            key=lambda i: float(log_a[i].detach().cpu().item()),
+            reverse=True,
+        )
+
+        k = min(topk_exact_children, len(valid_sorted))
+        top_indices = valid_sorted[:k]
+        rest_indices = valid_sorted[k:]
+
+        terms: List[float] = []
+
+        for i in top_indices:
+            lai = float(log_a[i].detach().cpu().item())
+            child_bits = mask_bits | (1 << i)
+            child_est = _rb_log_estimate_from_mask_bits(child_bits, depth - 1)
+
+            if math.isfinite(lai) and math.isfinite(child_est):
+                terms.append(lai + child_est)
+
+        if rest_indices:
+            rest_log_q = _single_log_proposal(
+                mask_bits=mask_bits,
+                log_a=log_a,
+                allowed_indices=rest_indices,
+            )
+
+            if rest_log_q:
+                j = _sample_from_log_q(rest_log_q)
+
+                lai = float(log_a[j].detach().cpu().item())
+                lqj = rest_log_q[j]
+
+                child_bits = mask_bits | (1 << j)
+                child_est = _rb_log_estimate_from_mask_bits(child_bits, depth - 1)
+
+                if (
+                    math.isfinite(lai)
+                    and math.isfinite(lqj)
+                    and math.isfinite(child_est)
+                ):
+                    terms.append(lai - lqj + child_est)
+
+        return _logsumexp_floats(terms)
 
     sample_log_probabilities: List[float] = []
     sample_probabilities: List[float] = []
+
+    rb_extra_depth = rb_tail_depth if topk_exact_children > 0 else 0
+    stop_threshold = exact_tail_steps + rb_extra_depth
 
     for batch_start in range(0, num_samples, batch_size):
         bsz = min(batch_size, num_samples - batch_start)
@@ -1782,205 +2363,79 @@ def _path_sampling_low_confidence_probability(
         log_weight = torch.zeros(bsz, dtype=torch.float64, device=device)
         alive = torch.ones(bsz, dtype=torch.bool, device=device)
 
-        for _ in range(suffix_len):
-            masked = ~revealed  # [bsz, suffix_len]
+        for step_idx in range(suffix_len):
+            remaining_count = suffix_len - step_idx
 
-            x = torch.cat(
-                [
-                    prompt_row.unsqueeze(0).expand(bsz, -1),
-                    suffix,
-                ],
-                dim=1,
-            )
-
-            batched_attn = None
-            if attn is not None:
-                if attn.shape[0] == bsz:
-                    batched_attn = attn
-                else:
-                    batched_attn = attn.expand(bsz, *attn.shape[1:])
-
-            logits = model(x, attention_mask=batched_attn).logits
-            suffix_logits = logits[:, prompt_len:, :]  # [bsz, suffix_len, vocab]
-
-            # Correctness-critical: compute the full temperature-adjusted
-            # distribution in float64. Float32 can silently turn small nonzero
-            # probabilities into zeros, biasing the estimator downward.
-            scaled_logits = suffix_logits.to(torch.float64) / float(temperature)
-            probs = torch.softmax(scaled_logits, dim=-1)  # [bsz, suffix_len, vocab]
-
-            target_ids = target_row.unsqueeze(0).expand(bsz, -1)
-
-            target_probs = torch.gather(
-                probs,
-                dim=-1,
-                index=target_ids.unsqueeze(-1),
-            ).squeeze(-1)  # [bsz, suffix_len], float64
-
-            # Sort each full distribution once.
-            sorted_probs, _ = torch.sort(probs, dim=-1)  # float64
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            cumulative_probs = cumulative_probs.clamp(max=1.0)
-
-            # F[:, j, i] = F_j(c_i) = P(confidence at j < c_i)
-            F = torch.empty(
-                (bsz, suffix_len, suffix_len),
-                dtype=torch.float64,
-                device=device,
-            )
-
-            tie_mass = None
-            if validate_no_ties:
-                # tie_mass[:, j, i] =
-                # P(confidence at j == c_i)
-                tie_mass = torch.empty_like(F)
-
-            for j in range(suffix_len):
-                sorted_j = sorted_probs[:, j, :].contiguous()
-                cdf_j = cumulative_probs[:, j, :]
-
-                # Strict CDF: P(p_j(V_j) < c_i)
-                left_idx = torch.searchsorted(
-                    sorted_j,
-                    target_probs,
-                    right=False,
-                )  # [bsz, suffix_len]
-
-                left_gather_idx = (left_idx - 1).clamp_min(0)
-
-                F_less = torch.gather(
-                    cdf_j,
-                    dim=-1,
-                    index=left_gather_idx,
+            # Exact / Rao-Blackwellized tail.
+            if stop_threshold > 0 and remaining_count <= stop_threshold:
+                tail_logs = torch.full(
+                    (bsz,),
+                    float("-inf"),
+                    dtype=torch.float64,
+                    device=device,
                 )
 
-                F_less = torch.where(
-                    left_idx > 0,
-                    F_less,
-                    torch.zeros_like(F_less),
+                depth_here = min(
+                    rb_extra_depth,
+                    max(remaining_count - exact_tail_steps, 0),
                 )
 
-                F[:, j, :] = F_less
+                for b in range(bsz):
+                    if not bool(alive[b].item()):
+                        continue
 
-                if validate_no_ties:
-                    # Weak CDF: P(p_j(V_j) <= c_i)
-                    right_idx = torch.searchsorted(
-                        sorted_j,
-                        target_probs,
-                        right=True,
-                    )
+                    bits = _mask_bits_from_revealed_row(revealed[b])
 
-                    right_gather_idx = (right_idx - 1).clamp_min(0)
+                    if depth_here > 0 and topk_exact_children > 0:
+                        val = _rb_log_estimate_from_mask_bits(bits, depth_here)
+                    else:
+                        val = _exact_log_p_from_mask_bits(bits)
 
-                    F_leq = torch.gather(
-                        cdf_j,
-                        dim=-1,
-                        index=right_gather_idx,
-                    )
+                    tail_logs[b] = val
 
-                    F_leq = torch.where(
-                        right_idx > 0,
-                        F_leq,
-                        torch.zeros_like(F_leq),
-                    )
-
-                    tie_mass[:, j, :] = (F_leq - F_less).clamp_min(0.0)
-
-            if validate_no_ties:
-                # Check for positive-probability confidence ties between
-                # candidate i and any competing masked position j != i.
-                #
-                # F has axes [batch, j, i].
-                tie_competitor_mask = (
-                    masked.unsqueeze(-1)  # j is masked
-                    & masked.unsqueeze(1)  # i is masked
-                    & (~eye.unsqueeze(0))  # j != i
-                    & alive.view(bsz, 1, 1)
+                log_weight = torch.where(
+                    alive,
+                    log_weight + tail_logs,
+                    log_weight,
                 )
 
-                detected_tie = (
-                    tie_competitor_mask
-                    & (tie_mass > 0)
-                ).any()
+                alive = alive & torch.isfinite(tail_logs)
+                break
 
-                if bool(detected_tie.item()):
-                    raise ValueError(
-                        "Detected a positive-probability confidence tie. "
-                        "The current estimator uses the strict no-ties formula "
-                        "F_j(c) = P(confidence < c). To estimate the actual "
-                        "decoder under ties, implement the decoder's exact "
-                        "tie-breaking rule inside a_i(S)."
-                    )
+            masked = ~revealed
 
-            # log a_i(S)
-            #
-            # a_i(S) =
-            #   p_target_i * prod_{j in M(S), j != i} F_j(c_i)
-            log_F = torch.where(
-                F > 0,
-                torch.log(F),
-                torch.full_like(F, float("-inf")),
+            log_a = _compute_log_a_for_batch(
+                suffix=suffix,
+                revealed=revealed,
+                active_rows=alive,
             )
 
-            include_j = masked.unsqueeze(-1) & (~eye.unsqueeze(0))
-            # include_j shape: [bsz, j, i]
+            log_A = torch.logsumexp(log_a, dim=-1)
+            can_continue = alive & torch.isfinite(log_A)
 
-            log_product = torch.where(
-                include_j,
-                log_F,
-                torch.zeros_like(log_F),
-            ).sum(dim=1)  # [bsz, suffix_len]
-
-            log_target_probs = torch.where(
-                target_probs > 0,
-                torch.log(target_probs),
-                torch.full_like(target_probs, float("-inf")),
+            log_q = _make_log_proposal_for_batch(
+                suffix=suffix,
+                revealed=revealed,
+                log_a=log_a,
+                active_rows=can_continue,
             )
 
-            log_a = log_target_probs + log_product
-
-            # Only currently masked indices are valid candidates i.
-            log_a = torch.where(
-                masked,
-                log_a,
-                torch.full_like(log_a, float("-inf")),
-            )
-
-            # A(S) = sum_i a_i(S), computed in log-space.
-            log_A = torch.logsumexp(log_a, dim=-1)  # [bsz]
-
-            still_alive = alive & torch.isfinite(log_A)
-
-            log_weight = torch.where(
-                still_alive,
-                log_weight + log_A,
-                log_weight,
-            )
-
-            alive = still_alive
-
-            # Sample next index from q(i | S) = a_i(S) / A(S).
             q = torch.zeros_like(log_a, dtype=torch.float64)
 
-            if alive.any():
-                q_alive = torch.exp(log_a[alive] - log_A[alive].unsqueeze(-1))
-                q[alive] = q_alive
+            if bool(can_continue.any().item()):
+                q[can_continue] = torch.exp(log_q[can_continue])
 
-            # Dead rows contribute probability zero. We still sample a dummy
-            # remaining masked position so tensor shapes remain valid.
-            dead = ~alive
-            if dead.any():
+            dead = ~can_continue
+            if bool(dead.any().item()):
                 dummy_probs = masked[dead].to(torch.float64)
-                dummy_probs = dummy_probs / dummy_probs.sum(dim=-1, keepdim=True)
+                dummy_probs = dummy_probs / dummy_probs.sum(
+                    dim=-1,
+                    keepdim=True,
+                ).clamp_min(torch.finfo(torch.float64).tiny)
                 q[dead] = dummy_probs
 
-            q = torch.where(
-                masked,
-                q,
-                torch.zeros_like(q),
-            )
+            q = torch.where(masked, q, torch.zeros_like(q))
 
-            # Defensive renormalization against tiny numerical drift.
             q_sum = q.sum(dim=-1, keepdim=True)
             q = q / q_sum.clamp_min(torch.finfo(q.dtype).tiny)
 
@@ -1992,6 +2447,28 @@ def _path_sampling_low_confidence_probability(
             ).squeeze(-1)
 
             next_indices = next_indices_cpu.to(device)
+
+            chosen_log_a = torch.gather(
+                log_a,
+                dim=1,
+                index=next_indices.unsqueeze(-1),
+            ).squeeze(-1)
+
+            chosen_log_q = torch.gather(
+                log_q,
+                dim=1,
+                index=next_indices.unsqueeze(-1),
+            ).squeeze(-1)
+
+            increment = chosen_log_a - chosen_log_q
+
+            log_weight = torch.where(
+                can_continue,
+                log_weight + increment,
+                log_weight,
+            )
+
+            alive = can_continue
 
             next_target_ids = torch.gather(
                 target_row.unsqueeze(0).expand(bsz, -1),
@@ -2021,7 +2498,6 @@ def _path_sampling_low_confidence_probability(
             batch_log_probs.detach().cpu().tolist()
         )
 
-        # These may underflow to 0. The log values above are the reliable ones.
         batch_probabilities = torch.where(
             torch.isfinite(batch_log_probs),
             torch.exp(batch_log_probs),
@@ -2047,8 +2523,6 @@ def _path_sampling_low_confidence_probability(
             for lp in finite_logs
         )
 
-        # Important: divide by all samples, not only finite samples.
-        # Non-finite samples contribute zero probability.
         log_average_probability = (
             max_log
             + math.log(scaled_sum)
@@ -2070,6 +2544,12 @@ def _path_sampling_low_confidence_probability(
         "decoding_scheme": "full",
         "temperature": temperature,
         "validated_no_ties": validate_no_ties,
+        "proposal": proposal,
+        "lookahead_power": lookahead_power,
+        "exact_tail_steps": exact_tail_steps,
+        "topk_exact_children": topk_exact_children,
+        "rb_tail_depth": rb_tail_depth,
+        "exact_tail_cache_size": len(exact_cache),
     }
 
 
