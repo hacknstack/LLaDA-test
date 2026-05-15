@@ -1697,27 +1697,19 @@ def _path_sampling_low_confidence_probability(
     return_samples: bool = True,
 ) -> Dict[str, object]:
     """
-    Depth-1 stratified / enumerated version of the unbiased path-sampling
-    estimator for the full-distribution low-confidence remasking decoder.
+    Faster unbiased path-sampling estimator for the full-distribution
+    low-confidence remasking decoder.
 
-    It uses the exact decomposition
+    Main speedups versus the original:
+    - only sorts currently masked suffix positions;
+    - vectorizes the F_j(c_i) searchsorted computation over j and i;
+    - uses fp32 for full-vocab log_softmax/sort/CDF tensors;
+    - keeps only log_weight in fp64;
+    - samples on device when possible;
+    - optionally avoids storing all per-sample probabilities.
 
-        p_z = sum_i a_i(empty) p_z({i}),
-
-    where the first revealed suffix index i is enumerated exactly, and each
-    continuation p_z({i}) is estimated by the same successful-path proposal.
-
-    The argument `num_samples` is interpreted as the total number of continuation
-    samples split deterministically across the finite first-step branches.
-
-    Requires:
-
-        num_samples >= number of first-step branches with finite a_i(empty)
-
-    for unbiased deterministic depth-1 enumeration.
-
-    Assumes `_model_device` and `_suffix_attention_mask` are available, as in
-    your original implementation.
+    Assumes the helper functions `_model_device` and `_suffix_attention_mask`
+    are available, as in your original implementation.
     """
 
     device = _model_device(model)
@@ -1758,6 +1750,7 @@ def _path_sampling_low_confidence_probability(
 
     attn = _suffix_attention_mask(attention_mask, suffix_len, device)
 
+    # Prefer on-device sampling. Fall back to CPU for less common devices.
     if device.type in {"cuda", "cpu"}:
         rng_device = device
         sample_on_device = True
@@ -1775,9 +1768,13 @@ def _path_sampling_low_confidence_probability(
     sample_log_probabilities: List[float] = []
     sample_probabilities: List[float] = []
 
-    branch_log_contributions: List[float] = []
-    branch_indices: List[int] = []
-    branch_num_samples: List[int] = []
+    running_log_sum = torch.tensor(
+        float("-inf"),
+        dtype=torch.float64,
+        device=device,
+    )
+
+    num_accumulated = 0
 
     def compute_log_a_for_batch(
         suffix: torch.Tensor,
@@ -1786,7 +1783,7 @@ def _path_sampling_low_confidence_probability(
         num_masked: int,
     ) -> torch.Tensor:
         """
-        Computes log a_i(S) for every row and suffix index.
+        Computes log a_i(S) for every row and every suffix index i.
 
         Returns:
             log_a_full: [bsz, suffix_len]
@@ -1815,11 +1812,13 @@ def _path_sampling_low_confidence_probability(
         suffix_logits = logits[:, prompt_len:, :]
         vocab_size = suffix_logits.shape[-1]
 
+        # Every row has exactly num_masked masked positions, since all rows
+        # reveal exactly one index per estimator step.
         active_idx = masked.nonzero(as_tuple=False)[:, 1].view(
             bsz,
             num_masked,
         )
-        # [bsz, m]
+        # active_idx: [bsz, m]
 
         active_logits = torch.gather(
             suffix_logits,
@@ -1831,6 +1830,8 @@ def _path_sampling_low_confidence_probability(
         active_target_ids = target_row[active_idx]
         # [bsz, m]
 
+        # Full-vocab tensors are the expensive part. fp32 is much faster and
+        # normally sufficient here. Keep only final weights in fp64.
         scaled_logits = active_logits.float() / float(temperature)
 
         log_probs = torch.log_softmax(
@@ -1858,7 +1859,8 @@ def _path_sampling_low_confidence_probability(
         ).clamp_max_(0.0)
         # [bsz, m, vocab]
 
-        # thresholds[b, j, i] = log c_i, evaluated against position j.
+        # thresholds[b, j, i] = log c_i,
+        # evaluated against position j's sorted distribution.
         thresholds = target_log_probs.unsqueeze(1).expand(
             -1,
             num_masked,
@@ -1866,6 +1868,8 @@ def _path_sampling_low_confidence_probability(
         ).contiguous()
         # [bsz, m, m]
 
+        # Strict CDF:
+        # F_j(c_i) = P[log p_j(V_j) < log c_i].
         left_idx = torch.searchsorted(
             sorted_log_probs,
             thresholds,
@@ -1917,7 +1921,7 @@ def _path_sampling_low_confidence_probability(
                     "tie-breaking rule inside a_i(S)."
                 )
 
-        # Exclude j = i from prod_{j != i} F_j(c_i).
+        # Exclude the j = i term from prod_{j != i} F_j(c_i).
         log_F = log_F.masked_fill(eye_m, 0.0)
 
         log_product = log_F.sum(dim=1)
@@ -1947,63 +1951,121 @@ def _path_sampling_low_confidence_probability(
 
         return log_a_full
 
-    def estimate_continuation_from_first_index(
-        first_index: int,
-        k_samples: int,
-    ) -> torch.Tensor:
-        """
-        Estimates p_z({first_index}) by averaging k_samples continuation paths.
+    for batch_start in range(0, num_samples, batch_size):
+        bsz = min(batch_size, num_samples - batch_start)
 
-        Returns:
-            log_mean_continuation: scalar fp64 tensor.
-        """
+        suffix = torch.full(
+            (bsz, suffix_len),
+            mask_id,
+            dtype=torch.long,
+            device=device,
+        )
 
-        branch_running_log_sum = torch.tensor(
-            float("-inf"),
+        revealed = torch.zeros(
+            (bsz, suffix_len),
+            dtype=torch.bool,
+            device=device,
+        )
+
+        log_weight = torch.zeros(
+            bsz,
             dtype=torch.float64,
             device=device,
         )
 
-        samples_done = 0
+        alive = torch.ones(
+            bsz,
+            dtype=torch.bool,
+            device=device,
+        )
 
-        for batch_start in range(0, k_samples, batch_size):
-            bsz = min(batch_size, k_samples - batch_start)
+        for step in range(suffix_len):
+            masked = ~revealed
+            num_masked = suffix_len - step
 
-            suffix = torch.full(
-                (bsz, suffix_len),
-                mask_id,
-                dtype=torch.long,
-                device=device,
+            log_a = compute_log_a_for_batch(
+                suffix=suffix,
+                revealed=revealed,
+                alive=alive,
+                num_masked=num_masked,
+            )
+            # log_a is fp32.
+
+            log_A = torch.logsumexp(
+                log_a,
+                dim=-1,
+            ).to(torch.float64)
+            # [bsz]
+
+            still_alive = alive & torch.isfinite(log_A)
+
+            log_weight = torch.where(
+                still_alive,
+                log_weight + log_A,
+                log_weight,
             )
 
-            revealed = torch.zeros(
-                (bsz, suffix_len),
-                dtype=torch.bool,
-                device=device,
+            alive = still_alive
+
+            q = torch.zeros_like(log_a)
+
+            if alive.any():
+                q[alive] = torch.softmax(
+                    log_a[alive],
+                    dim=-1,
+                )
+
+            dead = ~alive
+            if dead.any():
+                dummy_probs = masked[dead].float()
+                dummy_probs = dummy_probs / dummy_probs.sum(
+                    dim=-1,
+                    keepdim=True,
+                )
+                q[dead] = dummy_probs
+
+            q = torch.where(
+                masked,
+                q,
+                torch.zeros_like(q),
             )
 
-            first_idx_tensor = torch.full(
-                (bsz, 1),
-                first_index,
-                dtype=torch.long,
-                device=device,
+            q_sum = q.sum(dim=-1, keepdim=True)
+
+            q = q / q_sum.clamp_min(
+                torch.finfo(q.dtype).tiny,
             )
 
-            first_target_ids = torch.gather(
+            if sample_on_device:
+                next_indices = torch.multinomial(
+                    q.float(),
+                    num_samples=1,
+                    replacement=True,
+                    generator=rng,
+                ).squeeze(-1)
+            else:
+                next_indices = torch.multinomial(
+                    q.detach().cpu().float(),
+                    num_samples=1,
+                    replacement=True,
+                    generator=rng,
+                ).squeeze(-1).to(device)
+
+            next_target_ids = torch.gather(
                 target_row.unsqueeze(0).expand(bsz, -1),
                 dim=1,
-                index=first_idx_tensor,
+                index=next_indices.unsqueeze(-1),
             )
 
             suffix.scatter_(
                 dim=1,
-                index=first_idx_tensor,
-                src=first_target_ids,
+                index=next_indices.unsqueeze(-1),
+                src=next_target_ids,
             )
 
             revealed.scatter_(
                 dim=1,
-                index=first_idx_tensor,
+                index=next_indices.unsqueeze(-1),
                 src=torch.ones(
                     (bsz, 1),
                     dtype=torch.bool,
@@ -2011,243 +2073,37 @@ def _path_sampling_low_confidence_probability(
                 ),
             )
 
-            log_weight = torch.zeros(
-                bsz,
-                dtype=torch.float64,
-                device=device,
-            )
-
-            alive = torch.ones(
-                bsz,
-                dtype=torch.bool,
-                device=device,
-            )
-
-            # We already enumerated and applied the first reveal.
-            for step in range(1, suffix_len):
-                masked = ~revealed
-                num_masked = suffix_len - step
-
-                log_a = compute_log_a_for_batch(
-                    suffix=suffix,
-                    revealed=revealed,
-                    alive=alive,
-                    num_masked=num_masked,
-                )
-
-                log_A = torch.logsumexp(
-                    log_a,
-                    dim=-1,
-                ).to(torch.float64)
-
-                still_alive = alive & torch.isfinite(log_A)
-
-                log_weight = torch.where(
-                    still_alive,
-                    log_weight + log_A,
-                    log_weight,
-                )
-
-                alive = still_alive
-
-                q = torch.zeros_like(log_a)
-
-                if alive.any():
-                    q[alive] = torch.softmax(
-                        log_a[alive],
-                        dim=-1,
-                    )
-
-                dead = ~alive
-                if dead.any():
-                    dummy_probs = masked[dead].float()
-                    dummy_probs = dummy_probs / dummy_probs.sum(
-                        dim=-1,
-                        keepdim=True,
-                    )
-                    q[dead] = dummy_probs
-
-                q = torch.where(
-                    masked,
-                    q,
-                    torch.zeros_like(q),
-                )
-
-                q_sum = q.sum(dim=-1, keepdim=True)
-
-                q = q / q_sum.clamp_min(
-                    torch.finfo(q.dtype).tiny,
-                )
-
-                if sample_on_device:
-                    next_indices = torch.multinomial(
-                        q.float(),
-                        num_samples=1,
-                        replacement=True,
-                        generator=rng,
-                    ).squeeze(-1)
-                else:
-                    next_indices = torch.multinomial(
-                        q.detach().cpu().float(),
-                        num_samples=1,
-                        replacement=True,
-                        generator=rng,
-                    ).squeeze(-1).to(device)
-
-                next_target_ids = torch.gather(
-                    target_row.unsqueeze(0).expand(bsz, -1),
-                    dim=1,
-                    index=next_indices.unsqueeze(-1),
-                )
-
-                suffix.scatter_(
-                    dim=1,
-                    index=next_indices.unsqueeze(-1),
-                    src=next_target_ids,
-                )
-
-                revealed.scatter_(
-                    dim=1,
-                    index=next_indices.unsqueeze(-1),
-                    src=torch.ones(
-                        (bsz, 1),
-                        dtype=torch.bool,
-                        device=device,
-                    ),
-                )
-
-            batch_log_continuations = torch.where(
-                alive,
-                log_weight,
-                torch.full_like(log_weight, float("-inf")),
-            )
-
-            branch_running_log_sum = torch.logaddexp(
-                branch_running_log_sum,
-                torch.logsumexp(batch_log_continuations, dim=0),
-            )
-
-            samples_done += bsz
-
-            if return_samples:
-                # These are continuation samples only. They are converted into
-                # stratified full-estimator sample contributions outside this
-                # helper, because they need the first-step a_i and branch K_i.
-                pass
-
-        return branch_running_log_sum - math.log(samples_done)
-
-    # ---------------------------------------------------------------------
-    # Step 1: compute exact first-step log a_i(empty).
-    # ---------------------------------------------------------------------
-
-    initial_suffix = torch.full(
-        (1, suffix_len),
-        mask_id,
-        dtype=torch.long,
-        device=device,
-    )
-
-    initial_revealed = torch.zeros(
-        (1, suffix_len),
-        dtype=torch.bool,
-        device=device,
-    )
-
-    initial_alive = torch.ones(
-        1,
-        dtype=torch.bool,
-        device=device,
-    )
-
-    log_a0 = compute_log_a_for_batch(
-        suffix=initial_suffix,
-        revealed=initial_revealed,
-        alive=initial_alive,
-        num_masked=suffix_len,
-    )[0].to(torch.float64)
-    # [suffix_len]
-
-    finite_first = torch.isfinite(log_a0)
-    active_first_indices = torch.nonzero(
-        finite_first,
-        as_tuple=False,
-    ).squeeze(-1)
-
-    num_branches = int(active_first_indices.numel())
-
-    if num_branches == 0:
-        result = {
-            "probability": 0.0,
-            "log_probability": float("-inf"),
-            "sample_probabilities": [] if return_samples else None,
-            "sample_log_probabilities": [] if return_samples else None,
-            "num_samples": num_samples,
-            "num_first_step_branches": 0,
-            "branch_indices": [],
-            "branch_num_samples": [],
-            "branch_log_contributions": [],
-            "estimation_method": "path_sampling_low_confidence_depth1",
-            "decoding_scheme": "full",
-            "temperature": temperature,
-            "validated_no_ties": validate_no_ties,
-        }
-        return result
-
-    if num_samples < num_branches:
-        raise ValueError(
-            "Depth-1 enumeration needs at least one continuation sample per "
-            f"finite first-step branch. Got num_samples={num_samples}, but "
-            f"there are {num_branches} finite branches."
+        batch_log_probs = torch.where(
+            alive,
+            log_weight,
+            torch.full_like(log_weight, float("-inf")),
         )
 
-    # Deterministic sample allocation across branches.
-    base = num_samples // num_branches
-    remainder = num_samples % num_branches
-
-    k_per_branch = torch.full(
-        (num_branches,),
-        base,
-        dtype=torch.long,
-        device=device,
-    )
-
-    if remainder > 0:
-        k_per_branch[:remainder] += 1
-
-    # ---------------------------------------------------------------------
-    # Step 2: estimate every continuation and sum:
-    #
-    #   p_z = sum_i a_i(empty) p_z({i}).
-    # ---------------------------------------------------------------------
-
-    total_log_sum = torch.tensor(
-        float("-inf"),
-        dtype=torch.float64,
-        device=device,
-    )
-
-    for branch_pos in range(num_branches):
-        first_index = int(active_first_indices[branch_pos].item())
-        k_i = int(k_per_branch[branch_pos].item())
-
-        log_cont_i = estimate_continuation_from_first_index(
-            first_index=first_index,
-            k_samples=k_i,
+        running_log_sum = torch.logaddexp(
+            running_log_sum,
+            torch.logsumexp(batch_log_probs, dim=0),
         )
 
-        log_contribution_i = log_a0[first_index] + log_cont_i
+        num_accumulated += bsz
 
-        total_log_sum = torch.logaddexp(
-            total_log_sum,
-            log_contribution_i,
-        )
+        if return_samples:
+            sample_log_probabilities.extend(
+                batch_log_probs.detach().cpu().tolist()
+            )
 
-        branch_indices.append(first_index)
-        branch_num_samples.append(k_i)
-        branch_log_contributions.append(float(log_contribution_i.item()))
+            batch_probabilities = torch.where(
+                torch.isfinite(batch_log_probs),
+                torch.exp(batch_log_probs),
+                torch.zeros_like(batch_log_probs),
+            )
 
-    log_average_probability = float(total_log_sum.item())
+            sample_probabilities.extend(
+                batch_probabilities.detach().cpu().tolist()
+            )
+
+    log_average_probability = (
+        running_log_sum - math.log(num_accumulated)
+    ).item()
 
     if math.isfinite(log_average_probability):
         try:
@@ -2261,23 +2117,15 @@ def _path_sampling_low_confidence_probability(
         "probability": average_probability,
         "log_probability": log_average_probability,
         "num_samples": num_samples,
-        "num_first_step_branches": num_branches,
-        "branch_indices": branch_indices,
-        "branch_num_samples": branch_num_samples,
-        "branch_log_contributions": branch_log_contributions,
-        "estimation_method": "path_sampling_low_confidence_depth1",
+        "estimation_method": "path_sampling_low_confidence_fast",
         "decoding_scheme": "full",
         "temperature": temperature,
         "validated_no_ties": validate_no_ties,
     }
 
     if return_samples:
-        # This depth-1 estimator is stratified, not a plain IID path average.
-        # Returning naive per-path probabilities would be misleading unless we
-        # store scaled stratified contributions. For now, expose branch-level
-        # contributions instead.
-        result["sample_probabilities"] = None
-        result["sample_log_probabilities"] = None
+        result["sample_probabilities"] = sample_probabilities
+        result["sample_log_probabilities"] = sample_log_probabilities
     else:
         result["sample_probabilities"] = None
         result["sample_log_probabilities"] = None
