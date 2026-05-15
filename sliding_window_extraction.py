@@ -223,6 +223,8 @@ def main() -> None:
             raise ValueError("--decoding-scheme must be one of {'full', 'top_k'} when --mode path_sampling with --remasking low-confidence.")
         if not math.isclose(args.temperature, 1.0, rel_tol=0.0, abs_tol=1e-9):
             raise ValueError("--temperature must be exactly 1 when --mode path_sampling with --model-family llada and --remasking low-confidence.")
+        if args.masked_indexes is not None and decoding_scheme.lower() != 'full':
+            raise ValueError("--decoding-scheme must be 'full' when --masked_indexes is used with --mode path_sampling and --remasking low-confidence.")
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
