@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.colors as pc
@@ -501,14 +502,72 @@ with st.sidebar:
                 st.session_state.graph_settings.pop(key, None)
             st.session_state.selected_run_keys = []
 
+    if "plot_mode" not in st.session_state:
+        st.session_state.plot_mode = "line"
+    if "scatter_axis_choice" not in st.session_state:
+        st.session_state.scatter_axis_choice = 0
+
+    selected_graphs = [
+        get_run_by_key(runs, key)
+        for key in st.session_state.selected_run_keys
+    ]
+    selected_graphs = [
+        r
+        for r in selected_graphs
+        if r is not None and r.document == document
+    ]
+    visible_selected_graphs = [
+        r
+        for r in selected_graphs
+        if get_graph_settings(run_lookup_key(r)).get("visible", True)
+    ]
+
     st.divider()
     st.header("Graph options")
 
     y_scale = st.radio("Y axis", ["linear", "log"], horizontal=True)
-    x_axis = st.radio("X axis", ["window_index", "char_start"], horizontal=True)
+    x_scale = st.radio("X axis scale", ["linear", "log"], horizontal=True)
+
+    scatter_disabled = len(visible_selected_graphs) != 2
+    plot_mode = st.radio(
+        "Plot mode",
+        ["line", "scatter"],
+        index=1 if st.session_state.plot_mode == "scatter" else 0,
+        horizontal=True,
+        disabled=scatter_disabled,
+    )
+    if plot_mode == "scatter" and scatter_disabled:
+        plot_mode = "line"
+    st.session_state.plot_mode = plot_mode
+
+    x_axis = "window_index"
+    if plot_mode != "scatter":
+        x_axis = st.radio("X axis", ["window_index", "char_start"], horizontal=True)
+    else:
+        st.info("Scatter mode displays p_z values from two visible graphs against each other.")
 
     show_markers = st.checkbox("Show markers", value=False)
-    show_threshold = st.checkbox("Show extraction threshold 0.001", value=True)
+    label = (
+        "Show y=x reference line"
+        if plot_mode == "scatter"
+        else "Show extraction threshold 0.001"
+    )
+    show_reference_line = st.checkbox(
+        label,
+        value=True,
+    )
+
+    if plot_mode == "scatter" and len(visible_selected_graphs) == 2:
+        scatter_axis_labels = [
+            f"{visible_selected_graphs[0].display_label} → x, {visible_selected_graphs[1].display_label} → y",
+            f"{visible_selected_graphs[1].display_label} → x, {visible_selected_graphs[0].display_label} → y",
+        ]
+        selected_axis_label = st.radio(
+            "Scatter axes",
+            scatter_axis_labels,
+            index=st.session_state.scatter_axis_choice,
+        )
+        st.session_state.scatter_axis_choice = scatter_axis_labels.index(selected_axis_label)
 
     st.divider()
     st.header("Discovered")
@@ -650,82 +709,190 @@ with left:
         st.info("All added graphs are currently hidden. Toggle at least one graph visible to display it.")
         st.stop()
 
-    all_models_for_colors = sorted(
-        {r.model for r, _ in visible_loaded_frames},
-        key=natural_key,
+    x_run: ResultRun | None = None
+    y_run: ResultRun | None = None
+
+    scatter_mode = (
+        st.session_state.plot_mode == "scatter"
+        and len(visible_loaded_frames) == 2
     )
 
-    colors_by_model = model_color_map(all_models_for_colors)
-    model_seen_counts: dict[str, int] = {}
-
-    for run, df in visible_loaded_frames:
-        mode = "lines+markers" if show_markers else "lines"
-
-        occurrence_index = model_seen_counts.get(run.model, 0)
-        model_seen_counts[run.model] = occurrence_index + 1
-
-        default_trace_color = trace_color_for_run_hex(
-            run,
-            colors_by_model,
-            occurrence_index,
+    if scatter_mode:
+        all_models_for_colors = sorted(
+            {r.model for r, _ in visible_loaded_frames},
+            key=natural_key,
         )
 
-        settings = get_graph_settings(run_lookup_key(run))
-        trace_color = settings.get("color") or default_trace_color
+        colors_by_model = model_color_map(all_models_for_colors)
 
+        axis_order = st.session_state.scatter_axis_choice
+        x_run, x_df = visible_loaded_frames[axis_order]
+        y_run, y_df = visible_loaded_frames[1 - axis_order]
+
+        x_settings = get_graph_settings(run_lookup_key(x_run))
+        y_settings = get_graph_settings(run_lookup_key(y_run))
+
+        x_default_color = trace_color_for_run_hex(
+            x_run,
+            colors_by_model,
+            0,
+        )
+        trace_color = x_settings.get("color") or x_default_color
+
+        merged_df = pd.merge(
+            x_df[["window_index", "char_start", "char_end", "p_z"]],
+            y_df[["window_index", "p_z"]],
+            on="window_index",
+            how="inner",
+            suffixes=("_x", "_y"),
+        )
+
+        if x_scale == "log":
+            merged_df = merged_df[merged_df["p_z_x"] > 0].copy()
         if y_scale == "log":
-            # Plotly log axes cannot display zero.
-            # Keep raw p_z in customdata and show only positive values.
-            plot_df = df[df["p_z"] > 0].copy()
-        else:
-            plot_df = df.copy()
+            merged_df = merged_df[merged_df["p_z_y"] > 0].copy()
 
-        customdata = plot_df[
-            ["window_index", "char_start", "char_end", "p_z"]
+        if merged_df.empty:
+            st.error("Scatter mode could not align the two selected runs by window_index with the requested axis scales.")
+            st.stop()
+
+        customdata = merged_df[
+            ["window_index", "char_start", "char_end", "p_z_x", "p_z_y"]
         ].to_numpy()
 
         fig.add_trace(
             go.Scatter(
-                x=plot_df[x_axis],
-                y=plot_df["p_z"],
-                mode=mode,
-                name=run.display_label,
+                x=merged_df["p_z_x"],
+                y=merged_df["p_z_y"],
+                mode="markers",
+                name=f"{x_run.display_label} vs {y_run.display_label}",
                 customdata=customdata,
-                line=dict(color=trace_color, width=2.5),
-                marker=dict(color=trace_color, size=6),
+                marker=dict(color=trace_color, size=8),
                 hovertemplate=(
                     "<b>%{fullData.name}</b><br>"
-                    f"{x_axis}: %{{x}}<br>"
+                    f"x: {x_run.display_label}<br>"
+                    f"y: {y_run.display_label}<br>"
                     "window_index: %{customdata[0]}<br>"
                     "chars: %{customdata[1]}-%{customdata[2]}<br>"
-                    "p_z: %{customdata[3]:.6g}<extra></extra>"
+                    "p_z_x: %{customdata[3]:.6g}<br>"
+                    "p_z_y: %{customdata[4]:.6g}<extra></extra>"
                 ),
             )
         )
 
-    if show_threshold:
-        fig.add_hline(
-            y=0.001,
-            line_dash="dash",
-            annotation_text="0.001 threshold",
-            annotation_position="top left",
+        if show_reference_line:
+            line_min = float(min(merged_df["p_z_x"].min(), merged_df["p_z_y"].min()))
+            line_max = float(max(merged_df["p_z_x"].max(), merged_df["p_z_y"].max()))
+            if x_scale == "log":
+                line_x = np.geomspace(line_min, line_max, num=100)
+            else:
+                line_x = np.linspace(line_min, line_max, num=100)
+            fig.add_trace(
+                go.Scatter(
+                    x=line_x,
+                    y=line_x,
+                    mode="lines",
+                    name="y=x",
+                    line=dict(color="#888888", dash="dash"),
+                    showlegend=True,
+                )
+            )
+
+        fig.update_layout(
+            height=700,
+            margin=dict(l=90, r=40, t=60, b=90),
+            xaxis_title=dict(text=f"p_z ({x_run.display_label})", standoff=22),
+            yaxis_title=dict(text=f"p_z ({y_run.display_label})", standoff=28),
+            legend_title="Runs",
+            hovermode="closest",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="left",
+                x=0,
+            ),
+        )
+    else:
+        all_models_for_colors = sorted(
+            {r.model for r, _ in visible_loaded_frames},
+            key=natural_key,
         )
 
-    fig.update_layout(
-        height=700,
-        margin=dict(l=90, r=40, t=60, b=90),
-        xaxis_title=dict(text=x_axis, standoff=22),
-        yaxis_title=dict(text="p_z", standoff=28),
-        legend_title="Runs",
-        hovermode="closest",
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="left",
-            x=0,
-        ),
-    )
+        colors_by_model = model_color_map(all_models_for_colors)
+        model_seen_counts: dict[str, int] = {}
+
+        for run, df in visible_loaded_frames:
+            mode = "lines+markers" if show_markers else "lines"
+
+            occurrence_index = model_seen_counts.get(run.model, 0)
+            model_seen_counts[run.model] = occurrence_index + 1
+
+            default_trace_color = trace_color_for_run_hex(
+                run,
+                colors_by_model,
+                occurrence_index,
+            )
+
+            settings = get_graph_settings(run_lookup_key(run))
+            trace_color = settings.get("color") or default_trace_color
+
+            if y_scale == "log":
+                # Plotly log axes cannot display zero.
+                # Keep raw p_z in customdata and show only positive values.
+                plot_df = df[df["p_z"] > 0].copy()
+            else:
+                plot_df = df.copy()
+
+            if x_scale == "log":
+                plot_df = plot_df[plot_df[x_axis] > 0].copy()
+
+            customdata = plot_df[
+                ["window_index", "char_start", "char_end", "p_z"]
+            ].to_numpy()
+
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_df[x_axis],
+                    y=plot_df["p_z"],
+                    mode=mode,
+                    name=run.display_label,
+                    customdata=customdata,
+                    line=dict(color=trace_color, width=2.5),
+                    marker=dict(color=trace_color, size=6),
+                    hovertemplate=(
+                        "<b>%{fullData.name}</b><br>"
+                        f"{x_axis}: %{{x}}<br>"
+                        "window_index: %{customdata[0]}<br>"
+                        "chars: %{customdata[1]}-%{customdata[2]}<br>"
+                        "p_z: %{customdata[3]:.6g}<extra></extra>"
+                    ),
+                )
+            )
+
+        if show_reference_line:
+            fig.add_hline(
+                y=0.001,
+                line_dash="dash",
+                annotation_text="0.001 threshold",
+                annotation_position="top left",
+            )
+
+        fig.update_layout(
+            height=700,
+            margin=dict(l=90, r=40, t=60, b=90),
+            xaxis_title=dict(text=x_axis, standoff=22),
+            yaxis_title=dict(text="p_z", standoff=28),
+            legend_title="Runs",
+            hovermode="closest",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="left",
+                x=0,
+            ),
+        )
 
     fig.update_xaxes(
         automargin=True,
@@ -741,6 +908,8 @@ with left:
         title_standoff=28,
     )
 
+    if x_scale == "log":
+        fig.update_xaxes(type="log")
     if y_scale == "log":
         fig.update_yaxes(type="log")
 
@@ -751,7 +920,7 @@ with left:
         select_event=False,
         override_height=700,
         key=(
-            f"plot_{document}_{y_scale}_{x_axis}_{len(selected_runs)}_"
+            f"plot_{document}_{y_scale}_{x_scale}_{x_axis}_{len(selected_runs)}_"
             f"{hash(str(st.session_state.graph_settings))}"
         ),
     )
@@ -768,46 +937,87 @@ with left:
         customdata = point.get("customdata")
 
         if customdata is not None and curve_number is not None:
-            # If threshold hline or another shape gets clicked,
-            # curveNumber may not map to visible_loaded_frames.
-            if 0 <= curve_number < len(visible_loaded_frames):
-                run, _ = visible_loaded_frames[curve_number]
+            if scatter_mode:
+                if len(customdata) != 5:
+                    st.warning("Clicked item does not correspond to a data trace.")
+                else:
+                    window_index, char_start, char_end, p_z_x, p_z_y = customdata
+                    run = x_run
+                    p_z = float(p_z_x)
+                    window_label = f"{x_run.display_label} vs {y_run.display_label}" if x_run and y_run else "scatter trace"
 
-                window_index, char_start, char_end, p_z = customdata
+                    window_index = int(window_index)
+                    char_start = int(char_start)
+                    char_end = int(char_end)
 
-                window_index = int(window_index)
-                char_start = int(char_start)
-                char_end = int(char_end)
-                p_z = float(p_z)
+                    full_text = load_text(document)
+                    chunk = full_text[char_start:char_end]
 
-                full_text = load_text(document)
-                chunk = full_text[char_start:char_end]
+                    st.divider()
+                    st.subheader("Clicked window")
 
-                st.divider()
-                st.subheader("Clicked window")
+                    c1, c2, c3, c4 = st.columns(4)
 
-                c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("window_index", window_index)
+                    c2.metric("char_start", char_start)
+                    c3.metric("char_end", char_end)
+                    c4.metric("p_z_x", f"{p_z_x:.6g}")
 
-                c1.metric("window_index", window_index)
-                c2.metric("char_start", char_start)
-                c3.metric("char_end", char_end)
-                c4.metric("p_z", f"{p_z:.6g}")
+                    with st.container(border=True):
+                        st.markdown("**Run**")
+                        st.write(window_label)
+                        if x_run:
+                            st.code(str(x_run.path), language="text")
 
-                with st.container(border=True):
-                    st.markdown("**Run**")
-                    st.write(run.display_label)
-                    st.code(str(run.path), language="text")
+                    st.markdown("**Text chunk used before tokenization**")
 
-                st.markdown("**Text chunk used before tokenization**")
-
-                st.text_area(
-                    "chunk",
-                    value=chunk,
-                    height=260,
-                    label_visibility="collapsed",
-                )
+                    st.text_area(
+                        "chunk",
+                        value=chunk,
+                        height=260,
+                        label_visibility="collapsed",
+                    )
             else:
-                st.warning("Clicked item does not correspond to a data trace.")
+                # If threshold hline or another shape gets clicked,
+                # curveNumber may not map to visible_loaded_frames.
+                if 0 <= curve_number < len(visible_loaded_frames):
+                    run, _ = visible_loaded_frames[curve_number]
+
+                    window_index, char_start, char_end, p_z = customdata
+
+                    window_index = int(window_index)
+                    char_start = int(char_start)
+                    char_end = int(char_end)
+                    p_z = float(p_z)
+
+                    full_text = load_text(document)
+                    chunk = full_text[char_start:char_end]
+
+                    st.divider()
+                    st.subheader("Clicked window")
+
+                    c1, c2, c3, c4 = st.columns(4)
+
+                    c1.metric("window_index", window_index)
+                    c2.metric("char_start", char_start)
+                    c3.metric("char_end", char_end)
+                    c4.metric("p_z", f"{p_z:.6g}")
+
+                    with st.container(border=True):
+                        st.markdown("**Run**")
+                        st.write(run.display_label)
+                        st.code(str(run.path), language="text")
+
+                    st.markdown("**Text chunk used before tokenization**")
+
+                    st.text_area(
+                        "chunk",
+                        value=chunk,
+                        height=260,
+                        label_visibility="collapsed",
+                    )
+                else:
+                    st.warning("Clicked item does not correspond to a data trace.")
     else:
         st.divider()
         st.subheader("Clicked window")

@@ -4,6 +4,8 @@ import csv
 import json
 import math
 from importlib.metadata import PackageNotFoundError, version as package_version
+import re
+from bisect import bisect_left
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, median
@@ -37,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--mode', choices=['exact', 'monte-carlo', 'path_sampling'], default='exact')
     parser.add_argument('--tau', type=float, default=0.001)
     parser.add_argument('--chunk-chars', type=int, default=800)
-    parser.add_argument('--stride-chars', type=int, default=10)
+    parser.add_argument('--stride-words', type=int, default=1)
     parser.add_argument('--seq-tokens', type=int, default=100)
     parser.add_argument('--prefix-tokens', type=int, default=50)
     parser.add_argument('--suffix-tokens', type=int, default=50)
@@ -79,6 +81,14 @@ def _resolve_decoding_scheme(args: argparse.Namespace) -> str:
     if args.decoding_scheme != 'auto':
         return args.decoding_scheme
     return 'full' if args.model_family == 'llada' else 'top_k'
+
+
+def _advance_by_words(start_pos: int, word_count: int, word_start_positions: List[int], text_len: int) -> int:
+    if word_count <= 0:
+        return start_pos
+    idx = bisect_left(word_start_positions, start_pos)
+    target_idx = idx + word_count
+    return word_start_positions[target_idx] if target_idx < len(word_start_positions) else text_len
 
 
 def _load_tokenizer(model_name: str):
@@ -232,6 +242,9 @@ def main() -> None:
     model = _load_model(args.model_name, args.model_family, device)
 
     text = args.txt_path.read_text(encoding='utf-8', errors='replace')
+    word_start_positions = [m.start() for m in re.finditer(r'\S+', text)]
+    if not word_start_positions:
+        raise ValueError('Input text contains no words to slide across.')
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_dir = args.output_dir / args.txt_path.stem / timestamp
@@ -241,7 +254,7 @@ def main() -> None:
     pos = 0
     window_index = 0
 
-    total_possible = max(0, (len(text) + args.stride_chars - 1) // args.stride_chars)
+    total_possible = max(0, (len(word_start_positions) + args.stride_words - 1) // args.stride_words)
 
     pbar = tqdm(total=total_possible, desc='Sliding windows', unit='window')
 
@@ -286,7 +299,7 @@ def main() -> None:
             }
         )
 
-        pos += args.stride_chars
+        pos = _advance_by_words(pos, args.stride_words, word_start_positions, len(text))
         window_index += 1
         pbar.update(1)
 
@@ -323,7 +336,7 @@ def main() -> None:
         'total_chars': len(text),
         'parameters': {
             'chunk_chars': args.chunk_chars,
-            'stride_chars': args.stride_chars,
+            'stride_words': args.stride_words,
             'seq_tokens': args.seq_tokens,
             'prefix_tokens': args.prefix_tokens,
             'suffix_tokens': args.suffix_tokens,
