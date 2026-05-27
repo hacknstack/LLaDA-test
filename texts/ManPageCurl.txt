@@ -1,0 +1,181 @@
+Name
+
+curl - transfer a URL
+Synopsis
+
+curl [options / URLs]
+Description
+
+curl is a tool for transferring data from or to a server using URLs. It supports these protocols: DICT, FILE, FTP, FTPS, GOPHER, GOPHERS, HTTP, HTTPS, IMAP, IMAPS, LDAP, LDAPS, MQTT, MQTTS, POP3, POP3S, RTSP, SCP, SFTP, SMB, SMBS, SMTP, SMTPS, TELNET, TFTP, WS and WSS.
+
+curl is powered by libcurl for all transfer-related features. See libcurl for details.
+Url
+
+The URL syntax is protocol-dependent. You can find a detailed description in RFC 3986.
+
+If you provide a URL without a leading "protocol://" scheme, curl guesses what protocol you want. It then defaults to HTTP but assumes others based on often-used hostname prefixes. For example, for hostnames starting with "ftp." curl assumes you want FTP.
+
+You can specify any amount of URLs on the command line. They are fetched in a sequential manner in the specified order unless you use --parallel. You can specify command line options and URLs mixed and in any order on the command line.
+
+curl attempts to reuse connections when doing multiple transfers, so that getting many files from the same server do not use multiple connects and setup handshakes. This improves speed. Connection reuse can only be done for URLs specified for a single command line invocation and cannot be performed between separate curl runs.
+
+Provide an IPv6 zone id in the URL with an escaped percentage sign. Like in
+
+http://[fe80::3%25eth0]/
+
+Everything provided on the command line that is not a command line option or its argument, curl assumes is a URL and treats it as such.
+Globbing
+
+You can specify multiple URLs or parts of URLs by writing lists within braces or ranges within brackets. We call this "globbing".
+
+Provide a list with three different names like this:
+
+https://fun.example/{one,two,three}.jpg
+ 
+sftp://{one,two,three}.example/README
+
+Do sequences of alphanumeric series by using [] as in:
+
+ftp://ftp.example.com/file[1-100].txt
+
+With leading zeroes:
+
+ftp://ftp.example.com/file[001-100].txt
+
+With letters through the alphabet:
+
+ftp://ftp.example.com/file[a-z].txt
+
+Nested sequences are not supported, but you can use several ones next to each other:
+
+https://example.com/archive[1996-1999]/vol[1-4]/part{a,b,c}.html
+
+You can specify a step counter for the ranges to get every Nth number or letter:
+
+https://example.com/file[1-100:10].txt
+ 
+https://example.com/file[a-z:2].txt
+
+When using [] or {} sequences when invoked from a command line prompt, you probably have to put the full URL within double quotes to avoid the shell from interfering with it. This also goes for other characters treated special, like for example '&', '?' and '*'.
+
+The separate globbing components can be referenced in the --output option to allow pieces to be reused in the target filename.
+
+Starting in curl 8.21.0, the separate globbing parts can be named and referenced by their names. The case sensitive alphanumeric name is set enclosed within angle brackets after the opening character. Examples:
+
+https://fun.example/{<number>one,two,three}.jpg
+ 
+ftp://ftp.example.com/file[<range>1-100].txt
+
+Setting the same glob name twice is an error.
+
+Switch off globbing with --globoff.
+Variables
+
+curl supports command line variables (added in 8.3.0). Set variables with --variable name=content or --variable name@file (where "file" can be stdin if set to a single dash (-)).
+
+Variable contents can be expanded in option parameters using "{{name}}" if the option name is prefixed with "--expand-". This gets the contents of the variable "name" inserted, or a blank if the name does not exist as a variable. Insert "{{" verbatim in the string by prefixing it with a backslash, like "\{{".
+
+You can access and expand environment variables by importing them with "--variable %name". This imports the variable called "name" but exits with an error if that environment variable is not already set. To provide a default value in case it is not already set, use "--variable %name=content" or "--variable %name@content".
+
+Example: get the USER environment variable and expand into the URL, fail if USER is not set:
+
+--variable '%USER'
+--expand-url = "https://example.com/api/{{USER}}/method"
+
+When expanding variables, curl supports a set of functions that can make the variable contents more convenient to use. It can trim leading and trailing white space with "trim", output the contents as a JSON quoted string with "json", URL encode the string with "url", base64 encode it with "b64" and base64 decode it with "64dec". To apply functions to a variable expansion, add them colon separated to the right side of the variable. Variable content holding null bytes that are not encoded when expanded causes an error.
+
+Example: get the contents of a file called $HOME/.secret into a variable called "fix". Make sure that the content is trimmed and percent-encoded when sent as POST data:
+
+--variable %HOME
+--expand-variable fix@{{HOME}}/.secret
+--expand-data "{{fix:trim:url}}"
+https://example.com/
+
+Command line variables and expansions were added in 8.3.0.
+Output
+
+If not told otherwise, curl writes the received data to stdout. It can be instructed to instead save that data into a local file, using the --output or --remote-name options. If curl is given multiple URLs to transfer on the command line, it similarly needs multiple options for where to save them.
+
+curl does not parse or otherwise "understand" the content it gets or writes as output. It does no encoding or decoding, unless explicitly asked to with dedicated command line options.
+Protocols
+
+curl supports numerous protocols, or put in URL terms: schemes. Your particular build may not support them all.
+
+DICT
+
+Lets you lookup words using online dictionaries.
+
+FILE
+
+Read or write local files. curl does not support accessing "file://" URL remotely, but when running on Microsoft Windows using the native UNC approach works. Only absolute paths.
+
+FTP(S)
+
+curl supports the File Transfer Protocol with a lot of tweaks and levers. With or without using TLS.
+
+GOPHER(S)
+
+Retrieve files.
+
+HTTP(S)
+
+curl supports HTTP with numerous options and variations. It can speak HTTP version 0.9, 1.0, 1.1, 2 and 3 depending on build options and the correct command line options.
+
+IMAP(S)
+
+Using the mail reading protocol, curl can download emails for you. With or without using TLS.
+
+LDAP(S)
+
+curl can do directory lookups for you, with or without TLS.
+
+MQTT
+
+curl supports MQTT version 3. Downloading over MQTT equals subscribing to a topic while uploading/posting equals publishing on a topic. MQTT over TLS is not supported (yet).
+
+POP3(S)
+
+Downloading from a pop3 server means getting an email. With or without using TLS.
+
+RTSP
+
+curl supports RTSP 1.0 downloads.
+
+SCP
+
+curl supports SSH version 2 scp transfers.
+
+SFTP
+
+curl supports SFTP (draft 5) done over SSH version 2.
+
+SMB(S)
+
+curl supports SMB version 1 for upload and download.
+
+SMTP(S)
+
+Uploading contents to an SMTP server means sending an email. With or without TLS.
+
+TELNET
+
+Fetching a telnet URL starts an interactive session where it sends what it reads on stdin and outputs what the server sends it.
+
+TFTP
+
+curl can do TFTP downloads and uploads.
+
+WS(S)
+
+WebSocket done over HTTP/1. WSS implies that it works over HTTPS.
+Progress meter
+
+curl normally displays a progress meter during operations, indicating the amount of transferred data, transfer speeds and estimated time left, etc. The progress meter displays the transfer rate in bytes per second. The used suffixes ("k" for kilo, "M" for mega, "G" for giga, "T" for tera, "P" for peta and "E" for exa) are 1024 based. For example 1k is 1024 bytes. 1M is 1048576 bytes. Strictly speaking this makes the units kibibyte and mebibyte etc.
+
+curl displays this data to the terminal by default, so if you invoke curl to do an operation and it is about to write data to the terminal, it disables the progress meter as otherwise it would mess up the output mixing progress meter and response data.
+
+If you want a progress meter for HTTP POST or PUT requests, you need to redirect the response output to a file, using shell redirect (>), --output or similar.
+
+This does not apply to FTP upload as that operation does not spit out any response data to the terminal.
+
+If you prefer a progress bar instead of the regular meter, --progress-bar is your friend. You can also disable the progress meter completely with the --silent option. 
