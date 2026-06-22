@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/Psalm23.txt",
+  "total_chars": 630,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llama",
+    "model_name": "NousResearch/Meta-Llama-3-8B",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 47,
+  "num_windows_scored": 47,
+  "num_windows_extracted": 41,
+  "extraction_rate": 0.8723404255319149,
+  "p_z_distribution": {
+    "min": 0.00012323017261483833,
+    "median": 0.12570567524720994,
+    "mean": 0.14986527082961476,
+    "max": 0.5039397943569583,
+    "q_0.9": 0.252310964109569,
+    "q_0.99": 0.5018359282313911,
+    "q_0.999": 0.5037294077444017
+  }
+}

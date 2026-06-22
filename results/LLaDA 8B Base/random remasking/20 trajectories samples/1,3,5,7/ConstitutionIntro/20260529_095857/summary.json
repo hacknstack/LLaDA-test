@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/ConstitutionIntro.txt",
+  "total_chars": 13580,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "path_sampling",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "random",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 2241,
+  "num_windows_scored": 2241,
+  "num_windows_extracted": 142,
+  "extraction_rate": 0.06336456938866578,
+  "p_z_distribution": {
+    "min": 1.6961964972070122e-15,
+    "median": 4.5415999137299753e-07,
+    "mean": 0.002434589189581889,
+    "max": 0.3513501717216337,
+    "q_0.9": 0.00028527681599334543,
+    "q_0.99": 0.07671020708267559,
+    "q_0.999": 0.2839450349815337
+  }
+}

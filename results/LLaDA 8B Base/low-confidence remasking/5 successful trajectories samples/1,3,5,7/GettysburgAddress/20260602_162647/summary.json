@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/GettysburgAddress.txt",
+  "total_chars": 1455,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "path_sampling",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "low-confidence",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 179,
+  "num_windows_scored": 179,
+  "num_windows_extracted": 41,
+  "extraction_rate": 0.22905027932960895,
+  "p_z_distribution": {
+    "min": 1.9330697250307308e-41,
+    "median": 2.382462489661615e-05,
+    "mean": 0.05455172292148179,
+    "max": 0.9698302779910891,
+    "q_0.9": 0.03613297415018001,
+    "q_0.99": 0.8447680666396724,
+    "q_0.999": 0.953576670132845
+  }
+}

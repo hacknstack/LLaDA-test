@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/DeclarationTranscript.txt",
+  "total_chars": 8133,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "olmo",
+    "model_name": "allenai/OLMo-7B-0724-hf",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 1252,
+  "num_windows_scored": 1252,
+  "num_windows_extracted": 1024,
+  "extraction_rate": 0.8178913738019169,
+  "p_z_distribution": {
+    "min": 1.7115586355163614e-08,
+    "median": 0.025477612434641334,
+    "mean": 0.08873241413654552,
+    "max": 0.6723053200572581,
+    "q_0.9": 0.29319575990250485,
+    "q_0.99": 0.5607869204487006,
+    "q_0.999": 0.6525434659210064
+  }
+}

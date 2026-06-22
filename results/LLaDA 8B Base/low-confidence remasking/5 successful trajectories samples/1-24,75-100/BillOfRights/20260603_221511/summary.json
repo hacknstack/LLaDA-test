@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/BillOfRights.txt",
+  "total_chars": 2791,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "path_sampling",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "low-confidence",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 408,
+  "num_windows_scored": 408,
+  "num_windows_extracted": 2,
+  "extraction_rate": 0.004901960784313725,
+  "p_z_distribution": {
+    "min": 1.4457715421472152e-174,
+    "median": 1.1336712115994516e-37,
+    "mean": 3.954496522122259e-05,
+    "max": 0.00926705026221643,
+    "q_0.9": 4.5336438927833897e-14,
+    "q_0.99": 9.874231938639467e-09,
+    "q_0.999": 0.008284599506141466
+  }
+}

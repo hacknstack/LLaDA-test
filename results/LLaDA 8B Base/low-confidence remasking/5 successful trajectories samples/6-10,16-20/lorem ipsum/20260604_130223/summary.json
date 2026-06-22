@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/lorem ipsum.txt",
+  "total_chars": 976,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "path_sampling",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "low-confidence",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 104,
+  "num_windows_scored": 104,
+  "num_windows_extracted": 17,
+  "extraction_rate": 0.16346153846153846,
+  "p_z_distribution": {
+    "min": 6.294789982006587e-132,
+    "median": 7.082019692085197e-31,
+    "mean": 0.1343167818784047,
+    "max": 0.9966399119845067,
+    "q_0.9": 0.8327605517588839,
+    "q_0.99": 0.9958646472112972,
+    "q_0.999": 0.9965823185076719
+  }
+}

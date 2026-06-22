@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/3-ClauseBSDLicense.txt",
+  "total_chars": 1443,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "olmo",
+    "model_name": "allenai/OLMo-7B-0724-hf",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 148,
+  "num_windows_scored": 148,
+  "num_windows_extracted": 148,
+  "extraction_rate": 1.0,
+  "p_z_distribution": {
+    "min": 0.04241938627995718,
+    "median": 0.1976731283965305,
+    "mean": 0.35894751887966353,
+    "max": 0.9554036524867878,
+    "q_0.9": 0.8709778202470178,
+    "q_0.99": 0.9439951208297411,
+    "q_0.999": 0.9543912917575764
+  }
+}

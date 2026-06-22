@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/GenesisNumbered.txt",
+  "total_chars": 17302,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "path_sampling",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "random",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 3339,
+  "num_windows_scored": 3339,
+  "num_windows_extracted": 0,
+  "extraction_rate": 0.0,
+  "p_z_distribution": {
+    "min": 4.230509652891859e-48,
+    "median": 8.5196075232178575e-19,
+    "mean": 7.357883951032882e-07,
+    "max": 0.0005385450013547324,
+    "q_0.9": 1.4913718163298304e-10,
+    "q_0.99": 3.657017750798741e-06,
+    "q_0.999": 0.0001664962015957134
+  }
+}

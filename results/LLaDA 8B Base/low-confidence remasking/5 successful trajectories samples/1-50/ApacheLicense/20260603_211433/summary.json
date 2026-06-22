@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/ApacheLicense.txt",
+  "total_chars": 10596,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "path_sampling",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "low-confidence",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 1420,
+  "num_windows_scored": 1420,
+  "num_windows_extracted": 0,
+  "extraction_rate": 0.0,
+  "p_z_distribution": {
+    "min": 0.0,
+    "median": 6.718814080368051e-35,
+    "mean": 7.272112111151938e-12,
+    "max": 3.5451045497282198e-09,
+    "q_0.9": 6.368913948080599e-18,
+    "q_0.99": 4.4955060772554754e-12,
+    "q_0.999": 2.7937683185123747e-09
+  }
+}

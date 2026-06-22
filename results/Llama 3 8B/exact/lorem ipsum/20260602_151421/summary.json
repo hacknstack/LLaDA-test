@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/lorem ipsum.txt",
+  "total_chars": 976,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llama",
+    "model_name": "NousResearch/Meta-Llama-3-8B",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 100,
+  "num_windows_scored": 100,
+  "num_windows_extracted": 22,
+  "extraction_rate": 0.22,
+  "p_z_distribution": {
+    "min": 0.0,
+    "median": 0.0,
+    "mean": 0.05114744661887335,
+    "max": 0.5162025402076734,
+    "q_0.9": 0.20875517316852352,
+    "q_0.99": 0.5121482922087157,
+    "q_0.999": 0.5157971154077776
+  }
+}

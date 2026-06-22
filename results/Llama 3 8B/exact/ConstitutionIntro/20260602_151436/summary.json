@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/ConstitutionIntro.txt",
+  "total_chars": 13580,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llama",
+    "model_name": "NousResearch/Meta-Llama-3-8B",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 2239,
+  "num_windows_scored": 2239,
+  "num_windows_extracted": 1867,
+  "extraction_rate": 0.8338543992853953,
+  "p_z_distribution": {
+    "min": 0.0,
+    "median": 0.2761141485277089,
+    "mean": 0.2930465392876855,
+    "max": 0.8989250819459019,
+    "q_0.9": 0.6639408327597259,
+    "q_0.99": 0.8307120522472763,
+    "q_0.999": 0.8752540962174913
+  }
+}

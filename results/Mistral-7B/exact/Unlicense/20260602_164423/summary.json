@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/Unlicense.txt",
+  "total_chars": 1147,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "mistral",
+    "model_name": "mistralai/Mistral-7B-v0.1",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 128,
+  "num_windows_scored": 128,
+  "num_windows_extracted": 117,
+  "extraction_rate": 0.9140625,
+  "p_z_distribution": {
+    "min": 0.0,
+    "median": 0.17065065665630613,
+    "mean": 0.3096371956870249,
+    "max": 0.8346062780401496,
+    "q_0.9": 0.764810162446274,
+    "q_0.99": 0.8191663669177344,
+    "q_0.999": 0.8328025154548863
+  }
+}

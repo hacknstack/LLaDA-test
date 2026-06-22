@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/3-ClauseBSDLicense.txt",
+  "total_chars": 1443,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llama2",
+    "model_name": "NousResearch/Llama-2-7b-hf",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 174,
+  "num_windows_scored": 174,
+  "num_windows_extracted": 157,
+  "extraction_rate": 0.9022988505747126,
+  "p_z_distribution": {
+    "min": 0.0,
+    "median": 0.2137329379851864,
+    "mean": 0.3114658811290663,
+    "max": 0.9663972634518934,
+    "q_0.9": 0.7642338081989963,
+    "q_0.99": 0.9060418403393888,
+    "q_0.999": 0.9662996093152354
+  }
+}

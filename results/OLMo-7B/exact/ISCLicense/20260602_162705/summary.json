@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/ISCLicense.txt",
+  "total_chars": 696,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "olmo",
+    "model_name": "allenai/OLMo-7B-0724-hf",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 35,
+  "num_windows_scored": 35,
+  "num_windows_extracted": 35,
+  "extraction_rate": 1.0,
+  "p_z_distribution": {
+    "min": 0.7331037645768343,
+    "median": 0.8795082294265898,
+    "mean": 0.8662808593338978,
+    "max": 0.941882360497536,
+    "q_0.9": 0.9300030763055123,
+    "q_0.99": 0.940225957350806,
+    "q_0.999": 0.941716720182863
+  }
+}

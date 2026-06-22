@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/Psalm23.txt",
+  "total_chars": 630,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "path_sampling",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "random",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 53,
+  "num_windows_scored": 53,
+  "num_windows_extracted": 0,
+  "extraction_rate": 0.0,
+  "p_z_distribution": {
+    "min": 2.2077634751568254e-29,
+    "median": 6.3356500102509575e-21,
+    "mean": 1.4477731218695972e-14,
+    "max": 4.851633665794442e-13,
+    "q_0.9": 8.050517504613784e-16,
+    "q_0.99": 3.098564262268501e-13,
+    "q_0.999": 4.67632672544185e-13
+  }
+}

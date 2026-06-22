@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/Unlicense.txt",
+  "total_chars": 1147,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "path_sampling",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "random",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 115,
+  "num_windows_scored": 115,
+  "num_windows_extracted": 56,
+  "extraction_rate": 0.48695652173913045,
+  "p_z_distribution": {
+    "min": 1.1784135164009501e-13,
+    "median": 0.0009314213123485592,
+    "mean": 0.04799943366848103,
+    "max": 0.5106573678587132,
+    "q_0.9": 0.20808471377676852,
+    "q_0.99": 0.5023033810655452,
+    "q_0.999": 0.5103068275332658
+  }
+}

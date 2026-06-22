@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/3-ClauseBSDLicense.txt",
+  "total_chars": 1443,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "mistral",
+    "model_name": "mistralai/Mistral-7B-v0.1",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 162,
+  "num_windows_scored": 162,
+  "num_windows_extracted": 131,
+  "extraction_rate": 0.808641975308642,
+  "p_z_distribution": {
+    "min": 3.1681739628871696e-05,
+    "median": 0.011167896293434749,
+    "mean": 0.1610934661476316,
+    "max": 0.8189260860665266,
+    "q_0.9": 0.6214127954541497,
+    "q_0.99": 0.7722360446253123,
+    "q_0.999": 0.8117082602988736
+  }
+}

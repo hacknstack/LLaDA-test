@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/lorem ipsum.txt",
+  "total_chars": 976,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "olmo",
+    "model_name": "allenai/OLMo-7B-0724-hf",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 105,
+  "num_windows_scored": 105,
+  "num_windows_extracted": 14,
+  "extraction_rate": 0.13333333333333333,
+  "p_z_distribution": {
+    "min": 0.0,
+    "median": 7.576555198148573e-11,
+    "mean": 0.007390953666633641,
+    "max": 0.10124109859052773,
+    "q_0.9": 0.01529163782434849,
+    "q_0.99": 0.09675573113288798,
+    "q_0.999": 0.10078222979211351
+  }
+}

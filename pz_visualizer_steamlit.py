@@ -23,7 +23,9 @@ ROOT = Path(".")
 TEXTS_DIR = ROOT / "texts"
 RESULTS_DIR = ROOT / "results"
 EXPECTED_FILES = {"summary.json", "windows.csv"}
-CUSTOM_MASK_SEGMENT = "custom masks"
+CUSTOM_MASK_SEGMENT = "custom masks"  # Obsolete layout marker; mask runs are no longer read from this folder.
+TIMESTAMP_DIR_RE = re.compile(r"^\d{8}[_-]\d{6}$")
+DISCOVERY_CACHE_VERSION = "layout-v3-scatter-20260607"
 
 PRESET_TRACE_COLORS = {
     "Blue": "#1f77b4",
@@ -56,9 +58,9 @@ class ResultRun:
     @property
     def base_key(self) -> tuple[str, str, tuple[str, ...]]:
         """
-        Groups default and custom-mask equivalents together.
+        Groups runs that differ only by mask together.
 
-        Key = document, model, setup path excluding custom-mask/document/mask suffix.
+        Key = document, model, setup path excluding the mask/document/data suffix.
         """
         return (self.document, self.model, self.setup_parts)
 
@@ -91,19 +93,69 @@ def looks_like_result_dir(path: Path) -> bool:
     return EXPECTED_FILES.issubset(files)
 
 
-def parse_result_dir(path: Path) -> ResultRun | None:
+def setup_label_from_parts(setup_parts: tuple[str, ...]) -> str:
+    return " / ".join(setup_parts) if setup_parts else "default"
+
+
+def is_llada_model(model: str) -> bool:
+    return "llada" in model.lower()
+
+
+def is_likely_mask_segment(segment: str) -> bool:
     """
-    Supports both default and custom-mask layouts.
+    Matches masks such as 1,3,5,7 or 1-10,21-30.
+    Avoids treating setup labels such as full or top_k = 40 as masks.
+    """
+    return bool(
+        re.fullmatch(
+            r"\s*\d+(?:\s*-\s*\d+)?(?:\s*,\s*\d+(?:\s*-\s*\d+)?)*\s*",
+            segment,
+        )
+    )
 
-    Default examples:
-      results/Llama 3 8B/exact/top_k = 40/MITLicense
-      results/LLaDA 8B Base/low-confidence remasking/100 Monte Carlo samples/full/MITLicense
-      results/LLaDA 8B Base/ELBO/MITLicense
 
-    Custom-mask examples:
-      results/LLaDA 8B Base/low-confidence remasking/100 Monte Carlo samples/full/custom masks/MITLicense/1-24,75-100
-      results/LLaDA 8B Base/random remasking/20 trajectories samples/custom masks/MITLicense/2,4,6,8
-      results/LLaDA 8B Base/ELBO/custom masks/MITLicense/1-50
+def contains_trajectory_segment(parts: tuple[str, ...]) -> bool:
+    return any("trajector" in part.lower() for part in parts)
+
+
+def infer_document_index(parts: tuple[str, ...], text_doc_set: set[str]) -> int | None:
+    """
+    Return the index of the document segment inside a result path.
+
+    The important rule is that the real document name is the path segment
+    matching texts/<document>.txt, even when summary.json/windows.csv are one
+    layer below the document folder, such as:
+
+      results/<model>/<setup>/<document>/<timestamp>/windows.csv
+
+    If no exact text-doc segment is found, fall back only for common
+    timestamp-like data folders. Otherwise return None so the run is not
+    incorrectly assigned to a fake document.
+    """
+    for idx in range(len(parts) - 1, 0, -1):
+        if parts[idx] in text_doc_set:
+            return idx
+
+    if len(parts) >= 3 and TIMESTAMP_DIR_RE.fullmatch(parts[-1]):
+        return len(parts) - 2
+
+    return None
+
+
+def parse_result_dir(path: Path, text_doc_set: set[str]) -> ResultRun | None:
+    """
+    Parses result directories containing summary.json and windows.csv.
+
+    Supported layouts:
+      results/<model>/<setup>/<document>
+      results/<model>/<setup>/<document>/<ignored-data-folder>
+
+    LLaDA trajectory-mask layout:
+      results/LLaDA 8B Base/<remasking>/<trajectory setup>/<mask>/<document>
+      results/LLaDA 8B Base/<remasking>/<trajectory setup>/<mask>/<document>/<ignored-data-folder>
+
+    Obsolete custom masks folders are ignored; masks are discovered only as
+    implicit LLaDA path segments directly before the document name.
     """
     try:
         rel = path.relative_to(RESULTS_DIR)
@@ -119,18 +171,34 @@ def parse_result_dir(path: Path) -> ResultRun | None:
     windows_path = path / "windows.csv"
 
     if CUSTOM_MASK_SEGMENT in parts:
-        idx = parts.index(CUSTOM_MASK_SEGMENT)
-        if idx + 2 >= len(parts):
-            return None
-        document = parts[idx + 1]
-        custom_mask = parts[idx + 2]
-        setup_parts = tuple(parts[1:idx])
-    else:
-        document = parts[-1]
-        custom_mask = None
-        setup_parts = tuple(parts[1:-1])
+        return None
 
-    setup_label = " / ".join(setup_parts) if setup_parts else "default"
+    document_idx = infer_document_index(parts, text_doc_set)
+    if document_idx is None or document_idx <= 0 or document_idx >= len(parts):
+        return None
+
+    document = parts[document_idx]
+    if document not in text_doc_set:
+        return None
+    before_document = tuple(parts[1:document_idx])
+
+    custom_mask = None
+    setup_parts = before_document
+
+    # LLaDA trajectory masks are implicit: the segment immediately before
+    # the document name is the mask. There is no default mask for these
+    # trajectory runs, so a masked run is discovered directly.
+    if is_llada_model(model) and before_document:
+        possible_mask = before_document[-1]
+        setup_before_mask = before_document[:-1]
+        if setup_before_mask and (
+            contains_trajectory_segment(setup_before_mask)
+            or is_likely_mask_segment(possible_mask)
+        ):
+            custom_mask = possible_mask
+            setup_parts = setup_before_mask
+
+    setup_label = setup_label_from_parts(setup_parts)
 
     return ResultRun(
         path=path,
@@ -145,21 +213,23 @@ def parse_result_dir(path: Path) -> ResultRun | None:
 
 
 @st.cache_data(show_spinner=False)
-def discover_text_documents() -> list[str]:
+def discover_text_documents(cache_version: str) -> list[str]:
     if not TEXTS_DIR.exists():
         return []
     return sorted([p.stem for p in TEXTS_DIR.glob("*.txt")], key=natural_key)
 
 
 @st.cache_data(show_spinner=False)
-def discover_runs() -> list[ResultRun]:
+def discover_runs(cache_version: str, text_docs: tuple[str, ...]) -> list[ResultRun]:
     if not RESULTS_DIR.exists():
         return []
+
+    text_doc_set = set(text_docs)
 
     runs: list[ResultRun] = []
     for p in RESULTS_DIR.rglob("*"):
         if looks_like_result_dir(p):
-            parsed = parse_result_dir(p)
+            parsed = parse_result_dir(p, text_doc_set)
             if parsed is not None:
                 runs.append(parsed)
 
@@ -208,29 +278,43 @@ def runs_for_document(runs: list[ResultRun], document: str) -> list[ResultRun]:
     return [r for r in runs if r.document == document]
 
 
-def default_runs_for_document_and_model(
+def runs_for_document_and_model(
     runs: list[ResultRun],
     document: str,
     model: str,
 ) -> list[ResultRun]:
-    return [
-        r
-        for r in runs
-        if r.document == document
-        and r.model == model
-        and not r.is_custom_mask
-    ]
+    return [r for r in runs if r.document == document and r.model == model]
 
 
-def custom_runs_equivalent_to(runs: list[ResultRun], base_run: ResultRun) -> list[ResultRun]:
-    return [
-        r
+def setup_parts_for_document_and_model(
+    runs: list[ResultRun],
+    document: str,
+    model: str,
+) -> list[tuple[str, ...]]:
+    options = {
+        r.setup_parts
         for r in runs
-        if r.document == base_run.document
-        and r.model == base_run.model
-        and r.setup_parts == base_run.setup_parts
-        and r.is_custom_mask
-    ]
+        if r.document == document and r.model == model
+    }
+    return sorted(options, key=lambda parts: natural_key(setup_label_from_parts(parts)))
+
+
+def runs_for_setup(
+    runs: list[ResultRun],
+    document: str,
+    model: str,
+    setup_parts: tuple[str, ...],
+) -> list[ResultRun]:
+    return sorted(
+        [
+            r
+            for r in runs
+            if r.document == document
+            and r.model == model
+            and r.setup_parts == setup_parts
+        ],
+        key=lambda r: natural_key(r.custom_mask or "default"),
+    )
 
 
 def run_lookup_key(run: ResultRun) -> str:
@@ -347,6 +431,44 @@ def get_graph_settings(run_key: str) -> dict[str, Any]:
     return st.session_state.graph_settings[run_key]
 
 
+def is_ar_run(run: ResultRun) -> bool:
+    """AR means any selected non-LLaDA run."""
+    return not is_llada_model(run.model)
+
+
+def scatter_ar_vs_llada_possible(selected_runs: list[ResultRun]) -> bool:
+    """
+    Multi-run scatter is supported when exactly one visible run is AR
+    and every other visible run is an LLaDA trajectory/mask run.
+    """
+    ar_runs = [run for run in selected_runs if is_ar_run(run)]
+    llada_runs = [run for run in selected_runs if is_llada_model(run.model)]
+    return len(ar_runs) == 1 and len(llada_runs) >= 1 and len(selected_runs) >= 2
+
+
+def default_color_lookup_for_runs(selected_runs: list[ResultRun]) -> dict[str, str]:
+    models_for_colors = sorted({run.model for run in selected_runs}, key=natural_key)
+    colors_by_model = model_color_map(models_for_colors)
+    model_seen_counts: dict[str, int] = {}
+    default_colors: dict[str, str] = {}
+
+    for run in selected_runs:
+        occurrence_index = model_seen_counts.get(run.model, 0)
+        model_seen_counts[run.model] = occurrence_index + 1
+        default_colors[run_lookup_key(run)] = trace_color_for_run_hex(
+            run,
+            colors_by_model,
+            occurrence_index,
+        )
+
+    return default_colors
+
+
+def color_for_run_hex(run: ResultRun, default_colors: dict[str, str]) -> str:
+    settings = get_graph_settings(run_lookup_key(run))
+    return settings.get("color") or default_colors.get(run_lookup_key(run), "#1f77b4")
+
+
 # -----------------------------
 # Streamlit app state
 # -----------------------------
@@ -373,8 +495,10 @@ st.caption(
     "decoding schemes, estimators, remasking strategies, and masks."
 )
 
-text_docs = discover_text_documents()
-runs = discover_runs()
+text_docs = discover_text_documents(DISCOVERY_CACHE_VERSION)
+runs = discover_runs(DISCOVERY_CACHE_VERSION, tuple(text_docs))
+result_documents = {r.document for r in runs}
+selectable_documents = [doc for doc in text_docs if doc in result_documents]
 
 if not TEXTS_DIR.exists():
     st.error("Could not find texts/ in the current working directory.")
@@ -395,6 +519,20 @@ if not runs:
     )
     st.stop()
 
+if not selectable_documents:
+    st.error(
+        "No documents in texts/ have corresponding result runs. "
+        "Documents with no results are hidden from the selection."
+    )
+    st.caption(
+        f"Discovery debug: {len(text_docs)} text document(s), "
+        f"{len(runs)} parsed result run(s), "
+        f"{len(result_documents)} parsed result document name(s)."
+    )
+    with st.expander("Parsed result document names"):
+        st.write(sorted(result_documents, key=natural_key))
+    st.stop()
+
 
 # -----------------------------
 # Sidebar controls
@@ -403,10 +541,15 @@ if not runs:
 with st.sidebar:
     st.header("Add graph")
 
-    document = st.selectbox("1. Document", text_docs, index=0)
+    if st.session_state.active_document not in selectable_documents:
+        st.session_state.active_document = selectable_documents[0]
 
-    if st.session_state.active_document is None:
-        st.session_state.active_document = document
+    default_document_index = selectable_documents.index(st.session_state.active_document)
+    document = st.selectbox(
+        "1. Document",
+        selectable_documents,
+        index=default_document_index,
+    )
 
     if document != st.session_state.active_document:
         previous_selected_runs = [
@@ -443,47 +586,49 @@ with st.sidebar:
     doc_runs = runs_for_document(runs, document)
     models = sorted({r.model for r in doc_runs}, key=natural_key)
 
-    if not models:
-        st.warning("No results found for this document.")
-        st.stop()
-
     model = st.selectbox("2. Model θ", models)
 
-    default_runs = default_runs_for_document_and_model(runs, document, model)
-    setup_options = sorted(default_runs, key=lambda r: natural_key(r.setup_label))
+    setup_options = setup_parts_for_document_and_model(runs, document, model)
 
     if not setup_options:
-        st.warning("No non-custom-mask setups found for this model/document.")
+        st.warning("No setups found for this model/document.")
         st.stop()
 
-    setup_labels = [r.setup_label for r in setup_options]
+    setup_labels = [setup_label_from_parts(parts) for parts in setup_options]
     selected_setup_label = st.selectbox("3. Setup", setup_labels)
+    selected_setup_parts = setup_options[setup_labels.index(selected_setup_label)]
 
-    base_run = setup_options[setup_labels.index(selected_setup_label)]
+    setup_runs = runs_for_setup(runs, document, model, selected_setup_parts)
+    default_variants = [r for r in setup_runs if not r.is_custom_mask]
+    mask_variants = [r for r in setup_runs if r.is_custom_mask]
 
-    custom_equivalents = custom_runs_equivalent_to(runs, base_run)
-    custom_equivalents = sorted(
-        custom_equivalents,
-        key=lambda r: natural_key(r.custom_mask or ""),
-    )
+    variant_runs: list[ResultRun] = []
+    variant_labels: list[str] = []
 
-    variant_labels = ["default mask"] + [
-        f"custom mask: {r.custom_mask}"
-        for r in custom_equivalents
-    ]
+    for run in default_variants:
+        variant_runs.append(run)
+        variant_labels.append("no mask")
 
-    selected_variant = st.selectbox("4. Mask variant", variant_labels)
+    for run in mask_variants:
+        variant_runs.append(run)
+        variant_labels.append(f"mask: {run.custom_mask}")
 
-    if selected_variant == "default mask":
-        run_to_add = base_run
+    if not variant_runs:
+        st.warning("No runs found for this setup.")
+        st.stop()
+
+    selected_variant = st.selectbox("4. Mask", variant_labels)
+    run_to_add = variant_runs[variant_labels.index(selected_variant)]
+
+    if mask_variants and not default_variants:
+        st.info(
+            "This setup has LLaDA trajectory masks only. "
+            "Select a mask to add a trajectory run."
+        )
+    elif mask_variants:
+        st.info(f"Found {len(mask_variants)} mask variant(s) for this setup.")
     else:
-        idx = variant_labels.index(selected_variant) - 1
-        run_to_add = custom_equivalents[idx]
-
-    if custom_equivalents:
-        st.info(f"Found {len(custom_equivalents)} custom-mask equivalent(s) for this setup.")
-    else:
-        st.caption("No custom-mask equivalents found for this setup.")
+        st.caption("This setup has no mask variants.")
 
     add_col, clear_col = st.columns(2)
 
@@ -528,7 +673,13 @@ with st.sidebar:
     y_scale = st.radio("Y axis", ["linear", "log"], horizontal=True)
     x_scale = st.radio("X axis scale", ["linear", "log"], horizontal=True)
 
-    scatter_disabled = len(visible_selected_graphs) != 2
+    scatter_pairwise_available = len(visible_selected_graphs) == 2
+    scatter_ar_llada_available = (
+        len(visible_selected_graphs) > 2
+        and scatter_ar_vs_llada_possible(visible_selected_graphs)
+    )
+    scatter_disabled = not (scatter_pairwise_available or scatter_ar_llada_available)
+
     plot_mode = st.radio(
         "Plot mode",
         ["line", "scatter"],
@@ -543,6 +694,13 @@ with st.sidebar:
     x_axis = "window_index"
     if plot_mode != "scatter":
         x_axis = st.radio("X axis", ["window_index", "char_start"], horizontal=True)
+    elif scatter_ar_llada_available:
+        ar_run = next(run for run in visible_selected_graphs if is_ar_run(run))
+        llada_runs = [run for run in visible_selected_graphs if is_llada_model(run.model)]
+        st.info(
+            "Scatter mode compares one AR trajectory against all visible LLaDA trajectories. "
+            "Each LLaDA trajectory is listed separately and keeps its own point color."
+        )
     else:
         st.info("Scatter mode displays p_z values from two visible graphs against each other.")
 
@@ -557,22 +715,41 @@ with st.sidebar:
         value=True,
     )
 
-    if plot_mode == "scatter" and len(visible_selected_graphs) == 2:
-        scatter_axis_labels = [
-            f"{visible_selected_graphs[0].display_label} → x, {visible_selected_graphs[1].display_label} → y",
-            f"{visible_selected_graphs[1].display_label} → x, {visible_selected_graphs[0].display_label} → y",
-        ]
-        selected_axis_label = st.radio(
-            "Scatter axes",
-            scatter_axis_labels,
-            index=st.session_state.scatter_axis_choice,
-        )
-        st.session_state.scatter_axis_choice = scatter_axis_labels.index(selected_axis_label)
+    if plot_mode == "scatter":
+        if scatter_ar_llada_available:
+            ar_run = next(run for run in visible_selected_graphs if is_ar_run(run))
+            llada_runs = [run for run in visible_selected_graphs if is_llada_model(run.model)]
+            scatter_axis_labels = [
+                f"AR: {ar_run.display_label} → x, LLaDA trajectories → y",
+                f"LLaDA trajectories → x, AR: {ar_run.display_label} → y",
+            ]
+            selected_axis_label = st.radio(
+                "Scatter axes",
+                scatter_axis_labels,
+                index=min(st.session_state.scatter_axis_choice, len(scatter_axis_labels) - 1),
+            )
+            st.session_state.scatter_axis_choice = scatter_axis_labels.index(selected_axis_label)
+
+            with st.expander("LLaDA trajectories in scatter"):
+                for run in llada_runs:
+                    st.caption(run.display_label)
+        elif len(visible_selected_graphs) == 2:
+            scatter_axis_labels = [
+                f"{visible_selected_graphs[0].display_label} → x, {visible_selected_graphs[1].display_label} → y",
+                f"{visible_selected_graphs[1].display_label} → x, {visible_selected_graphs[0].display_label} → y",
+            ]
+            selected_axis_label = st.radio(
+                "Scatter axes",
+                scatter_axis_labels,
+                index=min(st.session_state.scatter_axis_choice, len(scatter_axis_labels) - 1),
+            )
+            st.session_state.scatter_axis_choice = scatter_axis_labels.index(selected_axis_label)
 
     st.divider()
     st.header("Discovered")
 
     st.caption(f"Texts: {len(text_docs)}")
+    st.caption(f"Documents with results: {len(selectable_documents)}")
     st.caption(f"Result runs: {len(runs)}")
 
 
@@ -608,9 +785,9 @@ with right:
                 st.caption(run.setup_label)
 
                 if run.custom_mask:
-                    st.caption(f"custom mask: `{run.custom_mask}`")
+                    st.caption(f"mask: `{run.custom_mask}`")
                 else:
-                    st.caption("default mask")
+                    st.caption("no mask")
 
                 settings["visible"] = st.toggle(
                     "Visible",
@@ -711,80 +888,183 @@ with left:
 
     x_run: ResultRun | None = None
     y_run: ResultRun | None = None
+    ar_run_for_scatter: ResultRun | None = None
 
-    scatter_mode = (
+    visible_runs_for_scatter = [run for run, _ in visible_loaded_frames]
+    scatter_ar_llada_mode = (
+        st.session_state.plot_mode == "scatter"
+        and len(visible_loaded_frames) > 2
+        and scatter_ar_vs_llada_possible(visible_runs_for_scatter)
+    )
+    scatter_pairwise_mode = (
         st.session_state.plot_mode == "scatter"
         and len(visible_loaded_frames) == 2
     )
+    scatter_mode = scatter_pairwise_mode or scatter_ar_llada_mode
 
     if scatter_mode:
-        all_models_for_colors = sorted(
-            {r.model for r, _ in visible_loaded_frames},
-            key=natural_key,
-        )
+        default_colors = default_color_lookup_for_runs(visible_runs_for_scatter)
 
-        colors_by_model = model_color_map(all_models_for_colors)
+        if scatter_pairwise_mode:
+            axis_order = st.session_state.scatter_axis_choice
+            x_run, x_df = visible_loaded_frames[axis_order]
+            y_run, y_df = visible_loaded_frames[1 - axis_order]
 
-        axis_order = st.session_state.scatter_axis_choice
-        x_run, x_df = visible_loaded_frames[axis_order]
-        y_run, y_df = visible_loaded_frames[1 - axis_order]
+            trace_color = color_for_run_hex(x_run, default_colors)
 
-        x_settings = get_graph_settings(run_lookup_key(x_run))
-        y_settings = get_graph_settings(run_lookup_key(y_run))
-
-        x_default_color = trace_color_for_run_hex(
-            x_run,
-            colors_by_model,
-            0,
-        )
-        trace_color = x_settings.get("color") or x_default_color
-
-        merged_df = pd.merge(
-            x_df[["window_index", "char_start", "char_end", "p_z"]],
-            y_df[["window_index", "p_z"]],
-            on="window_index",
-            how="inner",
-            suffixes=("_x", "_y"),
-        )
-
-        if x_scale == "log":
-            merged_df = merged_df[merged_df["p_z_x"] > 0].copy()
-        if y_scale == "log":
-            merged_df = merged_df[merged_df["p_z_y"] > 0].copy()
-
-        if merged_df.empty:
-            st.error("Scatter mode could not align the two selected runs by window_index with the requested axis scales.")
-            st.stop()
-
-        customdata = merged_df[
-            ["window_index", "char_start", "char_end", "p_z_x", "p_z_y"]
-        ].to_numpy()
-
-        fig.add_trace(
-            go.Scatter(
-                x=merged_df["p_z_x"],
-                y=merged_df["p_z_y"],
-                mode="markers",
-                name=f"{x_run.display_label} vs {y_run.display_label}",
-                customdata=customdata,
-                marker=dict(color=trace_color, size=8),
-                hovertemplate=(
-                    "<b>%{fullData.name}</b><br>"
-                    f"x: {x_run.display_label}<br>"
-                    f"y: {y_run.display_label}<br>"
-                    "window_index: %{customdata[0]}<br>"
-                    "chars: %{customdata[1]}-%{customdata[2]}<br>"
-                    "p_z_x: %{customdata[3]:.6g}<br>"
-                    "p_z_y: %{customdata[4]:.6g}<extra></extra>"
-                ),
+            merged_df = pd.merge(
+                x_df[["window_index", "char_start", "char_end", "p_z"]],
+                y_df[["window_index", "p_z"]],
+                on="window_index",
+                how="inner",
+                suffixes=("_x", "_y"),
             )
-        )
 
-        if show_reference_line:
+            if x_scale == "log":
+                merged_df = merged_df[merged_df["p_z_x"] > 0].copy()
+            if y_scale == "log":
+                merged_df = merged_df[merged_df["p_z_y"] > 0].copy()
+
+            if merged_df.empty:
+                st.error("Scatter mode could not align the two selected runs by window_index with the requested axis scales.")
+                st.stop()
+
+            customdata = merged_df[
+                ["window_index", "char_start", "char_end", "p_z_x", "p_z_y"]
+            ].to_numpy()
+
+            fig.add_trace(
+                go.Scatter(
+                    x=merged_df["p_z_x"],
+                    y=merged_df["p_z_y"],
+                    mode="markers",
+                    name=f"{x_run.display_label} vs {y_run.display_label}",
+                    customdata=customdata,
+                    marker=dict(color=trace_color, size=8),
+                    hovertemplate=(
+                        "<b>%{fullData.name}</b><br>"
+                        f"x: {x_run.display_label}<br>"
+                        f"y: {y_run.display_label}<br>"
+                        "window_index: %{customdata[0]}<br>"
+                        "chars: %{customdata[1]}-%{customdata[2]}<br>"
+                        "p_z_x: %{customdata[3]:.6g}<br>"
+                        "p_z_y: %{customdata[4]:.6g}<extra></extra>"
+                    ),
+                )
+            )
+
             line_min = float(min(merged_df["p_z_x"].min(), merged_df["p_z_y"].min()))
             line_max = float(max(merged_df["p_z_x"].max(), merged_df["p_z_y"].max()))
-            if x_scale == "log":
-                line_x = np.geomspace(line_min, line_max, num=100)
+            xaxis_title = f"p_z ({x_run.display_label})"
+            yaxis_title = f"p_z ({y_run.display_label})"
+
+        else:
+            frame_by_key = {run_lookup_key(run): (run, df) for run, df in visible_loaded_frames}
+            ar_frames = [(run, df) for run, df in visible_loaded_frames if is_ar_run(run)]
+            llada_frames = [
+                (run, df)
+                for run, df in visible_loaded_frames
+                if is_llada_model(run.model)
+            ]
+
+            ar_run_for_scatter, ar_df = ar_frames[0]
+            ar_on_x = st.session_state.scatter_axis_choice == 0
+
+            all_scatter_values: list[float] = []
+            aligned_any = False
+
+            for llada_run, llada_df in llada_frames:
+                merged_df = pd.merge(
+                    ar_df[["window_index", "char_start", "char_end", "p_z"]],
+                    llada_df[["window_index", "p_z"]],
+                    on="window_index",
+                    how="inner",
+                    suffixes=("_ar", "_llada"),
+                )
+
+                if ar_on_x:
+                    x_values = merged_df["p_z_ar"]
+                    y_values = merged_df["p_z_llada"]
+                    x_label = f"AR: {ar_run_for_scatter.display_label}"
+                    y_label = "LLaDA trajectories"
+                else:
+                    x_values = merged_df["p_z_llada"]
+                    y_values = merged_df["p_z_ar"]
+                    x_label = "LLaDA trajectories"
+                    y_label = f"AR: {ar_run_for_scatter.display_label}"
+
+                plot_df = merged_df.copy()
+                plot_df["scatter_x"] = x_values
+                plot_df["scatter_y"] = y_values
+
+                if x_scale == "log":
+                    plot_df = plot_df[plot_df["scatter_x"] > 0].copy()
+                if y_scale == "log":
+                    plot_df = plot_df[plot_df["scatter_y"] > 0].copy()
+
+                if plot_df.empty:
+                    continue
+
+                aligned_any = True
+                all_scatter_values.extend(plot_df["scatter_x"].astype(float).tolist())
+                all_scatter_values.extend(plot_df["scatter_y"].astype(float).tolist())
+
+                plot_df["ar_run_key"] = run_lookup_key(ar_run_for_scatter)
+                plot_df["llada_run_key"] = run_lookup_key(llada_run)
+
+                customdata = plot_df[
+                    [
+                        "window_index",
+                        "char_start",
+                        "char_end",
+                        "p_z_ar",
+                        "p_z_llada",
+                        "ar_run_key",
+                        "llada_run_key",
+                    ]
+                ].to_numpy()
+
+                trace_color = color_for_run_hex(llada_run, default_colors)
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=plot_df["scatter_x"],
+                        y=plot_df["scatter_y"],
+                        mode="markers",
+                        name=llada_run.display_label,
+                        customdata=customdata,
+                        marker=dict(color=trace_color, size=8),
+                        hovertemplate=(
+                            "<b>%{fullData.name}</b><br>"
+                            f"AR: {ar_run_for_scatter.display_label}<br>"
+                            "window_index: %{customdata[0]}<br>"
+                            "chars: %{customdata[1]}-%{customdata[2]}<br>"
+                            "p_z_AR: %{customdata[3]:.6g}<br>"
+                            "p_z_LLaDA: %{customdata[4]:.6g}<extra></extra>"
+                        ),
+                    )
+                )
+
+            if not aligned_any:
+                st.error("Scatter mode could not align the AR run with any visible LLaDA trajectory by window_index with the requested axis scales.")
+                st.stop()
+
+            line_min = float(min(all_scatter_values))
+            line_max = float(max(all_scatter_values))
+            xaxis_title = f"p_z ({x_label})"
+            yaxis_title = f"p_z ({y_label})"
+
+        if show_reference_line:
+            if x_scale == "log" or y_scale == "log":
+                positive_values = [value for value in [line_min, line_max] if value > 0]
+                positive_min = min(positive_values) if positive_values else np.nextafter(0, 1)
+                positive_max = max(positive_values) if positive_values else 1.0
+                if positive_max <= positive_min:
+                    line_x = np.array([positive_min, positive_max])
+                else:
+                    line_x = np.geomspace(positive_min, positive_max, num=100)
+            elif line_max <= line_min:
+                line_x = np.array([line_min, line_max])
             else:
                 line_x = np.linspace(line_min, line_max, num=100)
             fig.add_trace(
@@ -801,8 +1081,8 @@ with left:
         fig.update_layout(
             height=700,
             margin=dict(l=90, r=40, t=60, b=90),
-            xaxis_title=dict(text=f"p_z ({x_run.display_label})", standoff=22),
-            yaxis_title=dict(text=f"p_z ({y_run.display_label})", standoff=28),
+            xaxis_title=dict(text=xaxis_title, standoff=22),
+            yaxis_title=dict(text=yaxis_title, standoff=28),
             legend_title="Runs",
             hovermode="closest",
             legend=dict(
@@ -921,6 +1201,7 @@ with left:
         override_height=700,
         key=(
             f"plot_{document}_{y_scale}_{x_scale}_{x_axis}_{len(selected_runs)}_"
+            f"{st.session_state.plot_mode}_{st.session_state.scatter_axis_choice}_"
             f"{hash(str(st.session_state.graph_settings))}"
         ),
     )
@@ -938,17 +1219,15 @@ with left:
 
         if customdata is not None and curve_number is not None:
             if scatter_mode:
-                if len(customdata) != 5:
-                    st.warning("Clicked item does not correspond to a data trace.")
-                else:
+                if scatter_pairwise_mode and len(customdata) == 5:
                     window_index, char_start, char_end, p_z_x, p_z_y = customdata
-                    run = x_run
-                    p_z = float(p_z_x)
                     window_label = f"{x_run.display_label} vs {y_run.display_label}" if x_run and y_run else "scatter trace"
 
                     window_index = int(window_index)
                     char_start = int(char_start)
                     char_end = int(char_end)
+                    p_z_x = float(p_z_x)
+                    p_z_y = float(p_z_y)
 
                     full_text = load_text(document)
                     chunk = full_text[char_start:char_end]
@@ -956,18 +1235,21 @@ with left:
                     st.divider()
                     st.subheader("Clicked window")
 
-                    c1, c2, c3, c4 = st.columns(4)
+                    c1, c2, c3, c4, c5 = st.columns(5)
 
                     c1.metric("window_index", window_index)
                     c2.metric("char_start", char_start)
                     c3.metric("char_end", char_end)
                     c4.metric("p_z_x", f"{p_z_x:.6g}")
+                    c5.metric("p_z_y", f"{p_z_y:.6g}")
 
                     with st.container(border=True):
                         st.markdown("**Run**")
                         st.write(window_label)
                         if x_run:
                             st.code(str(x_run.path), language="text")
+                        if y_run:
+                            st.code(str(y_run.path), language="text")
 
                     st.markdown("**Text chunk used before tokenization**")
 
@@ -977,6 +1259,59 @@ with left:
                         height=260,
                         label_visibility="collapsed",
                     )
+                elif scatter_ar_llada_mode and len(customdata) == 7:
+                    (
+                        window_index,
+                        char_start,
+                        char_end,
+                        p_z_ar,
+                        p_z_llada,
+                        ar_run_key,
+                        llada_run_key,
+                    ) = customdata
+
+                    ar_run_clicked = get_run_by_key(runs, str(ar_run_key))
+                    llada_run_clicked = get_run_by_key(runs, str(llada_run_key))
+
+                    window_index = int(window_index)
+                    char_start = int(char_start)
+                    char_end = int(char_end)
+                    p_z_ar = float(p_z_ar)
+                    p_z_llada = float(p_z_llada)
+
+                    full_text = load_text(document)
+                    chunk = full_text[char_start:char_end]
+
+                    st.divider()
+                    st.subheader("Clicked window")
+
+                    c1, c2, c3, c4, c5 = st.columns(5)
+
+                    c1.metric("window_index", window_index)
+                    c2.metric("char_start", char_start)
+                    c3.metric("char_end", char_end)
+                    c4.metric("p_z_AR", f"{p_z_ar:.6g}")
+                    c5.metric("p_z_LLaDA", f"{p_z_llada:.6g}")
+
+                    with st.container(border=True):
+                        st.markdown("**Runs**")
+                        if ar_run_clicked is not None:
+                            st.write(f"AR: {ar_run_clicked.display_label}")
+                            st.code(str(ar_run_clicked.path), language="text")
+                        if llada_run_clicked is not None:
+                            st.write(f"LLaDA: {llada_run_clicked.display_label}")
+                            st.code(str(llada_run_clicked.path), language="text")
+
+                    st.markdown("**Text chunk used before tokenization**")
+
+                    st.text_area(
+                        "chunk",
+                        value=chunk,
+                        height=260,
+                        label_visibility="collapsed",
+                    )
+                else:
+                    st.warning("Clicked item does not correspond to a data trace.")
             else:
                 # If threshold hline or another shape gets clicked,
                 # curveNumber may not map to visible_loaded_frames.

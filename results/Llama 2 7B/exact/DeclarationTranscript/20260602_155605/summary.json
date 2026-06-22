@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/DeclarationTranscript.txt",
+  "total_chars": 8133,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llama2",
+    "model_name": "NousResearch/Llama-2-7b-hf",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 1261,
+  "num_windows_scored": 1261,
+  "num_windows_extracted": 1129,
+  "extraction_rate": 0.8953211736716892,
+  "p_z_distribution": {
+    "min": 0.0,
+    "median": 0.06246414905500186,
+    "mean": 0.13446603990284786,
+    "max": 0.8141520605683142,
+    "q_0.9": 0.3749330275455157,
+    "q_0.99": 0.7682284745988606,
+    "q_0.999": 0.8009490403369338
+  }
+}

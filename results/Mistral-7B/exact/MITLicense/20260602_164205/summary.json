@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/MITLicense.txt",
+  "total_chars": 1023,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "mistral",
+    "model_name": "mistralai/Mistral-7B-v0.1",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 93,
+  "num_windows_scored": 93,
+  "num_windows_extracted": 93,
+  "extraction_rate": 1.0,
+  "p_z_distribution": {
+    "min": 0.1796989541583087,
+    "median": 0.7211324245348202,
+    "mean": 0.6803653400113994,
+    "max": 0.946646181608743,
+    "q_0.9": 0.9033211849675862,
+    "q_0.99": 0.9439213500629182,
+    "q_0.999": 0.9463736984541605
+  }
+}

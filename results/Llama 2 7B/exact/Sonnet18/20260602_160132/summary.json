@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/Sonnet18.txt",
+  "total_chars": 622,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "llama2",
+    "model_name": "NousResearch/Llama-2-7b-hf",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 55,
+  "num_windows_scored": 55,
+  "num_windows_extracted": 17,
+  "extraction_rate": 0.3090909090909091,
+  "p_z_distribution": {
+    "min": 6.45749927951942e-05,
+    "median": 0.0003691745424911622,
+    "mean": 0.0011691303613581994,
+    "max": 0.007051424948646583,
+    "q_0.9": 0.003711535726579908,
+    "q_0.99": 0.00594932345211116,
+    "q_0.999": 0.006941214798993036
+  }
+}

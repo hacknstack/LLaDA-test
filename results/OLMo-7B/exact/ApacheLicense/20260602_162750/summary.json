@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/ApacheLicense.txt",
+  "total_chars": 10596,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "olmo",
+    "model_name": "allenai/OLMo-7B-0724-hf",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 1424,
+  "num_windows_scored": 1424,
+  "num_windows_extracted": 1376,
+  "extraction_rate": 0.9662921348314607,
+  "p_z_distribution": {
+    "min": 0.0,
+    "median": 0.5606992090144964,
+    "mean": 0.490138340654381,
+    "max": 0.9857129502408702,
+    "q_0.9": 0.905165099346001,
+    "q_0.99": 0.9709426115756605,
+    "q_0.999": 0.9826158849034956
+  }
+}

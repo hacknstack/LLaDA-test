@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/ISCLicense.txt",
+  "total_chars": 696,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "path_sampling",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "low-confidence",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 33,
+  "num_windows_scored": 33,
+  "num_windows_extracted": 1,
+  "extraction_rate": 0.030303030303030304,
+  "p_z_distribution": {
+    "min": 2.5070467140749634e-98,
+    "median": 9.940919538883624e-22,
+    "mean": 3.87843748546353e-05,
+    "max": 0.0012794627800864944,
+    "q_0.9": 1.4714737039486592e-08,
+    "q_0.99": 0.0008701568233219147,
+    "q_0.999": 0.0012385321844100364
+  }
+}

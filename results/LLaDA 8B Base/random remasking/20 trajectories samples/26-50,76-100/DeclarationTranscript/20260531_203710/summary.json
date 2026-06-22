@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/DeclarationTranscript.txt",
+  "total_chars": 8133,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "path_sampling",
+    "model_family": "llada",
+    "model_name": "GSAI-ML/LLaDA-8B-Base",
+    "remasking": "random",
+    "decoding_scheme": "full",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 1250,
+  "num_windows_scored": 1250,
+  "num_windows_extracted": 30,
+  "extraction_rate": 0.024,
+  "p_z_distribution": {
+    "min": 1.3179240174377923e-57,
+    "median": 7.153475120306482e-29,
+    "mean": 0.00011945770969753122,
+    "max": 0.016725218999322656,
+    "q_0.9": 1.4570101098363795e-07,
+    "q_0.99": 0.003611425910858195,
+    "q_0.999": 0.01364791913855415
+  }
+}

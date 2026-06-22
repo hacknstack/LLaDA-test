@@ -1,0 +1,32 @@
+{
+  "input_file": "LLaDA-test/texts/GenesisNumbered.txt",
+  "total_chars": 17302,
+  "parameters": {
+    "chunk_chars": 800,
+    "stride_words": 1,
+    "seq_tokens": 100,
+    "prefix_tokens": 50,
+    "suffix_tokens": 50,
+    "tau_min": 0.001,
+    "mode": "exact",
+    "model_family": "olmo",
+    "model_name": "allenai/OLMo-7B-0724-hf",
+    "remasking": "low-confidence",
+    "decoding_scheme": "top_k",
+    "k": 40,
+    "temperature": 1.0
+  },
+  "num_windows_total": 3336,
+  "num_windows_scored": 3336,
+  "num_windows_extracted": 2548,
+  "extraction_rate": 0.7637889688249401,
+  "p_z_distribution": {
+    "min": 0.0,
+    "median": 0.029275050553385737,
+    "mean": 0.11101686845582728,
+    "max": 0.8297922318325819,
+    "q_0.9": 0.3689894577352192,
+    "q_0.99": 0.6899807079410453,
+    "q_0.999": 0.8085204324421292
+  }
+}
