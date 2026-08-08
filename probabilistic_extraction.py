@@ -2241,20 +2241,16 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
     NUMERICAL STRATEGY
     ------------------
-    For A100/H100 efficiency:
-      - model forward stays in the model's native dtype;
-      - full-vocabulary probability/sort/CDF calculations use FP32;
-      - the much smaller path-level calculations use FP64:
-          * sum_j log F_j
-          * log a_i
-          * log A
-          * q
-          * trajectory log weights
-          * Monte Carlo averaging
+    This version is intentionally FULL FP64:
+      - all floating-point model parameters/buffers are converted to FP64;
+      - autocast is disabled around the model forward;
+      - model logits are required to be FP64;
+      - all full-vocabulary normalizers, sorting, CDFs, confidence thresholds,
+        successful-transition probabilities, proposal probabilities,
+        trajectory log weights, and Monte Carlo averaging are FP64;
       - all multiplicative probabilities are accumulated in log-space.
 
-    This avoids expensive full-vocabulary FP64 tensors while retaining FP64
-    where accumulated numerical error matters most.
+    WARNING: this is extremely memory- and compute-intensive for an 8B model.
 
     Assumptions:
       - sequence_tokens has shape [1, 100];
@@ -2264,6 +2260,11 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     """
 
     device = _model_device(model)
+
+    # FULL FP64: convert every floating-point model parameter/buffer to float64.
+    # nn.Module.double() mutates the module in-place and returns it.
+    model = model.double()
+
     sequence_tokens = sequence_tokens.to(device)
 
     # ------------------------------------------------------------------
@@ -2438,13 +2439,29 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         # Model forward
         # --------------------------------------------------------------
 
-        outputs = model(
-            x,
-            attention_mask=batched_attn,
-        )
+        # FULL FP64: an outer autocast context must not silently reduce
+        # precision for the model forward.
+        if device.type in {"cuda", "cpu"}:
+            with torch.autocast(device_type=device.type, enabled=False):
+                outputs = model(
+                    x,
+                    attention_mask=batched_attn,
+                )
+        else:
+            outputs = model(
+                x,
+                attention_mask=batched_attn,
+            )
 
         logits = outputs.logits
         # [bsz, 100, vocab]
+
+        if logits.dtype != torch.float64:
+            raise RuntimeError(
+                "Full-FP64 estimator expected model logits in torch.float64, "
+                f"but got {logits.dtype}. The model/attention implementation "
+                "is casting internally to a lower precision."
+            )
 
         vocab_size = logits.shape[-1]
 
@@ -2488,14 +2505,13 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             device=device,
         ).unsqueeze(1)
 
-        # Extract only logits at currently masked positions and immediately
-        # promote to fp32.
+        # Extract only logits at currently masked positions. They remain FP64.
         active_logits = logits[
             batch_ids,
             active_abs_positions,
             :,
-        ].float()
-        # [bsz, m, vocab], FP32
+        ].to(dtype=torch.float64)
+        # [bsz, m, vocab], FP64
 
         del outputs
         del logits
@@ -2518,7 +2534,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             active_logits,
             dim=-1,
         )
-        # [bsz, m], fp32
+        # [bsz, m], FP64
 
         if tau == 1.0:
             # Exact same distribution; avoid a second vocab reduction.
@@ -2528,7 +2544,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                 active_logits / tau,
                 dim=-1,
             )
-            # [bsz, m], fp32
+            # [bsz, m], FP64
 
         # Target raw logits l_i(z_i).
         target_raw_logits = torch.gather(
@@ -2543,14 +2559,14 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             target_raw_logits / tau
             - log_Z_sample
         )
-        # [bsz, m], fp32
+        # [bsz, m], FP64
 
         # log c_i^* = log c_i(z_i):
         target_conf_log_probs = (
             target_raw_logits
             - log_Z_conf
         )
-        # [bsz, m], fp32
+        # [bsz, m], FP64
 
         highest_possible_active = None
         highest_sampled_active = None
@@ -2615,16 +2631,16 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
         # Numerically CDF <= 1, so log CDF <= 0.
         log_cdf.clamp_max_(0.0)
-        # [bsz, m, vocab], fp32
+        # [bsz, m, vocab], FP64
 
         if verbose:
             if sample_on_device:
                 diagnostic_uniform = torch.rand(
-                    (bsz, m), device=device, generator=diagnostic_rng
+                    (bsz, m), device=device, dtype=torch.float64, generator=diagnostic_rng
                 )
             else:
                 diagnostic_uniform = torch.rand(
-                    (bsz, m), device='cpu', generator=diagnostic_rng
+                    (bsz, m), device='cpu', dtype=torch.float64, generator=diagnostic_rng
                 ).to(device)
             sampled_sorted_slots = torch.searchsorted(
                 log_cdf, diagnostic_uniform.log().unsqueeze(-1), right=False
@@ -2667,7 +2683,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             log_Z_conf.unsqueeze(2)
             + target_conf_log_probs.unsqueeze(1)
         ).contiguous()
-        # [bsz, m, m], fp32
+        # [bsz, m, m], FP64
 
         # Strict inequality:
         #
@@ -2691,7 +2707,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             dim=-1,
             index=gather_idx,
         )
-        # [bsz, m, m], fp32
+        # [bsz, m, m], FP64
         #
         # dimension 1 = competitor j
         # dimension 2 = proposed successful winner i
@@ -2766,7 +2782,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         )
 
         # --------------------------------------------------------------
-        # From here onward, switch to FP64.
+        # All tensors here are already FP64.
         #
         # This tensor is only [bsz, m, m], which is tiny relative to
         # [bsz, m, vocab].
@@ -3163,7 +3179,6 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
     result['verbose_samples'] = verbose_samples if verbose else None
 
-    return result
 
 @torch.inference_mode()
 def _path_sampling_low_confidence_probability(
