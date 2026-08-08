@@ -4702,7 +4702,7 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     temperature: float,
     decoding_scheme: str,
     k: int,
-    mc_batch_size: int = 32,
+    mc_batch_size: int = 64,
 ) -> MonteCarloResult:
     """
     Naive Monte Carlo estimator for one-token-per-step low-confidence remasking.
