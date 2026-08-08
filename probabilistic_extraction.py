@@ -2185,7 +2185,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     num_samples: int,
     seed: Optional[int],
     temperature: float,
-    batch_size: int = 64,
+    batch_size: int = 4,
     validate_no_ties: bool = False,
     return_samples: bool = True,
     verbose: bool = False,
