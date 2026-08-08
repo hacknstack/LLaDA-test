@@ -2190,6 +2190,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     return_samples: bool = True,
     verbose: bool = False,
     verbose_compact: bool = False,
+    use_state_cache: bool = True,
 ) -> Dict[str, object]:
     """
     Fast successful-trajectory estimator for low-confidence remasking.
@@ -2248,6 +2249,16 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         confidence thresholds, successful-transition probabilities, proposal
         probabilities, trajectory log weights, and Monte Carlo averaging are FP64;
       - all multiplicative probabilities are accumulated in log-space.
+
+    STATE CACHE
+    -----------
+    When use_state_cache=True, log a(S) is memoized by the 50-bit revealed-set
+    state S.  Identical states are deduplicated within a Monte Carlo batch and
+    reused across later batches, so the model is evaluated only once per unique
+    state encountered.  The cache stores only a 50-element FP64 log-a vector per
+    state.  Caching is automatically disabled when verbose=True (to preserve the
+    diagnostic RNG/records) or model.training=True (because stochastic training-
+    mode forwards would make log a(S) state-nondeterministic).
 
     TIE BREAKING
     ------------
@@ -2404,11 +2415,55 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
     num_accumulated = 0
 
+    # ------------------------------------------------------------------
+    # Small static tensors reused at every denoising step.  Keeping these
+    # outside the hot loop avoids repeated CUDA allocations/kernel launches.
+    # ------------------------------------------------------------------
+    max_bsz = min(batch_size, num_samples)
+    slot_grid_base = torch.arange(
+        masked_len, dtype=torch.long, device=device
+    ).unsqueeze(0)
+    batch_ids_base = torch.arange(
+        max_bsz, dtype=torch.long, device=device
+    ).unsqueeze(1)
+    eye_base = torch.eye(
+        masked_len, dtype=torch.bool, device=device
+    )
+    tie_denominators_log_base = torch.arange(
+        1, masked_len + 1, dtype=torch.float64, device=device
+    ).log()
+    reveal_true_base = torch.ones(
+        (max_bsz, 1), dtype=torch.bool, device=device
+    )
+
+    # Each revealed-set state S fits in 50 bits.  Keeping a compact state id
+    # lets us memoize log a(S) without transferring the full [50] boolean mask
+    # to the CPU for every trajectory and step.
+    state_bit_values = torch.bitwise_left_shift(
+        torch.ones(masked_len, dtype=torch.int64, device=device),
+        torch.arange(masked_len, dtype=torch.int64, device=device),
+    )
+
+    # Cache values stay on the model device.  Each entry is only 50 * 8 bytes.
+    # Caching is not behavior-preserving for stochastic training-mode forwards,
+    # and verbose mode consumes a separate diagnostic RNG stream, so disable it
+    # in those two cases.
+    cache_enabled = bool(
+        use_state_cache
+        and not verbose
+        and not bool(getattr(model, "training", False))
+    )
+    state_log_a_cache: Dict[int, torch.Tensor] = {}
+    cache_requests = 0
+    cache_hits = 0
+    cache_misses = 0
+    cache_forward_rows_saved = 0
+
     # ==================================================================
     # Compute log a_i(S)
     # ==================================================================
 
-    def compute_log_a_for_batch(
+    def _compute_log_a_for_batch_uncached(
         x: torch.Tensor,              # [bsz, 100]
         revealed: torch.Tensor,       # [bsz, 50]
         alive: torch.Tensor,          # [bsz]
@@ -2471,14 +2526,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         # one slot is marked revealed at every step, including dead rows.
         # --------------------------------------------------------------
 
-        slot_grid = torch.arange(
-            masked_len,
-            dtype=torch.long,
-            device=device,
-        ).unsqueeze(0).expand(
-            bsz,
-            -1,
-        )
+        slot_grid = slot_grid_base.expand(bsz, -1)
 
         active_slots = slot_grid[
             unrevealed
@@ -2498,23 +2546,25 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         ]
         # [bsz, m]
 
-        batch_ids = torch.arange(
-            bsz,
-            dtype=torch.long,
-            device=device,
-        ).unsqueeze(1)
+        batch_ids = batch_ids_base[:bsz]
 
-        # Extract only logits at currently masked positions and immediately
-        # promote this much smaller tensor to FP64.
-        active_logits = logits[
+        # Keep the active-position copy in the model's native dtype first.
+        # A widening cast to FP64 preserves the exact value ordering and exact
+        # ties of FP16/BF16/FP32 logits, so the expensive vocabulary sort can
+        # later be done in the native dtype without changing confidence order.
+        active_logits_native = logits[
             batch_ids,
             active_abs_positions,
             :,
-        ].to(dtype=torch.float64)
-        # [bsz, m, vocab], FP64
+        ]
+        # [bsz, m, vocab], model-native dtype
 
         del outputs
         del logits
+
+        # Probability calculations remain FP64.
+        active_logits = active_logits_native.to(dtype=torch.float64)
+        # [bsz, m, vocab], FP64
 
         # --------------------------------------------------------------
         # Normalizers for confidence and sampling distributions
@@ -2568,6 +2618,51 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         )
         # [bsz, m], FP64
 
+        # --------------------------------------------------------------
+        # Final-step fast path.  With one masked position there are no
+        # competitors, so the successful-transition probability is simply
+        # p_i(z_i | S).  Sorting/CDF/tie machinery would be pure overhead.
+        # --------------------------------------------------------------
+        if m == 1:
+            log_a_active = target_sample_log_probs
+            log_product = torch.zeros_like(log_a_active)
+            target_sample_log_probs_64 = target_sample_log_probs
+
+            log_a_full = torch.full(
+                (bsz, masked_len),
+                float("-inf"),
+                dtype=torch.float64,
+                device=device,
+            )
+            log_a_full.scatter_(
+                dim=1,
+                index=active_slots,
+                src=log_a_active,
+            )
+            log_a_full.masked_fill_(~alive.unsqueeze(-1), float("-inf"))
+
+            verbose_batch = None
+            if verbose:
+                active_alive = alive.unsqueeze(-1)
+                only_position = torch.ones(
+                    (bsz, 1), dtype=torch.bool, device=device
+                )
+                verbose_batch = {
+                    'sequence_indices': (active_abs_positions + 1).detach().cpu(),
+                    'log_a_active': log_a_active.detach().cpu(),
+                    'target_sample_log_probs_64': target_sample_log_probs_64.detach().cpu(),
+                    'log_product': log_product.detach().cpu(),
+                    'highest_possible': (only_position & active_alive).detach().cpu(),
+                    'highest_sampled': (only_position & active_alive).detach().cpu(),
+                    'tie_count': torch.zeros(
+                        bsz, dtype=torch.long, device=device
+                    ).detach().cpu(),
+                }
+
+            del active_logits
+            del active_logits_native
+            return log_a_full, verbose_batch
+
         highest_possible_active = None
         highest_sampled_active = None
         if verbose:
@@ -2590,16 +2685,21 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         # Crucially this ordering is also independent of temperature.
         # --------------------------------------------------------------
 
-        sorted_logits, sort_indices = torch.sort(
-            active_logits,
-            dim=-1,
-        )
-        # [bsz, m, vocab]
-
-        # We do not need the indices because p_j(v) is also monotone in the
-        # same raw logits for every tau > 0.
-        del sort_indices
+        # The normalizers/target probabilities above needed FP64, but the sort
+        # only needs the ordering.  Sorting before widening is substantially
+        # cheaper on GPU and is behavior-preserving because conversion from the
+        # model dtype to FP64 is exact and monotone.
         del active_logits
+
+        sorted_logits_native = torch.sort(
+            active_logits_native,
+            dim=-1,
+        ).values
+        del active_logits_native
+
+        sorted_logits = sorted_logits_native.to(dtype=torch.float64)
+        del sorted_logits_native
+        # [bsz, m, vocab], FP64
 
         # --------------------------------------------------------------
         # Build the CDF under the SAMPLING distribution.
@@ -2715,16 +2815,8 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         )
 
         # Exact CDF endpoints.
-        log_L = torch.where(
-            left_idx == 0,
-            torch.full_like(log_L, float("-inf")),
-            log_L,
-        )
-        log_L = torch.where(
-            left_idx == vocab_size,
-            torch.zeros_like(log_L),
-            log_L,
-        )
+        log_L.masked_fill_(left_idx == 0, float("-inf"))
+        log_L.masked_fill_(left_idx == vocab_size, 0.0)
         # [bsz, competitor j, proposed winner i], FP64
 
         # --------------------------------------------------------------
@@ -2738,119 +2830,116 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         equal_count = right_idx - left_idx
         has_equal = equal_count > 0
 
-        equal_gather_idx = left_idx.clamp(
-            min=0,
-            max=vocab_size - 1,
-        )
-        equal_raw_logit = torch.gather(
-            sorted_logits,
-            dim=-1,
-            index=equal_gather_idx,
-        )
-
-        log_E = (
-            equal_count.clamp_min(1).to(torch.float64).log()
-            + equal_raw_logit / tau
-            - log_Z_sample.unsqueeze(2)
-        )
-        log_E = torch.where(
-            has_equal,
-            log_E,
-            torch.full_like(log_E, float("-inf")),
-        )
-        # [bsz, competitor j, proposed winner i], FP64
-
         # --------------------------------------------------------------
         # Exclude j == i from the competitor set.  The neutral factor is
-        # L=1, E=0: the proposed winner does not compete against itself.
+        # L=1.  Cross-position exact ties are usually absent, so detect them
+        # before constructing E or the O(m^3) tie-count dynamic program.
         # --------------------------------------------------------------
 
-        eye_m = torch.eye(
-            m,
-            dtype=torch.bool,
-            device=device,
-        ).unsqueeze(0)
+        eye_m = eye_base[:m, :m].unsqueeze(0)
+        log_L.masked_fill_(eye_m, 0.0)
 
-        log_L = torch.where(
-            eye_m,
-            torch.zeros_like(log_L),
-            log_L,
-        )
-        log_E = torch.where(
-            eye_m,
-            torch.full_like(log_E, float("-inf")),
-            log_E,
-        )
+        cross_tie_mask = has_equal & (~eye_m)
+        has_cross_tie = bool(cross_tie_mask.any().item())
 
-        # Diagnostic count: number of (competitor j, proposed i) relations for
-        # which the competitor has positive probability mass exactly at c_i*.
         tie_count = torch.zeros(bsz, dtype=torch.long, device=device)
-        if verbose:
-            positive_tie = (
-                has_equal
-                & (~eye_m)
-                & alive.view(bsz, 1, 1)
-            )
-            tie_count = positive_tie.sum(dim=(1, 2))
+        if verbose and has_cross_tie:
+            tie_count = (
+                cross_tie_mask & alive.view(bsz, 1, 1)
+            ).sum(dim=(1, 2))
 
         # validate_no_ties is deliberately ignored.  It remains in the public
-        # signature only so existing callers do not break; ties are now handled
-        # by exact uniform tie-breaking rather than rejected.
+        # signature only so existing callers do not break; ties are handled by
+        # exact uniform tie-breaking.
         _ = validate_no_ties
 
-        # --------------------------------------------------------------
-        # Exact uniform tie-breaking probability.
-        #
-        # For proposed winner i, let K be the number of competitors whose
-        # sampled confidence equals c_i*.  Conditional on no competitor being
-        # above c_i*, i wins with probability 1/(K+1).  Therefore
-        #
-        #   W_i = sum_k P(K=k and no competitor > c_i*) / (k+1).
-        #
-        # We compute the distribution over K with a log-space dynamic program.
-        # dp[..., k] stores the log probability that, among competitors processed
-        # so far, exactly k tie and all remaining processed competitors are below.
-        # Shape is [bsz, proposed winner i, tie count k].
-        # --------------------------------------------------------------
+        if not has_cross_tie:
+            # Fast path: with no cross-position tie mass, uniform tie-breaking
+            # reduces exactly to the original strict-order product.  Accumulate
+            # in competitor order to preserve the same FP64 operation ordering
+            # as the k=0 branch of the full dynamic program, but only over a
+            # [bsz, m] tensor instead of [bsz, m, m].
+            log_uniform_win_mass = torch.zeros(
+                (bsz, m), dtype=torch.float64, device=device
+            )
+            for competitor_j in range(m):
+                log_uniform_win_mass = (
+                    log_uniform_win_mass + log_L[:, competitor_j, :]
+                )
 
-        log_dp = torch.full(
-            (bsz, m, m),
-            float("-inf"),
-            dtype=torch.float64,
-            device=device,
-        )
-        log_dp[:, :, 0] = 0.0
+            log_E = None
+            log_dp = None
+            log_L_by_i = None
+            log_E_by_i = None
 
-        # Reorder to [bsz, proposed i, competitor j] for convenient indexing.
-        log_L_by_i = log_L.transpose(1, 2).contiguous()
-        log_E_by_i = log_E.transpose(1, 2).contiguous()
+        else:
+            # ----------------------------------------------------------
+            # E_{j,i} = P(confidence == c*) in log-space.
+            #
+            # All vocabulary entries in [left_idx, right_idx) have the same raw
+            # logit, so their sampling probabilities are equal.  Computing the
+            # tie mass as count * p(one tied token) avoids subtracting nearly
+            # equal CDFs.
+            # ----------------------------------------------------------
 
-        for competitor_j in range(m):
-            log_l = log_L_by_i[:, :, competitor_j].unsqueeze(-1)
-            log_e = log_E_by_i[:, :, competitor_j].unsqueeze(-1)
-
-            stay_below = log_dp + log_l
-
-            become_tie = torch.full_like(log_dp, float("-inf"))
-            become_tie[:, :, 1:] = log_dp[:, :, :-1] + log_e
-
-            log_dp = torch.logaddexp(
-                stay_below,
-                become_tie,
+            equal_gather_idx = left_idx.clamp(
+                min=0,
+                max=vocab_size - 1,
+            )
+            equal_raw_logit = torch.gather(
+                sorted_logits,
+                dim=-1,
+                index=equal_gather_idx,
             )
 
-        tie_denominators = torch.arange(
-            1,
-            m + 1,
-            dtype=torch.float64,
-            device=device,
-        ).log()
+            log_E = (
+                equal_count.clamp_min(1).to(torch.float64).log()
+                + equal_raw_logit / tau
+                - log_Z_sample.unsqueeze(2)
+            )
+            log_E.masked_fill_(~has_equal, float("-inf"))
+            log_E.masked_fill_(eye_m, float("-inf"))
 
-        log_uniform_win_mass = torch.logsumexp(
-            log_dp - tie_denominators.view(1, 1, m),
-            dim=-1,
-        )
-        # [bsz, proposed winner i], FP64
+            # ----------------------------------------------------------
+            # Exact uniform tie-breaking probability.
+            #
+            # For proposed winner i, let K be the number of competitors whose
+            # sampled confidence equals c_i*.  Conditional on no competitor
+            # being above c_i*, i wins with probability 1/(K+1).
+            # ----------------------------------------------------------
+
+            log_dp = torch.full(
+                (bsz, m, m),
+                float("-inf"),
+                dtype=torch.float64,
+                device=device,
+            )
+            log_dp[:, :, 0] = 0.0
+
+            # transpose() is only a view; contiguous copies are unnecessary.
+            log_L_by_i = log_L.transpose(1, 2)
+            log_E_by_i = log_E.transpose(1, 2)
+
+            for competitor_j in range(m):
+                log_l = log_L_by_i[:, :, competitor_j].unsqueeze(-1)
+                log_e = log_E_by_i[:, :, competitor_j].unsqueeze(-1)
+
+                stay_below = log_dp + log_l
+
+                become_tie = torch.full_like(log_dp, float("-inf"))
+                become_tie[:, :, 1:] = log_dp[:, :, :-1] + log_e
+
+                log_dp = torch.logaddexp(
+                    stay_below,
+                    become_tie,
+                )
+
+            log_uniform_win_mass = torch.logsumexp(
+                log_dp
+                - tie_denominators_log_base[:m].view(1, 1, m),
+                dim=-1,
+            )
+            # [bsz, proposed winner i], FP64
 
         log_a_active = (
             target_sample_log_probs
@@ -2868,10 +2957,11 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         del sorted_logits
         del log_cdf
         del log_L
-        del log_E
-        del log_dp
-        del log_L_by_i
-        del log_E_by_i
+        if has_cross_tie:
+            del log_E
+            del log_dp
+            del log_L_by_i
+            del log_E_by_i
 
         # --------------------------------------------------------------
         # Scatter back into the fixed 50-slot representation.
@@ -2891,14 +2981,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         )
 
         # Dead trajectories have zero contribution.
-        log_a_full = torch.where(
-            alive.unsqueeze(-1),
-            log_a_full,
-            torch.full_like(
-                log_a_full,
-                float("-inf"),
-            ),
-        )
+        log_a_full.masked_fill_(~alive.unsqueeze(-1), float("-inf"))
 
         verbose_batch = None
         if verbose:
@@ -2918,6 +3001,110 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             }
 
         return log_a_full, verbose_batch
+
+    def compute_log_a_for_batch(
+        x: torch.Tensor,
+        revealed: torch.Tensor,
+        alive: torch.Tensor,
+        num_unrevealed: int,
+        state_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+        """Memoized wrapper around the expensive state evaluation.
+
+        The mathematical state is exactly the revealed subset S because all
+        revealed positions are fixed to their target z_i and all unrevealed
+        positions remain masked.  Therefore log a(S) can be reused whenever the
+        same 50-bit state id is encountered, irrespective of reveal order.
+        """
+        nonlocal cache_requests, cache_hits, cache_misses, cache_forward_rows_saved
+
+        if not cache_enabled:
+            return _compute_log_a_for_batch_uncached(
+                x=x,
+                revealed=revealed,
+                alive=alive,
+                num_unrevealed=num_unrevealed,
+            )
+
+        bsz = x.shape[0]
+        out = torch.full(
+            (bsz, masked_len),
+            float("-inf"),
+            dtype=torch.float64,
+            device=device,
+        )
+
+        live_rows_t = torch.nonzero(alive, as_tuple=False).squeeze(-1)
+        num_live = int(live_rows_t.numel())
+        if num_live == 0:
+            return out, None
+
+        # One compact synchronization per step/batch.  This is much cheaper than
+        # repeated 8B forwards and transfers only one int64 per live trajectory.
+        live_rows = live_rows_t.detach().cpu().tolist()
+        live_state_ids = state_ids[live_rows_t].detach().cpu().tolist()
+        cache_requests += num_live
+
+        # Group rows by state while preserving first-occurrence order.
+        rows_by_state: Dict[int, List[int]] = {}
+        for row, state_id in zip(live_rows, live_state_ids):
+            key = int(state_id)
+            rows_by_state.setdefault(key, []).append(int(row))
+
+        missing_keys: List[int] = []
+        representative_rows: List[int] = []
+        for key, rows in rows_by_state.items():
+            cached = state_log_a_cache.get(key)
+            if cached is not None:
+                row_idx = torch.tensor(rows, dtype=torch.long, device=device)
+                out.index_copy_(
+                    0,
+                    row_idx,
+                    cached.unsqueeze(0).expand(len(rows), -1),
+                )
+                cache_hits += len(rows)
+                cache_forward_rows_saved += len(rows)
+            else:
+                missing_keys.append(key)
+                representative_rows.append(rows[0])
+                # One representative row requires computation.  Additional rows
+                # with the same new state are cache-equivalent hits within this
+                # call and avoid redundant forward rows.
+                duplicate_rows = max(0, len(rows) - 1)
+                cache_hits += duplicate_rows
+                cache_forward_rows_saved += duplicate_rows
+
+        if missing_keys:
+            rep_idx = torch.tensor(
+                representative_rows, dtype=torch.long, device=device
+            )
+            missing_x = x.index_select(0, rep_idx)
+            missing_revealed = revealed.index_select(0, rep_idx)
+            missing_alive = torch.ones(
+                len(missing_keys), dtype=torch.bool, device=device
+            )
+
+            missing_log_a, _ = _compute_log_a_for_batch_uncached(
+                x=missing_x,
+                revealed=missing_revealed,
+                alive=missing_alive,
+                num_unrevealed=num_unrevealed,
+            )
+
+            cache_misses += len(missing_keys)
+
+            for local_idx, key in enumerate(missing_keys):
+                value = missing_log_a[local_idx].clone()
+                state_log_a_cache[key] = value
+                rows = rows_by_state[key]
+                row_idx = torch.tensor(rows, dtype=torch.long, device=device)
+                out.index_copy_(
+                    0,
+                    row_idx,
+                    value.unsqueeze(0).expand(len(rows), -1),
+                )
+
+        return out, None
 
     # ==================================================================
     # Successful trajectory Monte Carlo
@@ -2948,6 +3135,12 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             (bsz, masked_len),
             dtype=torch.bool,
             device=device,
+        )
+
+        # Compact 50-bit representation of S for memoization.  Bit r is set iff
+        # masked slot r has already been successfully revealed.
+        state_ids = torch.zeros(
+            bsz, dtype=torch.int64, device=device
         )
 
         # Accumulate
@@ -2995,6 +3188,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                 revealed=revealed,
                 alive=alive,
                 num_unrevealed=num_unrevealed,
+                state_ids=state_ids,
             )
             # [bsz, 50], FP64
 
@@ -3114,11 +3308,11 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             revealed.scatter_(
                 dim=1,
                 index=next_slots.unsqueeze(-1),
-                src=torch.ones(
-                    (bsz, 1),
-                    dtype=torch.bool,
-                    device=device,
-                ),
+                src=reveal_true_base[:bsz],
+            )
+
+            state_ids.bitwise_or_(
+                state_bit_values[next_slots]
             )
 
         # --------------------------------------------------------------
@@ -3229,6 +3423,12 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         "tie_breaking": "uniform_among_max_confidence",
         "model_forward_dtype": "native",
         "estimator_dtype_after_logits": "float64",
+        "state_cache_enabled": cache_enabled,
+        "state_cache_entries": len(state_log_a_cache),
+        "state_cache_requests": cache_requests,
+        "state_cache_hits": cache_hits,
+        "state_cache_misses": cache_misses,
+        "state_cache_forward_rows_saved": cache_forward_rows_saved,
     }
 
     if return_samples:
@@ -3243,7 +3443,9 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         result["sample_log_probabilities"] = None
 
     result['verbose_samples'] = verbose_samples if verbose else None
+
     return result
+
 
 
 
