@@ -3443,8 +3443,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
     result['verbose_samples'] = verbose_samples if verbose else None
 
-
-
+    return result
 
 
 
