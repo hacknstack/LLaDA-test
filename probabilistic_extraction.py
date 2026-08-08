@@ -1349,7 +1349,7 @@ def _path_sampling_random_probability(
 def _path_sampling_random_probability_from_partially_masked(
     model,
     sequence_tokens: torch.Tensor,          # [1, 100]
-    masked_indexes: list[int],              # 1-indexed masked positions in sequence_tokens
+    masked_indexes: list[int],              # 1-indexed masked positions
     steps: int,
     attention_mask: Optional[torch.Tensor],
     mask_id: int,
@@ -1361,195 +1361,644 @@ def _path_sampling_random_probability_from_partially_masked(
     batch_size: int = 64,
 ) -> Dict[str, object]:
     """
-    Batched path-sampling estimator for partially masked conditioning.
+    Batched random-remasking trajectory estimator for partially masked
+    conditioning.
 
-    High-level behavior:
-      - sequence_tokens is the full target sequence z, shape [1, 100]
-      - masked_indexes specifies the 50 positions to regenerate
-      - the other 50 positions are observed / conditioning tokens
-      - samples a random reveal permutation over the 50 masked positions
-      - uses the same fixed schedule across steps
-      - computes the path probability of obtaining the target tokens at those masked positions
-      - supports 'top_k' and full-softmax decoding
-      - returns the same output structure as the suffix-only version
+    Estimates
+
+        p_{theta, phi, M}(z_M | z_not_M)
+
+    by sampling random reveal trajectories and evaluating
+
+        hat p =
+            prod_{t=1}^T
+            prod_{i in B_t}
+                p_i(z_i | S_{t-1}),
+
+    where the ordered reveal batches B_1, ..., B_T are induced by a
+    uniformly random permutation of the masked set M and the deterministic
+    transfer schedule.
+
+    For steps == len(masked_indexes), this is the one-token-per-step
+    specialization.
+
+    Precision strategy for A100/H100:
+      - model forward: model's native dtype (typically BF16/FP16/FP32)
+      - selected vocabulary logits: FP32
+      - softmax/top-k normalization: FP32
+      - sums of token log-probabilities: FP64
+      - path log-probabilities: FP64
+      - Monte Carlo averaging: FP64/log-space
+
+    Supported decoding schemes:
+      - "full": full temperature-scaled softmax
+      - "top_k": temperature-scaled softmax restricted to top-k logits
+
+    Temperature must be finite and strictly positive.
 
     Assumptions:
       - sequence_tokens has shape [1, 100]
       - exactly 50 positions are masked
-      - if steps == 50, this is the one-token-per-step specialization
+      - 1 <= steps <= 50
       - attention_mask, if provided, has shape [1, 100]
     """
+
     device = _model_device(model)
     sequence_tokens = sequence_tokens.to(device)
 
+    # ------------------------------------------------------------------
+    # Validate inputs
+    # ------------------------------------------------------------------
+
     if sequence_tokens.ndim != 2 or sequence_tokens.shape[0] != 1:
         raise ValueError(
-            f"sequence_tokens must have shape [1, 100], got {tuple(sequence_tokens.shape)}"
+            f"sequence_tokens must have shape [1, 100], "
+            f"got {tuple(sequence_tokens.shape)}"
         )
 
     seq_len = sequence_tokens.shape[1]
-    if seq_len != 100:
-        raise ValueError(f"Expected sequence length 100, got {seq_len}")
 
-    # Convert 1-indexed -> 0-indexed, deduplicate, sort, validate.
-    masked_pos = sorted(set(int(i) - 1 for i in masked_indexes))
+    if seq_len != 100:
+        raise ValueError(
+            f"Expected sequence length 100, got {seq_len}"
+        )
+
+    # Convert 1-indexed -> sorted unique 0-indexed positions.
+    masked_pos = sorted(
+        set(int(i) - 1 for i in masked_indexes)
+    )
+
     if len(masked_pos) != 50:
         raise ValueError(
-            f"Expected exactly 50 masked positions out of 100, got {len(masked_pos)}"
+            f"Expected exactly 50 masked positions out of 100, "
+            f"got {len(masked_pos)}"
         )
+
     if any(pos < 0 or pos >= seq_len for pos in masked_pos):
-        raise ValueError("masked_indexes must be 1-indexed positions in [1, 100]")
+        raise ValueError(
+            "masked_indexes must be 1-indexed positions in [1, 100]"
+        )
 
     masked_len = len(masked_pos)
-    masked_pos_t = torch.tensor(masked_pos, dtype=torch.long, device=device)   # [50]
 
-    if steps <= 0:
-        raise ValueError("steps must be positive")
+    if steps < 1 or steps > masked_len:
+        raise ValueError(
+            f"steps must be in [1, {masked_len}], got {steps}"
+        )
+
+    if num_samples <= 0:
+        raise ValueError(
+            "num_samples must be positive."
+        )
+
+    if batch_size <= 0:
+        raise ValueError(
+            "batch_size must be positive."
+        )
+
+    if (
+        not math.isfinite(float(temperature))
+        or temperature <= 0
+    ):
+        raise ValueError(
+            "temperature must be finite and strictly positive."
+        )
+
+    if decoding_scheme not in {"full", "top_k"}:
+        raise ValueError(
+            "decoding_scheme must be either 'full' or 'top_k', "
+            f"got {decoding_scheme!r}"
+        )
+
+    if decoding_scheme == "top_k" and k <= 0:
+        raise ValueError(
+            "k must be positive when decoding_scheme='top_k'."
+        )
 
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
+
         if attention_mask.shape != (1, seq_len):
             raise ValueError(
-                f"attention_mask must have shape [1, {seq_len}], got {tuple(attention_mask.shape)}"
+                f"attention_mask must have shape [1, {seq_len}], "
+                f"got {tuple(attention_mask.shape)}"
             )
 
-    # Keep CPU RNG for seeded reproducibility style close to the original.
-    rng = torch.Generator(device="cpu")
-    if seed is not None:
-        rng.manual_seed(seed)
+    tau = float(temperature)
+
+    masked_pos_t = torch.tensor(
+        masked_pos,
+        dtype=torch.long,
+        device=device,
+    )
+    # [50]
+
+    full_target_row = sequence_tokens[0]
+    masked_target_row = full_target_row[masked_pos_t]
+    # [50]
+
+    # ------------------------------------------------------------------
+    # Deterministic transfer schedule
+    #
+    # b_t = floor(|M| / T) + indicator(t <= |M| mod T)
+    # ------------------------------------------------------------------
 
     base = masked_len // steps
     rem = masked_len % steps
-    schedule = [base + (1 if i < rem else 0) for i in range(steps)]
 
-    full_target_row = sequence_tokens[0]                 # [100]
-    masked_target_row = full_target_row[masked_pos_t]    # [50]
+    schedule = [
+        base + (1 if i < rem else 0)
+        for i in range(steps)
+    ]
 
-    sample_log_probabilities: List[float] = []
+    assert sum(schedule) == masked_len
+    assert all(step_size >= 1 for step_size in schedule)
+
+    # ------------------------------------------------------------------
+    # RNG
+    #
+    # seed=None uses PyTorch's ordinary global RNG.
+    #
+    # We generate random permutation keys in FP64. For 50 positions,
+    # this makes accidental equal random keys negligibly likely while
+    # remaining trivial in cost compared with a model forward.
+    # ------------------------------------------------------------------
+
+    if seed is None:
+        rng = None
+    else:
+        rng = torch.Generator(device="cpu")
+        rng.manual_seed(int(seed))
+
+    # ------------------------------------------------------------------
+    # Outputs / stable global Monte Carlo accumulator
+    # ------------------------------------------------------------------
+
     sample_probabilities: List[float] = []
 
-    for batch_start in range(0, num_samples, batch_size):
-        bsz = min(batch_size, num_samples - batch_start)
+    running_log_sum = torch.tensor(
+        float("-inf"),
+        dtype=torch.float64,
+        device=device,
+    )
 
-        # Current sequence states for all samples in this batch.
-        x = sequence_tokens.expand(bsz, -1).clone()      # [bsz, 100]
+    num_accumulated = 0
+
+    # ==================================================================
+    # Monte Carlo batches
+    # ==================================================================
+
+    for batch_start in range(
+        0,
+        num_samples,
+        batch_size,
+    ):
+        bsz = min(
+            batch_size,
+            num_samples - batch_start,
+        )
+
+        # --------------------------------------------------------------
+        # Initial sequence state:
+        #
+        # observed positions remain z;
+        # masked positions begin at mask_id.
+        # --------------------------------------------------------------
+
+        x = sequence_tokens.expand(
+            bsz,
+            -1,
+        ).clone()
+
         x[:, masked_pos_t] = mask_id
 
-        # Accumulated log-probability for each sample.
-        log_path_probability = torch.zeros(bsz, dtype=torch.float64, device=device)
+        # Path probability is accumulated entirely in log-space / FP64.
+        log_path_probability = torch.zeros(
+            bsz,
+            dtype=torch.float64,
+            device=device,
+        )
 
-        # Whether the sample is still alive (not zero-probability yet).
-        alive = torch.ones(bsz, dtype=torch.bool, device=device)
+        alive = torch.ones(
+            bsz,
+            dtype=torch.bool,
+            device=device,
+        )
 
-        # Random reveal permutations over the 50 masked slots, one per sample.
-        # Generated on CPU using the seeded CPU RNG, then moved to device.
-        perm_scores = torch.rand((bsz, masked_len), generator=rng, device="cpu")
-        permutation = perm_scores.argsort(dim=-1).to(device)  # [bsz, 50]
-        # permutation indexes into masked_pos_t / masked_target_row, not absolute positions.
+        # --------------------------------------------------------------
+        # Uniform random reveal permutation.
+        #
+        # Sorting IID continuous random keys produces a uniform random
+        # permutation. FP64 makes finite-precision key collisions
+        # negligible here.
+        #
+        # CPU work is tiny: only [batch_size, 50].
+        # --------------------------------------------------------------
+
+        perm_scores = torch.rand(
+            (bsz, masked_len),
+            generator=rng,
+            device="cpu",
+            dtype=torch.float64,
+        )
+
+        permutation = torch.argsort(
+            perm_scores,
+            dim=-1,
+        ).to(
+            device=device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
+        # [bsz, 50]
+        #
+        # Values index masked_pos_t / masked_target_row.
+
+        # Expand attention mask once per Monte Carlo batch rather than once
+        # per diffusion step.
+        batched_attn = None
+
+        if attention_mask is not None:
+            batched_attn = attention_mask.expand(
+                bsz,
+                -1,
+            )
 
         start = 0
+
+        # ==============================================================
+        # Decode trajectory
+        # ==============================================================
+
         for step_size in schedule:
-            reveal_slots = permutation[:, start:start + step_size]  # [bsz, step_size], values in [0, 49]
+            reveal_slots = permutation[
+                :,
+                start:start + step_size,
+            ]
+            # [bsz, step_size]
+
             start += step_size
 
-            # Repeat attention mask across batch if needed.
-            batched_attn = None
-            if attention_mask is not None:
-                batched_attn = attention_mask.expand(bsz, -1)
+            # ----------------------------------------------------------
+            # Model forward.
+            #
+            # All positions in this batch must be evaluated from the SAME
+            # pre-reveal state x.
+            # ----------------------------------------------------------
 
-            logits = model(x, attention_mask=batched_attn).logits   # [bsz, 100, vocab]
+            outputs = model(
+                x,
+                attention_mask=batched_attn,
+            )
+
+            logits = outputs.logits
+            # [bsz, 100, vocab]
+
             vocab_size = logits.shape[-1]
 
-            # Map reveal slots -> absolute sequence positions.
-            reveal_abs_positions = masked_pos_t[reveal_slots]       # [bsz, step_size]
+            # ----------------------------------------------------------
+            # Map masked-slot indices -> absolute sequence positions.
+            # ----------------------------------------------------------
 
-            gather_index = reveal_abs_positions.unsqueeze(-1).expand(-1, -1, vocab_size)
-            step_logits = torch.gather(logits, dim=1, index=gather_index)  # [bsz, step_size, vocab]
+            reveal_abs_positions = masked_pos_t[
+                reveal_slots
+            ]
+            # [bsz, step_size]
+
+            gather_index = (
+                reveal_abs_positions
+                .unsqueeze(-1)
+                .expand(
+                    -1,
+                    -1,
+                    vocab_size,
+                )
+            )
+
+            # ----------------------------------------------------------
+            # Only selected positions are promoted to FP32.
+            #
+            # This is important when the model itself runs BF16/FP16.
+            # Doing the vocabulary normalization directly in BF16 would
+            # lose accuracy before the FP64 path accumulator ever sees it.
+            # ----------------------------------------------------------
+
+            step_logits = torch.gather(
+                logits,
+                dim=1,
+                index=gather_index,
+            ).float()
+            # [bsz, step_size, vocab], FP32
+
+            # Release references to the much larger full output ASAP.
+            del outputs
+            del logits
 
             target_ids = torch.gather(
-                masked_target_row.unsqueeze(0).expand(bsz, -1),
+                masked_target_row
+                .unsqueeze(0)
+                .expand(bsz, -1),
                 dim=1,
                 index=reveal_slots,
-            )  # [bsz, step_size]
+            )
+            # [bsz, step_size]
 
-            scaled_logits = step_logits if temperature <= 0 else (step_logits / temperature)
+            # ==========================================================
+            # Token log probabilities
+            # ==========================================================
 
             if decoding_scheme == "top_k":
-                top_k = min(k, scaled_logits.shape[-1])
-                topk_vals, topk_idx = torch.topk(scaled_logits, k=top_k, dim=-1)  # [bsz, step_size, top_k]
+                # ------------------------------------------------------
+                # Temperature scaling does NOT alter top-k membership
+                # for tau > 0, so perform top-k on the raw FP32 logits.
+                #
+                # This avoids dividing the entire [B, step, V] tensor.
+                # ------------------------------------------------------
 
-                in_topk = (topk_idx == target_ids.unsqueeze(-1)).any(dim=-1)  # [bsz, step_size]
+                top_k = min(
+                    int(k),
+                    vocab_size,
+                )
 
-                target_logits = torch.gather(
-                    scaled_logits,
+                topk_vals, topk_idx = torch.topk(
+                    step_logits,
+                    k=top_k,
+                    dim=-1,
+                )
+                # [bsz, step_size, top_k]
+
+                in_topk = (
+                    topk_idx
+                    == target_ids.unsqueeze(-1)
+                ).any(dim=-1)
+                # [bsz, step_size]
+
+                target_raw_logits = torch.gather(
+                    step_logits,
                     dim=-1,
                     index=target_ids.unsqueeze(-1),
-                ).squeeze(-1)  # [bsz, step_size]
+                ).squeeze(-1)
+                # [bsz, step_size]
 
-                token_log_probs = target_logits - torch.logsumexp(topk_vals, dim=-1)
+                if tau == 1.0:
+                    target_scaled_logits = target_raw_logits
+                    topk_scaled_vals = topk_vals
+                else:
+                    target_scaled_logits = (
+                        target_raw_logits / tau
+                    )
+
+                    topk_scaled_vals = (
+                        topk_vals / tau
+                    )
+
+                topk_log_normalizer = torch.logsumexp(
+                    topk_scaled_vals,
+                    dim=-1,
+                )
+                # [bsz, step_size]
+
+                # +inf normalization indicates a numerical pathology.
+                if bool(
+                    torch.isposinf(
+                        topk_log_normalizer
+                    ).any().item()
+                ):
+                    raise FloatingPointError(
+                        "Encountered +inf top-k log-normalizer. "
+                        "This may indicate non-finite model logits or "
+                        "an excessively small temperature."
+                    )
+
+                token_log_probs = (
+                    target_scaled_logits
+                    - topk_log_normalizer
+                )
+                # [bsz, step_size]
+
                 token_log_probs = torch.where(
                     in_topk,
                     token_log_probs,
-                    torch.full_like(token_log_probs, float("-inf")),
+                    torch.full_like(
+                        token_log_probs,
+                        float("-inf"),
+                    ),
                 )
+
             else:
-                target_logits = torch.gather(
-                    scaled_logits,
+                # ------------------------------------------------------
+                # Full-distribution decoder:
+                #
+                # p(v) = softmax(logits / tau)_v
+                #
+                # To avoid allocating a second huge scaled tensor, scale
+                # the selected-position FP32 logits in-place.
+                # ------------------------------------------------------
+
+                if tau != 1.0:
+                    step_logits.div_(tau)
+
+                target_scaled_logits = torch.gather(
+                    step_logits,
                     dim=-1,
                     index=target_ids.unsqueeze(-1),
-                ).squeeze(-1)  # [bsz, step_size]
+                ).squeeze(-1)
+                # [bsz, step_size]
 
-                token_log_probs = target_logits - torch.logsumexp(scaled_logits, dim=-1)
+                log_normalizer = torch.logsumexp(
+                    step_logits,
+                    dim=-1,
+                )
+                # [bsz, step_size]
 
-            # If any revealed token has zero probability, the whole path becomes zero.
-            step_has_zero = torch.isneginf(token_log_probs).any(dim=-1)  # [bsz]
+                if bool(
+                    torch.isposinf(
+                        log_normalizer
+                    ).any().item()
+                ):
+                    raise FloatingPointError(
+                        "Encountered +inf log-normalizer. "
+                        "This may indicate non-finite model logits or "
+                        "an excessively small temperature."
+                    )
 
-            # Sum token log-probs for alive paths only.
-            safe_token_log_probs = torch.where(
-                torch.isfinite(token_log_probs),
-                token_log_probs,
-                torch.zeros_like(token_log_probs),
+                token_log_probs = (
+                    target_scaled_logits
+                    - log_normalizer
+                )
+                # [bsz, step_size]
+
+            # ----------------------------------------------------------
+            # Numerical validation.
+            #
+            # -inf is legitimate: it means the target token has zero
+            # probability under this decoder.
+            #
+            # NaN or +inf are not legitimate probabilities.
+            # ----------------------------------------------------------
+
+            invalid = (
+                torch.isnan(token_log_probs)
+                | torch.isposinf(token_log_probs)
             )
-            step_log_prob = safe_token_log_probs.sum(dim=-1)  # [bsz]
+
+            if bool(invalid.any().item()):
+                raise FloatingPointError(
+                    "Encountered NaN or +inf token log-probability "
+                    "during random-remasking trajectory estimation."
+                )
+
+            # Due only to floating-point roundoff, target-logsumexp can
+            # occasionally become an extremely small positive number.
+            # A probability cannot exceed 1, so enforce log p <= 0.
+            token_log_probs.clamp_max_(0.0)
+
+            # ----------------------------------------------------------
+            # If any simultaneously revealed target token has probability
+            # zero, this complete trajectory has probability zero.
+            # ----------------------------------------------------------
+
+            step_has_zero = torch.isneginf(
+                token_log_probs
+            ).any(dim=-1)
+            # [bsz]
+
+            # Replace -inf by zero ONLY for the summation itself.
+            # step_has_zero separately records that the trajectory is dead.
+            safe_token_log_probs = torch.where(
+                torch.isneginf(token_log_probs),
+                torch.zeros_like(token_log_probs),
+                token_log_probs,
+            )
+
+            # ----------------------------------------------------------
+            # Promote before summing.
+            #
+            # This is the important FP32 -> FP64 precision boundary.
+            # ----------------------------------------------------------
+
+            step_log_prob = (
+                safe_token_log_probs
+                .to(torch.float64)
+                .sum(dim=-1)
+            )
+            # [bsz], FP64
+
+            was_alive = alive
+
+            still_alive = (
+                was_alive
+                & (~step_has_zero)
+            )
 
             log_path_probability = torch.where(
-                alive & (~step_has_zero),
+                still_alive,
                 log_path_probability + step_log_prob,
                 log_path_probability,
             )
 
-            alive = alive & (~step_has_zero)
+            alive = still_alive
 
-            # Update x with the revealed target tokens for all samples.
-            x.scatter_(dim=1, index=reveal_abs_positions, src=target_ids)
+            # ----------------------------------------------------------
+            # Successful path state update.
+            #
+            # The probability of generating these target tokens has just
+            # been included in the path weight, so the next successful
+            # state contains the targets visibly.
+            #
+            # Updating dead rows as well is harmless and avoids expensive
+            # dynamic batch compaction / synchronization in the usual
+            # full-distribution case.
+            # ----------------------------------------------------------
+
+            x.scatter_(
+                dim=1,
+                index=reveal_abs_positions,
+                src=target_ids,
+            )
+
+        # ==============================================================
+        # Complete path probabilities
+        # ==============================================================
 
         batch_log_probs = torch.where(
             alive,
             log_path_probability,
-            torch.full_like(log_path_probability, float("-inf")),
+            torch.full_like(
+                log_path_probability,
+                float("-inf"),
+            ),
+        )
+        # [bsz], FP64
+
+        # --------------------------------------------------------------
+        # Arithmetic Monte Carlo mean accumulated stably:
+        #
+        #   log sum_r exp(log W_r)
+        # --------------------------------------------------------------
+
+        batch_log_sum = torch.logsumexp(
+            batch_log_probs,
+            dim=0,
         )
 
-        sample_log_probabilities.extend(batch_log_probs.detach().cpu().tolist())
+        running_log_sum = torch.logaddexp(
+            running_log_sum,
+            batch_log_sum,
+        )
+
+        num_accumulated += bsz
+
+        # --------------------------------------------------------------
+        # Preserve original per-sample output format.
+        #
+        # Extremely tiny probabilities can underflow when converted from
+        # log-space to an ordinary float. The estimator/mean itself stays
+        # in log-space until the final conversion.
+        # --------------------------------------------------------------
 
         batch_probabilities = torch.where(
             torch.isfinite(batch_log_probs),
             torch.exp(batch_log_probs),
             torch.zeros_like(batch_log_probs),
         )
-        sample_probabilities.extend(batch_probabilities.detach().cpu().tolist())
 
-    if sample_log_probabilities:
-        finite_logs = [lp for lp in sample_log_probabilities if not math.isinf(lp)]
-        if not finite_logs:
-            average_probability = 0.0
-        else:
-            max_log = max(finite_logs)
-            scaled_sum = sum(math.exp(lp - max_log) for lp in finite_logs)
-            average_probability = float(
-                math.exp(max_log) * (scaled_sum / len(sample_log_probabilities))
-            )
+        sample_probabilities.extend(
+            batch_probabilities
+            .detach()
+            .cpu()
+            .tolist()
+        )
+
+    # ==================================================================
+    # Final arithmetic mean
+    #
+    #   (1 / K) sum_r W_r
+    #
+    # ==================================================================
+
+    log_average_probability = (
+        running_log_sum
+        - math.log(num_accumulated)
+    ).item()
+
+    if math.isfinite(log_average_probability):
+        # A true probability cannot exceed one. This only protects against
+        # microscopic positive roundoff in the accumulated log probability.
+        log_average_probability = min(
+            log_average_probability,
+            0.0,
+        )
+
+        average_probability = float(
+            math.exp(log_average_probability)
+        )
     else:
         average_probability = 0.0
+
+    # ------------------------------------------------------------------
+    # Preserve original output format
+    # ------------------------------------------------------------------
 
     return {
         "probability": average_probability,
