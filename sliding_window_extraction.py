@@ -3,13 +3,14 @@ import argparse
 import csv
 import json
 import math
+from collections import Counter
 from importlib.metadata import PackageNotFoundError, version as package_version
 import re
 from bisect import bisect_left
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, median
-from typing import List
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -43,13 +44,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seq-tokens', type=int, default=100)
     parser.add_argument('--prefix-tokens', type=int, default=50)
     parser.add_argument('--suffix-tokens', type=int, default=50)
-    parser.add_argument('--max-windows', type=int, default=None)
+    window_group = parser.add_mutually_exclusive_group()
+    window_group.add_argument('--max-windows', type=int, default=None)
+    window_group.add_argument(
+        '--windows',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Zero-based window indices to evaluate, in the requested order.',
+    )
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--output-dir', type=Path, default=Path('outputs'))
     parser.add_argument('--model-family', type=str.lower, choices=['llada', 'llama', 'llama2', 'olmo', 'mistral'], default='llada')
     parser.add_argument('--model-name', type=str, default=None)
-    parser.add_argument('--num-samples', type=int, default=20, help='Monte Carlo samples when --mode monte-carlo')
-    parser.add_argument('--seed', type=int, default=None, help='Optional Monte Carlo seed')
+    parser.add_argument('--num-samples', type=int, default=20, help='Samples for Monte Carlo or path sampling')
+    parser.add_argument('--seed', type=int, default=None, help='Optional sampling seed')
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Write verbose.jsonl for partially masked low-confidence path sampling.',
+    )
+    parser.add_argument(
+        '--compact',
+        action='store_true',
+        help='Use parallel arrays for candidate values in verbose.jsonl (requires --verbose).',
+    )
     parser.add_argument('--decoding-scheme', choices=['auto', 'full', 'top_k', 'greedy', 'ELBO', 'elbo', 'random'], default='auto')
     parser.add_argument('--k', type=int, default=40, help='Top-k value when --decoding-scheme top_k')
     parser.add_argument('--temperature', type=float, default=0.0, help='Temperature for non-greedy llama decoding and llada target-token-confidence remasking')
@@ -89,6 +108,58 @@ def _advance_by_words(start_pos: int, word_count: int, word_start_positions: Lis
     idx = bisect_left(word_start_positions, start_pos)
     target_idx = idx + word_count
     return word_start_positions[target_idx] if target_idx < len(word_start_positions) else text_len
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return 'NaN'
+        return 'Infinity' if value > 0 else '-Infinity'
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _prepare_requested_windows(requested, text, word_starts, tokenizer, args):
+    invalid = sorted({index for index in requested if index < 0})
+    if invalid:
+        raise ValueError(f'--windows entries must be >= 0; got {invalid}.')
+    wanted, resolved = set(requested), {}
+    pos = window_index = 0
+    while pos < len(text) and window_index <= max(wanted):
+        token_ids = tokenizer(text[pos:pos + args.chunk_chars], add_special_tokens=False)['input_ids']
+        if len(token_ids) < args.seq_tokens:
+            break
+        if window_index in wanted:
+            resolved[window_index] = (pos, token_ids)
+        pos = _advance_by_words(pos, args.stride_words, word_starts, len(text))
+        window_index += 1
+    unavailable = sorted(wanted - resolved.keys())
+    if unavailable:
+        raise ValueError(f'Requested --windows are unavailable or too short: {unavailable}.')
+    return [(index, resolved[index][0], resolved[index][1]) for index in requested]
+
+
+def _iter_window_data(text, word_starts, tokenizer, args, requested_data):
+    if requested_data is not None:
+        for evaluation_index, (window_index, pos, token_ids) in enumerate(requested_data):
+            yield evaluation_index, window_index, pos, token_ids
+        return
+
+    pos = window_index = 0
+    while pos < len(text):
+        if args.max_windows is not None and window_index >= args.max_windows:
+            break
+        token_ids = tokenizer(
+            text[pos:pos + args.chunk_chars], add_special_tokens=False
+        )['input_ids']
+        if len(token_ids) < args.seq_tokens:
+            break
+        yield window_index, window_index, pos, token_ids
+        pos = _advance_by_words(pos, args.stride_words, word_starts, len(text))
+        window_index += 1
 
 
 def _load_tokenizer(model_name: str):
@@ -134,7 +205,9 @@ def _load_model(model_name: str, model_family: str, device: str):
         raise
 
 
-def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], args: argparse.Namespace) -> float:
+def _compute_probability(
+    model, prefix_ids: List[int], suffix_ids: List[int], args: argparse.Namespace
+) -> Tuple[float, Optional[List[Dict[str, object]]]]:
     prompt_tokens = torch.tensor([prefix_ids], dtype=torch.long)
     target_tokens = torch.tensor([suffix_ids], dtype=torch.long)
     decoding_scheme = _resolve_decoding_scheme(args)
@@ -152,7 +225,7 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
             k=args.k,
             temperature=args.temperature,
         )
-        return float(result['probability'])
+        return float(result['probability']), None
 
     result = compute_diffusion_probabilistic_extraction(
         model=model,
@@ -169,16 +242,28 @@ def _compute_probability(model, prefix_ids: List[int], suffix_ids: List[int], ar
         k=args.k,
         temperature=args.temperature,
         masked_indexes=args.masked_indexes,
+        verbose=args.verbose,
+        verbose_compact=args.compact,
     )
-    print("result", result)
     if args.mode in {'exact', 'path_sampling'} or str(decoding_scheme).lower() == 'elbo':
-        return float(result['probability'])
-    return float(result['estimate'])
+        probability = float(result['probability'])
+    else:
+        probability = float(result['estimate'])
+    return probability, result.get('verbose_samples')
 
 
 def main() -> None:
     args = parse_args()
     args.masked_indexes = validate_masked_indexes(args.masked_indexes)
+
+    if args.stride_words <= 0:
+        raise ValueError('--stride-words must be > 0.')
+    if args.compact and not args.verbose:
+        raise ValueError('--compact requires --verbose.')
+    if args.windows is not None:
+        duplicates = {index: count for index, count in Counter(args.windows).items() if count > 1}
+        if duplicates:
+            print(f'Warning: duplicate --windows will be evaluated repeatedly: {duplicates}')
 
     if args.prefix_tokens + args.suffix_tokens != args.seq_tokens:
         raise ValueError('prefix_tokens + suffix_tokens must equal seq_tokens.')
@@ -236,39 +321,57 @@ def main() -> None:
         if args.masked_indexes is not None and decoding_scheme.lower() != 'full':
             raise ValueError("--decoding-scheme must be 'full' when --masked_indexes is used with --mode path_sampling and --remasking low-confidence.")
 
+    if args.verbose:
+        valid_verbose = (
+            args.model_family == 'llada'
+            and args.mode == 'path_sampling'
+            and args.remasking == 'low-confidence'
+            and args.masked_indexes is not None
+            and decoding_scheme.lower() == 'full'
+            and math.isclose(args.temperature, 1.0, rel_tol=0.0, abs_tol=1e-9)
+        )
+        if not valid_verbose:
+            raise ValueError(
+                '--verbose requires partially masked LLaDA low-confidence path '
+                'sampling with full decoding and temperature 1.'
+            )
+
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
     tokenizer = _load_tokenizer(args.model_name)
-    model = _load_model(args.model_name, args.model_family, device)
-
     text = args.txt_path.read_text(encoding='utf-8', errors='replace')
     word_start_positions = [m.start() for m in re.finditer(r'\S+', text)]
     if not word_start_positions:
         raise ValueError('Input text contains no words to slide across.')
+
+    requested_window_data = None
+    if args.windows is not None:
+        requested_window_data = _prepare_requested_windows(
+            args.windows, text, word_start_positions, tokenizer, args
+        )
+
+    model = _load_model(args.model_name, args.model_family, device)
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_dir = args.output_dir / args.txt_path.stem / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
 
     rows = []
-    pos = 0
-    window_index = 0
-
     total_possible = max(0, (len(word_start_positions) + args.stride_words - 1) // args.stride_words)
+    if requested_window_data is not None:
+        total_to_evaluate = len(requested_window_data)
+    elif args.max_windows is not None:
+        total_to_evaluate = min(total_possible, args.max_windows)
+    else:
+        total_to_evaluate = total_possible
+    pbar = tqdm(total=total_to_evaluate, desc='Sliding windows', unit='window')
+    verbose_file = (run_dir / 'verbose.jsonl').open('w', encoding='utf-8') if args.verbose else None
+    window_data = _iter_window_data(
+        text, word_start_positions, tokenizer, args, requested_window_data
+    )
 
-    pbar = tqdm(total=total_possible, desc='Sliding windows', unit='window')
-
-    while pos < len(text):
-        if args.max_windows is not None and window_index >= args.max_windows:
-            break
-
-        chunk = text[pos: pos + args.chunk_chars]
-        token_ids = tokenizer(chunk, add_special_tokens=False)['input_ids']
+    for evaluation_index, window_index, pos, token_ids in window_data:
         n_tokens = len(token_ids)
-
-        if n_tokens < args.seq_tokens:
-            pbar.update(1)
-            break
 
         z = token_ids[:args.seq_tokens]
         prefix_ids = z[:args.prefix_tokens]
@@ -279,7 +382,24 @@ def main() -> None:
         error = ''
 
         try:
-            p_z = _compute_probability(model=model, prefix_ids=prefix_ids, suffix_ids=suffix_ids, args=args)
+            p_z, verbose_samples = _compute_probability(
+                model=model, prefix_ids=prefix_ids, suffix_ids=suffix_ids, args=args
+            )
+            if verbose_file is not None:
+                if verbose_samples is None:
+                    raise RuntimeError('Verbose estimator data was not returned.')
+                for sample in verbose_samples:
+                    record = {
+                        'evaluation_index': evaluation_index,
+                        'window_index': window_index,
+                        'masked_indexes': args.masked_indexes,
+                        **sample,
+                    }
+                    verbose_file.write(
+                        json.dumps(_json_safe(record), separators=(',', ':'), allow_nan=False)
+                        + '\n'
+                    )
+                verbose_file.flush()
             print(f"pz {p_z}")
             extracted = int(p_z >= args.tau)
         except Exception as exc:  # noqa: BLE001
@@ -288,6 +408,7 @@ def main() -> None:
 
         rows.append(
             {
+                'evaluation_index': evaluation_index,
                 'window_index': window_index,
                 'char_start': pos,
                 'char_end': pos + args.chunk_chars,
@@ -299,17 +420,18 @@ def main() -> None:
             }
         )
 
-        pos = _advance_by_words(pos, args.stride_words, word_start_positions, len(text))
-        window_index += 1
         pbar.update(1)
 
     pbar.close()
+    if verbose_file is not None:
+        verbose_file.close()
 
     windows_path = run_dir / 'windows.csv'
     with windows_path.open('w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(
             f,
             fieldnames=[
+                'evaluation_index',
                 'window_index',
                 'char_start',
                 'char_end',
@@ -337,6 +459,8 @@ def main() -> None:
         'parameters': {
             'chunk_chars': args.chunk_chars,
             'stride_words': args.stride_words,
+            'windows': args.windows,
+            'max_windows': args.max_windows,
             'seq_tokens': args.seq_tokens,
             'prefix_tokens': args.prefix_tokens,
             'suffix_tokens': args.suffix_tokens,
@@ -348,6 +472,14 @@ def main() -> None:
             'decoding_scheme': decoding_scheme,
             'k': args.k,
             'temperature': args.temperature,
+            'num_samples': args.num_samples,
+            'seed': args.seed,
+            'masked_indexes': args.masked_indexes,
+            'verbose': args.verbose,
+            'compact': args.compact,
+            'verbose_schema': (
+                'parallel-arrays' if args.compact else 'candidate-objects'
+            ) if args.verbose else None,
         },
         'num_windows_total': num_windows_total,
         'num_windows_scored': num_windows_scored,

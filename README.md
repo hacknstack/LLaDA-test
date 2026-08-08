@@ -18,9 +18,11 @@ The primary entrypoint for sliding-window probabilistic extraction.
 
 This script supports multiple model families, including `llada`, `llama`, `llama2`, `olmo`, and `mistral`, plus various decoding and remasking modes.
 
-The script writes two output files for each run:
+The script writes two output files by default:
 - `windows.csv` — one row per sliding window with extraction data.
 - `summary.json` — a run-level summary of parameters, extraction counts, and `p_z` statistics.
+
+With `--verbose`, it also writes `verbose.jsonl`.
 
 #### Usage examples:
 
@@ -28,6 +30,20 @@ The script writes two output files for each run:
 python sliding_window_extraction.py texts/AliceInWonderlandChapter1.txt --mode exact --model-family llama3
 python sliding_window_expected_extraction.py texts/1984Chapter1.txt --mode monte-carlo --model-family llada --temperature 1.0
 ```
+
+Select zero-based windows in any order with `--windows`. The indices refer to
+the candidate sequence produced by `--stride-words`; duplicates are evaluated
+again and retained in the requested order.
+
+```bash
+python sliding_window_extraction.py texts/book.txt --windows 5 1 4 5
+```
+
+For partially masked LLaDA low-confidence path sampling, `--verbose` writes one
+JSONL record per window/sample to `verbose.jsonl`. Add `--compact` to store the
+per-step candidate values as parallel arrays instead of repeated JSON objects.
+`--windows` and `--max-windows` are mutually exclusive, and `--compact` requires
+`--verbose`.
 
 ### `results/`
 Contains experiment outputs, organized by model and result type.

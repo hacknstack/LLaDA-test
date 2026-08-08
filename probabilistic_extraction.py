@@ -1,4 +1,5 @@
 import math
+import secrets
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Dict, List, Optional, Sequence, Tuple, Any
@@ -2135,6 +2136,44 @@ from typing import Dict, List, Optional
 import torch
 
 
+def _verbose_step_record(verbose_batch, log_A, row, step, compact):
+    indices = verbose_batch['sequence_indices'][row].tolist()
+    log_a = verbose_batch['log_a_active'][row].tolist()
+    target_logs = verbose_batch['target_sample_log_probs_64'][row].tolist()
+    products = verbose_batch['log_product'][row].tolist()
+    possible_mask = verbose_batch['highest_possible'][row].tolist()
+    sampled_mask = verbose_batch['highest_sampled'][row].tolist()
+    record = {
+        'step_index': step,
+        'log_A': float(log_A[row].item()),
+        'highest_possible_confidence_indices': [
+            int(index) for index, selected in zip(indices, possible_mask) if selected
+        ],
+        'highest_sampled_confidence_indices': [
+            int(index) for index, selected in zip(indices, sampled_mask) if selected
+        ],
+    }
+    if compact:
+        record.update({
+            'sequence_indices': [int(index) for index in indices],
+            'log_a_active': log_a,
+            'target_sample_log_probs_64': target_logs,
+            'log_product': products,
+        })
+    else:
+        record['candidates'] = [
+            {
+                'sequence_index': int(index),
+                'log_a_active': float(log_a_value),
+                'target_sample_log_probs_64': float(target_log),
+                'log_product': float(product),
+            }
+            for index, log_a_value, target_log, product
+            in zip(indices, log_a, target_logs, products)
+        ]
+    return record, int(verbose_batch['tie_count'][row].item())
+
+
 @torch.inference_mode()
 def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     model,
@@ -2149,6 +2188,8 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     batch_size: int = 64,
     validate_no_ties: bool = False,
     return_samples: bool = True,
+    verbose: bool = False,
+    verbose_compact: bool = False,
 ) -> Dict[str, object]:
     """
     Fast successful-trajectory estimator for low-confidence remasking.
@@ -2330,12 +2371,23 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             int(seed)
         )
 
+    diagnostic_rng = None
+    if verbose:
+        diagnostic_seed = (
+            secrets.randbits(63)
+            if seed is None
+            else (int(seed) + 0x5DEECE66D) % (2**63 - 1)
+        )
+        diagnostic_rng = torch.Generator(device=rng_device)
+        diagnostic_rng.manual_seed(diagnostic_seed)
+
     # ------------------------------------------------------------------
     # Output accumulators
     # ------------------------------------------------------------------
 
     sample_log_probabilities: List[float] = []
     sample_probabilities: List[float] = []
+    verbose_samples: List[Dict[str, object]] = []
 
     running_log_sum = torch.tensor(
         float("-inf"),
@@ -2354,7 +2406,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         revealed: torch.Tensor,       # [bsz, 50]
         alive: torch.Tensor,          # [bsz]
         num_unrevealed: int,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         """
         Returns
 
@@ -2500,6 +2552,15 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         )
         # [bsz, m], fp32
 
+        highest_possible_active = None
+        highest_sampled_active = None
+        if verbose:
+            maximum_confidence = active_logits.max(dim=-1).values - log_Z_conf
+            highest_possible_active = maximum_confidence == maximum_confidence.max(
+                dim=-1, keepdim=True
+            ).values
+            del maximum_confidence
+
         # --------------------------------------------------------------
         # Sort by CONFIDENCE.
         #
@@ -2555,6 +2616,30 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         # Numerically CDF <= 1, so log CDF <= 0.
         log_cdf.clamp_max_(0.0)
         # [bsz, m, vocab], fp32
+
+        if verbose:
+            if sample_on_device:
+                diagnostic_uniform = torch.rand(
+                    (bsz, m), device=device, generator=diagnostic_rng
+                )
+            else:
+                diagnostic_uniform = torch.rand(
+                    (bsz, m), device='cpu', generator=diagnostic_rng
+                ).to(device)
+            sampled_sorted_slots = torch.searchsorted(
+                log_cdf, diagnostic_uniform.log().unsqueeze(-1), right=False
+            ).squeeze(-1).clamp_max(vocab_size - 1)
+            sampled_logits = torch.gather(
+                sorted_logits, dim=-1, index=sampled_sorted_slots.unsqueeze(-1)
+            ).squeeze(-1)
+            sampled_confidence = sampled_logits - log_Z_conf
+            highest_sampled_active = sampled_confidence == sampled_confidence.max(
+                dim=-1, keepdim=True
+            ).values
+            del diagnostic_uniform
+            del sampled_sorted_slots
+            del sampled_logits
+            del sampled_confidence
 
         # --------------------------------------------------------------
         # Construct confidence thresholds.
@@ -2631,7 +2716,8 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         ).unsqueeze(0)
         # [1, m, m]
 
-        if validate_no_ties:
+        tie_count = torch.zeros(bsz, dtype=torch.long, device=device)
+        if validate_no_ties or verbose:
             right_idx = torch.searchsorted(
                 sorted_logits,
                 thresholds,
@@ -2652,7 +2738,10 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                 )
             )
 
-            if bool(
+            if verbose:
+                tie_count = positive_tie.sum(dim=(1, 2))
+
+            if validate_no_ties and bool(
                 positive_tie.any().item()
             ):
                 raise ValueError(
@@ -2733,7 +2822,24 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             ),
         )
 
-        return log_a_full
+        verbose_batch = None
+        if verbose:
+            active_alive = alive.unsqueeze(-1)
+            verbose_batch = {
+                'sequence_indices': (active_abs_positions + 1).detach().cpu(),
+                'log_a_active': log_a_active.detach().cpu(),
+                'target_sample_log_probs_64': target_sample_log_probs_64.detach().cpu(),
+                'log_product': log_product.detach().cpu(),
+                'highest_possible': (
+                    highest_possible_active & active_alive
+                ).detach().cpu(),
+                'highest_sampled': (
+                    highest_sampled_active & active_alive
+                ).detach().cpu(),
+                'tie_count': tie_count.detach().cpu(),
+            }
+
+        return log_a_full, verbose_batch
 
     # ==================================================================
     # Successful trajectory Monte Carlo
@@ -2785,6 +2891,19 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             device=device,
         )
 
+        batch_verbose: List[Dict[str, object]] = []
+        if verbose:
+            batch_verbose = [
+                {
+                    'sample_index': batch_start + row,
+                    'sample_log_estimate': None,
+                    'reveal_path_indices': [],
+                    'tie_count': 0,
+                    'steps': [],
+                }
+                for row in range(bsz)
+            ]
+
         for step in range(masked_len):
             unrevealed = ~revealed
             num_unrevealed = masked_len - step
@@ -2793,7 +2912,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             # log a_i(S)
             # ----------------------------------------------------------
 
-            log_a = compute_log_a_for_batch(
+            log_a, verbose_batch = compute_log_a_for_batch(
                 x=x,
                 revealed=revealed,
                 alive=alive,
@@ -2810,6 +2929,17 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                 dim=-1,
             )
             # [bsz], FP64
+
+            if verbose:
+                if verbose_batch is None:
+                    raise RuntimeError('Verbose step data was not produced.')
+                log_A_cpu = log_A.detach().cpu()
+                for row in range(bsz):
+                    step_record, step_ties = _verbose_step_record(
+                        verbose_batch, log_A_cpu, row, step, verbose_compact
+                    )
+                    batch_verbose[row]['steps'].append(step_record)
+                    batch_verbose[row]['tie_count'] += step_ties
 
             still_alive = (
                 alive
@@ -2880,6 +3010,11 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             ]
             # [bsz]
 
+            if verbose:
+                revealed_positions = (next_abs_positions + 1).detach().cpu().tolist()
+                for row, position in enumerate(revealed_positions):
+                    batch_verbose[row]['reveal_path_indices'].append(int(position))
+
             next_target_ids = masked_target_row[
                 next_slots
             ].unsqueeze(-1)
@@ -2934,6 +3069,12 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         )
 
         num_accumulated += bsz
+
+        if verbose:
+            finished_logs = batch_log_probs.detach().cpu().tolist()
+            for row, sample_log_estimate in enumerate(finished_logs):
+                batch_verbose[row]['sample_log_estimate'] = float(sample_log_estimate)
+            verbose_samples.extend(batch_verbose)
 
         if return_samples:
             sample_log_probabilities.extend(
@@ -3019,6 +3160,8 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     else:
         result["sample_probabilities"] = None
         result["sample_log_probabilities"] = None
+
+    result['verbose_samples'] = verbose_samples if verbose else None
 
     return result
 
@@ -3491,6 +3634,8 @@ def compute_diffusion_probabilistic_extraction(
     k: int = 40,
     temperature: float = 0.0,
     masked_indexes: Optional[Sequence[int]] = None,
+    verbose: bool = False,
+    verbose_compact: bool = False,
 ):
     """
     Compute probabilistic extraction under LLaDA Algorithm-5 style low-confidence remasking.
@@ -3533,6 +3678,21 @@ def compute_diffusion_probabilistic_extraction(
     if model_family != 'llada':
         raise ValueError('compute_diffusion_probabilistic_extraction only supports model_family="llada".')
     normalized_decoding_scheme = decoding_scheme.lower()
+    if verbose_compact and not verbose:
+        raise ValueError('verbose_compact requires verbose=True.')
+    if verbose:
+        valid_verbose = (
+            normalized_masked_indexes is not None
+            and remasking == 'low-confidence'
+            and estimation_method == 'path_sampling'
+            and normalized_decoding_scheme == 'full'
+            and math.isclose(float(temperature), 1.0, rel_tol=0.0, abs_tol=1e-9)
+        )
+        if not valid_verbose:
+            raise ValueError(
+                'verbose diagnostics require partially masked low-confidence '
+                'path sampling with full decoding and temperature 1.'
+            )
     if normalized_decoding_scheme not in {'full', 'top_k', 'elbo'}:
         raise ValueError("decoding_scheme must be one of {'full', 'top_k', 'ELBO'} for model_family='llada'.")
     if normalized_decoding_scheme == 'top_k' and k <= 0:
@@ -3705,11 +3865,16 @@ def compute_diffusion_probabilistic_extraction(
                     num_samples=num_samples,
                     seed=seed,
                     temperature=temperature,
+                    verbose=verbose,
+                    verbose_compact=verbose_compact,
                 )
                 return {
                     'method': 'path_sampling',
                     'probability': path_sampling_result['probability'],
+                    'log_probability': path_sampling_result['log_probability'],
                     'sample_probabilities': path_sampling_result['sample_probabilities'],
+                    'sample_log_probabilities': path_sampling_result['sample_log_probabilities'],
+                    'verbose_samples': path_sampling_result['verbose_samples'],
                     'num_samples': path_sampling_result['num_samples'],
                     'remasking': 'low-confidence',
                     'decoding_scheme': normalized_decoding_scheme,
