@@ -4689,7 +4689,6 @@ def _add_gumbel_noise_with_generator(
 
     return logits.exp() / gumbel_noise
 
-
 @torch.inference_mode()
 def _monte_carlo_probability_temperature_fast_from_partially_masked(
     model,
@@ -4703,120 +4702,139 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     temperature: float,
     decoding_scheme: str,
     k: int,
-    mc_batch_size: int = 512,
+    mc_batch_size: int = 32,
 ) -> MonteCarloResult:
     """
-    Bernoulli Monte Carlo estimate of the probability that
-    generate_from_partially_masked-style low-confidence decoding exactly
-    reconstructs the target tokens at `masked_indexes`.
+    Naive Monte Carlo estimator for one-token-per-step low-confidence remasking.
 
-    Specialization:
-        steps == len(masked_indexes)
+    Each Monte Carlo sample runs the actual stochastic decoder trajectory:
 
-    Therefore exactly one currently masked target position is permanently
-    transferred on every denoising step.
+      1. At every currently masked position i, sample one candidate token from
 
-    Fidelity to generate_from_partially_masked:
-      * sampling uses the same float64 add_gumbel_noise computation;
-      * confidence uses F.softmax on the original/native-dtype logits;
-      * the sampled token's untempered softmax probability is its confidence;
-      * the position with highest confidence is selected using topk(k=1);
-      * only the selected position becomes permanent;
-      * all other sampled candidates are discarded/remasked;
-      * a trajectory can be killed immediately when the selected permanent
-        token differs from the target.
+             p_i(v | S) = softmax(logits_i / temperature)_v.
 
-    `decoding_scheme="full"` is the faithful generate.py path.
+      2. Score the sampled candidate with the UNTEMPERED confidence
 
-    `decoding_scheme="top_k"` is retained as an optional extension: candidate
-    sampling is restricted to the top-k logits, while low-confidence scoring
-    still uses the full-vocabulary untempered softmax.
+             c_i(v | S) = softmax(logits_i)_v.
 
-    Note:
-        Batching/pruning changes the exact RNG stream relative to literally
-        calling generate_from_partially_masked independently num_samples times,
-        but does not change the Monte Carlo distribution.
+      3. Permanently reveal the sampled candidate having maximum confidence.
+         If multiple positions have exactly the same maximum confidence, choose
+         uniformly at random among those tied positions.
+
+      4. If the revealed token differs from target z_i, that trajectory is an
+         immediate failure and contributes 0.
+
+      5. If every masked target token is eventually revealed correctly, that
+         trajectory is a hit and contributes 1.
+
+    Therefore
+
+        p_hat = hits / num_samples
+
+    is the ordinary Bernoulli Monte Carlo estimate of the same extraction
+    probability targeted by Successful Trajectory Sampling.
+
+    IMPORTANT
+    ---------
+    This function intentionally supports decoding_scheme == "full" only,
+    because the Successful Trajectory Sampling implementation being checked
+    uses the full temperature-scaled vocabulary distribution.  `k` is retained
+    for API compatibility but is unused in this mode.
+
+    NUMERICS / MEMORY
+    -----------------
+    The model remains in its native dtype.  Only the active-position logits
+    needed for candidate sampling/confidence scoring are widened to FP64.
+
+    To avoid allocating [batch, remaining_masks, vocab] in FP64, active masked
+    positions are processed in small chunks.  This does not change the sampling
+    distribution; it only reduces peak VRAM.
+
+    Notes:
+      - One token is permanently revealed per step, so
+            steps == len(masked_indexes)
+        is required.
+      - The model should be in eval mode.  Training-mode stochasticity would
+        make the target probability itself vary between forwards.
+      - On complete success this returns a Bernoulli contribution of 1
+        (not 0); otherwise the Monte Carlo estimator would be identically zero.
     """
+
+    device = _model_device(model)
+    sequence_tokens = sequence_tokens.to(device)
 
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
 
-    if temperature < 0:
+    if bool(getattr(model, "training", False)):
         raise ValueError(
-            f"temperature must be >= 0, got {temperature}"
+            "Naive low-confidence Monte Carlo verification requires model.eval()."
         )
 
-    if steps <= 0:
-        raise ValueError(
-            f"steps must be positive, got {steps}"
-        )
-
-    if num_samples <= 0:
-        raise ValueError(
-            f"num_samples must be positive, got {num_samples}"
-        )
-
-    if mc_batch_size <= 0:
-        raise ValueError(
-            f"mc_batch_size must be positive, got {mc_batch_size}"
-        )
-
-    if decoding_scheme not in {"full", "top_k"}:
-        raise ValueError(
-            "decoding_scheme must be 'full' or 'top_k'"
-        )
-
-    if decoding_scheme == "top_k" and k <= 0:
-        raise ValueError(
-            "k must be >= 1 when decoding_scheme == 'top_k'"
-        )
-
-    device = _model_device(model)
-
-    sequence_tokens = sequence_tokens.to(
-        device,
-        non_blocking=True,
-    )
-
-    if (
-        sequence_tokens.ndim != 2
-        or sequence_tokens.shape[0] != 1
-    ):
+    if sequence_tokens.ndim != 2 or sequence_tokens.shape[0] != 1:
         raise ValueError(
             "sequence_tokens must have shape [1, L], "
             f"got {tuple(sequence_tokens.shape)}"
         )
 
-    seq_len = sequence_tokens.shape[1]
+    seq_len = int(sequence_tokens.shape[1])
 
-    # Match generate_from_partially_masked:
-    # 1-indexed -> 0-indexed, deduplicate, sort.
-    masked_pos = sorted(
-        set(int(i) - 1 for i in masked_indexes)
-    )
+    masked_pos = sorted(set(int(i) - 1 for i in masked_indexes))
 
     if not masked_pos:
+        raise ValueError("masked_indexes must contain at least one position.")
+
+    if len(masked_pos) != len(masked_indexes):
         raise ValueError(
-            "masked_indexes must be non-empty"
+            "masked_indexes must not contain duplicate positions."
         )
 
-    for pos in masked_pos:
-        if pos < 0 or pos >= seq_len:
+    if any(pos < 0 or pos >= seq_len for pos in masked_pos):
+        raise ValueError(
+            f"masked_indexes must be 1-indexed positions in [1, {seq_len}]."
+        )
+
+    masked_len = len(masked_pos)
+
+    if steps != masked_len:
+        raise ValueError(
+            "This low-confidence Monte Carlo sampler reveals exactly one token "
+            "per step, so steps must equal len(masked_indexes)="
+            f"{masked_len}, got steps={steps}."
+        )
+
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive.")
+
+    if mc_batch_size <= 0:
+        raise ValueError("mc_batch_size must be positive.")
+
+    if (
+        not math.isfinite(float(temperature))
+        or float(temperature) <= 0.0
+    ):
+        raise ValueError("temperature must be finite and > 0.")
+
+    if decoding_scheme != "full":
+        raise ValueError(
+            "This convergence-check sampler currently supports only "
+            "decoding_scheme='full', matching the successful-trajectory "
+            "estimator. `k` is unused in this mode."
+        )
+
+    # k is intentionally kept in the signature for API compatibility.
+    _ = k
+
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+        if attention_mask.shape != (1, seq_len):
             raise ValueError(
-                f"All masked_indexes must be in [1, {seq_len}], "
-                f"got index {pos + 1}"
+                f"attention_mask must have shape [1, {seq_len}], "
+                f"got {tuple(attention_mask.shape)}"
             )
 
-    num_masked = len(masked_pos)
-
-    if steps != num_masked:
-        raise ValueError(
-            "This estimator specializes to exactly one permanent "
-            "transfer per step, therefore steps must equal the "
-            "number of masked positions. "
-            f"Got steps={steps}, num_masked={num_masked}."
-        )
+    tau = float(temperature)
 
     masked_pos_t = torch.tensor(
         masked_pos,
@@ -4824,41 +4842,166 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
         device=device,
     )
 
-    target_masked_tokens = sequence_tokens[
-        0,
-        masked_pos_t,
-    ]
+    target_row = sequence_tokens[0]
+    masked_target_row = target_row[masked_pos_t]
 
-    # ------------------------------------------------------------------
-    # Attention mask
-    # ------------------------------------------------------------------
-
-    base_attn = None
-
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(
-            device,
-            non_blocking=True,
-        )
-
-        if attention_mask.shape != sequence_tokens.shape:
-            raise ValueError(
-                "attention_mask must have shape "
-                f"{tuple(sequence_tokens.shape)}, "
-                f"got {tuple(attention_mask.shape)}"
-            )
-
-        base_attn = attention_mask
+    slot_grid_base = torch.arange(
+        masked_len,
+        dtype=torch.long,
+        device=device,
+    ).unsqueeze(0)
 
     # ------------------------------------------------------------------
     # RNG
     # ------------------------------------------------------------------
 
+    if device.type in {"cuda", "cpu"}:
+        rng_device = device
+        sample_on_device = True
+    else:
+        rng_device = torch.device("cpu")
+        sample_on_device = False
+
     if seed is None:
         rng = None
     else:
-        rng = torch.Generator(device=device)
+        rng = torch.Generator(device=rng_device)
         rng.manual_seed(int(seed))
+
+    # ------------------------------------------------------------------
+    # Candidate sampler
+    # ------------------------------------------------------------------
+    #
+    # Use a small active-position chunk to avoid a giant FP64
+    # [alive_batch, remaining_masks, vocab] allocation.
+    #
+    # 4 is a conservative default; the model's [B, L, V] native-dtype logits
+    # are normally the larger allocation anyway.
+    # ------------------------------------------------------------------
+
+    position_chunk_size = 4
+
+    def sample_candidates_and_confidences(
+        logits: torch.Tensor,               # [n_alive, L, vocab], native dtype
+        active_abs_positions: torch.Tensor, # [n_alive, m]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return:
+            candidate_ids:          [n_alive, m] int64
+            candidate_log_conf:     [n_alive, m] float64
+
+        candidate_log_conf is log c_i(V_i | S), where c_i is the untempered
+        full-vocabulary softmax.
+
+        Candidate tokens are sampled from the temperature-scaled full
+        distribution.  Processing positions in chunks is distributionally
+        identical to processing all positions at once.
+        """
+
+        n_alive, m = active_abs_positions.shape
+        vocab_size = int(logits.shape[-1])
+
+        candidate_ids = torch.empty(
+            (n_alive, m),
+            dtype=torch.long,
+            device=device,
+        )
+        candidate_log_conf = torch.empty(
+            (n_alive, m),
+            dtype=torch.float64,
+            device=device,
+        )
+
+        row_ids = torch.arange(
+            n_alive,
+            dtype=torch.long,
+            device=device,
+        ).unsqueeze(1)
+
+        for chunk_start in range(0, m, position_chunk_size):
+            chunk_end = min(m, chunk_start + position_chunk_size)
+            c = chunk_end - chunk_start
+
+            chunk_positions = active_abs_positions[:, chunk_start:chunk_end]
+            # [n_alive, c]
+
+            # Gather only logits for the active positions in this chunk and
+            # immediately widen them.  The model itself remains native dtype.
+            chunk_logits = logits[
+                row_ids,
+                chunk_positions,
+                :,
+            ].to(torch.float64)
+            # [n_alive, c, vocab]
+
+            # Untempered normalizer used ONLY for low-confidence ranking.
+            log_Z_conf = torch.logsumexp(
+                chunk_logits,
+                dim=-1,
+            )
+            # [n_alive, c]
+
+            # Candidate sampling:
+            #
+            #   softmax(logits / tau)
+            #
+            # torch.multinomial accepts unnormalized non-negative weights.
+            # Subtracting the row maximum is mathematically neutral and avoids
+            # overflow in exp.
+            scaled = chunk_logits / tau
+            scaled.sub_(
+                scaled.max(dim=-1, keepdim=True).values
+            )
+            weights = torch.exp(scaled)
+            # [n_alive, c, vocab]
+
+            flat_weights = weights.reshape(
+                n_alive * c,
+                vocab_size,
+            )
+
+            if sample_on_device:
+                sampled_flat = torch.multinomial(
+                    flat_weights,
+                    num_samples=1,
+                    replacement=True,
+                    generator=rng,
+                ).squeeze(-1)
+            else:
+                sampled_flat = torch.multinomial(
+                    flat_weights.detach().cpu(),
+                    num_samples=1,
+                    replacement=True,
+                    generator=rng,
+                ).squeeze(-1).to(device)
+
+            sampled_ids = sampled_flat.view(n_alive, c)
+
+            sampled_raw_logits = torch.gather(
+                chunk_logits,
+                dim=-1,
+                index=sampled_ids.unsqueeze(-1),
+            ).squeeze(-1)
+
+            sampled_log_conf = (
+                sampled_raw_logits
+                - log_Z_conf
+            )
+
+            candidate_ids[:, chunk_start:chunk_end] = sampled_ids
+            candidate_log_conf[:, chunk_start:chunk_end] = sampled_log_conf
+
+            del chunk_logits
+            del log_Z_conf
+            del scaled
+            del weights
+            del flat_weights
+            del sampled_flat
+            del sampled_ids
+            del sampled_raw_logits
+            del sampled_log_conf
+
+        return candidate_ids, candidate_log_conf
 
     # ------------------------------------------------------------------
     # Monte Carlo
@@ -4871,344 +5014,236 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
         num_samples,
         mc_batch_size,
     ):
-        batch_size = min(
+        bsz = min(
             mc_batch_size,
             num_samples - batch_start,
         )
 
-        # --------------------------------------------------------------
-        # Initial partially masked states
-        # --------------------------------------------------------------
-
+        # Every trajectory begins at the same partially masked target.
         x = sequence_tokens.expand(
-            batch_size,
+            bsz,
             -1,
         ).clone()
 
         x[:, masked_pos_t] = mask_id
 
-        # Each entry is an index into masked_pos_t / target_masked_tokens.
-        #
-        # Keeping this ordered is useful: it preserves the same logical
-        # position ordering throughout decoding.
-        remaining_slots = torch.arange(
-            num_masked,
-            dtype=torch.long,
+        # revealed is indexed in the compact masked-position coordinate system.
+        revealed = torch.zeros(
+            (bsz, masked_len),
+            dtype=torch.bool,
             device=device,
-        ).unsqueeze(0).expand(
-            batch_size,
-            -1,
-        ).clone()
+        )
 
-        active_bsz = batch_size
+        alive = torch.ones(
+            bsz,
+            dtype=torch.bool,
+            device=device,
+        )
 
-        # ==============================================================
-        # One permanent transfer per step
-        # ==============================================================
+        for step in range(masked_len):
+            live_rows = torch.nonzero(
+                alive,
+                as_tuple=False,
+            ).squeeze(-1)
 
-        for step_idx in range(steps):
-            if active_bsz == 0:
+            n_alive = int(live_rows.numel())
+
+            # Every trajectory in this MC batch has already failed.
+            if n_alive == 0:
                 break
 
-            num_remaining = num_masked - step_idx
+            m = masked_len - step
 
-            # ----------------------------------------------------------
-            # Model forward
-            # ----------------------------------------------------------
+            # Compact to live trajectories.  Failed rows are never forwarded
+            # through the model again.
+            x_live = x.index_select(
+                0,
+                live_rows,
+            )
+            revealed_live = revealed.index_select(
+                0,
+                live_rows,
+            )
 
-            if base_attn is None:
-                attn_batch = None
-            else:
-                attn_batch = base_attn.expand(
-                    active_bsz,
+            batched_attn = None
+            if attention_mask is not None:
+                batched_attn = attention_mask.expand(
+                    n_alive,
                     -1,
                 )
 
-            outputs = model(
-                x,
-                attention_mask=attn_batch,
-            )
+            # Prevent an outer autocast context from silently changing the
+            # model's own/native execution dtype.
+            if device.type in {"cuda", "cpu"}:
+                with torch.autocast(
+                    device_type=device.type,
+                    enabled=False,
+                ):
+                    outputs = model(
+                        x_live,
+                        attention_mask=batched_attn,
+                    )
+            else:
+                outputs = model(
+                    x_live,
+                    attention_mask=batched_attn,
+                )
 
             logits = outputs.logits
-            vocab_size = logits.shape[-1]
+            # [n_alive, L, vocab], model-native dtype
 
-            # ----------------------------------------------------------
-            # Extract logits only for target positions that remain masked.
-            #
-            # IMPORTANT:
-            # Do NOT cast these logits to float32.
-            #
-            # generate_from_partially_masked feeds the original model
-            # logits to F.softmax for confidence computation.
-            # ----------------------------------------------------------
+            local_slot_grid = slot_grid_base.expand(
+                n_alive,
+                -1,
+            )
 
-            remaining_abs_positions = masked_pos_t[
-                remaining_slots
+            active_slots = local_slot_grid[
+                ~revealed_live
+            ].view(
+                n_alive,
+                m,
+            )
+            # [n_alive, m]
+
+            active_abs_positions = masked_pos_t[
+                active_slots
             ]
+            # [n_alive, m]
 
-            batch_idx = torch.arange(
-                active_bsz,
-                device=device,
-            ).unsqueeze(1)
-
-            active_logits = logits[
-                batch_idx,
-                remaining_abs_positions,
-                :,
-            ]
-            # [B_active, num_remaining, vocab_size]
-            # native model-logit dtype
+            candidate_ids, candidate_log_conf = (
+                sample_candidates_and_confidences(
+                    logits=logits,
+                    active_abs_positions=active_abs_positions,
+                )
+            )
 
             del outputs
             del logits
 
-            # ==========================================================
-            # Candidate token generation
+            # ----------------------------------------------------------
+            # Low-confidence remasking:
             #
-            # This mirrors:
-            #
-            #   logits_with_noise = add_gumbel_noise(...)
-            #   x0 = torch.argmax(logits_with_noise, dim=-1)
-            #
-            # but only evaluates still-relevant masked positions.
-            # ==========================================================
+            # reveal the sampled candidate having highest UNTEMPERED
+            # confidence.  If several positions are exactly tied, select
+            # uniformly among the tied maxima.
+            # ----------------------------------------------------------
 
-            if decoding_scheme == "full":
+            max_log_conf = candidate_log_conf.max(
+                dim=-1,
+                keepdim=True,
+            ).values
 
-                logits_with_noise = (
-                    _add_gumbel_noise_with_generator(
-                        active_logits,
-                        temperature=temperature,
-                        generator=rng,
-                    )
-                )
+            tied_for_max = (
+                candidate_log_conf
+                == max_log_conf
+            )
+            # [n_alive, m]
 
-                sampled_tokens = torch.argmax(
-                    logits_with_noise,
-                    dim=-1,
-                )
+            tie_weights = tied_for_max.to(
+                torch.float64
+            )
 
-                del logits_with_noise
-
-            else:
-                # ------------------------------------------------------
-                # Optional top-k extension.
-                #
-                # Not part of the original generate.py path.
-                # ------------------------------------------------------
-
-                top_k = min(
-                    int(k),
-                    vocab_size,
-                )
-
-                top_values, top_indices = torch.topk(
-                    active_logits,
-                    k=top_k,
-                    dim=-1,
-                )
-
-                logits_with_noise = (
-                    _add_gumbel_noise_with_generator(
-                        top_values,
-                        temperature=temperature,
-                        generator=rng,
-                    )
-                )
-
-                sampled_local = torch.argmax(
-                    logits_with_noise,
-                    dim=-1,
-                )
-
-                sampled_tokens = torch.gather(
-                    top_indices,
-                    dim=-1,
-                    index=sampled_local.unsqueeze(-1),
+            if sample_on_device:
+                winner_active_col = torch.multinomial(
+                    tie_weights,
+                    num_samples=1,
+                    replacement=True,
+                    generator=rng,
                 ).squeeze(-1)
-
-                del top_values
-                del top_indices
-                del logits_with_noise
-                del sampled_local
-
-            # ==========================================================
-            # Low-confidence score
-            #
-            # EXACT generator semantics:
-            #
-            #     p = F.softmax(logits, dim=-1)
-            #     x0_p = gather(p, x0)
-            #
-            # Notice that temperature affects sampled_tokens but does NOT
-            # appear in this softmax.
-            # ==========================================================
-
-            p = F.softmax(
-                active_logits,
-                dim=-1,
-            )
-
-            sampled_confidence = torch.gather(
-                p,
-                dim=-1,
-                index=sampled_tokens.unsqueeze(-1),
-            ).squeeze(-1)
-
-            del p
-            del active_logits
-
-            # ==========================================================
-            # Select exactly one token to transfer.
-            #
-            # generate_from_partially_masked uses torch.topk, not argmax:
-            #
-            #     _, select_index = torch.topk(confidence[j], k=1)
-            #
-            # Use topk here as well.
-            # ==========================================================
-
-            selected_local = torch.topk(
-                sampled_confidence,
-                k=1,
-                dim=-1,
-            ).indices.squeeze(-1)
-
-            del sampled_confidence
-
-            row_idx = torch.arange(
-                active_bsz,
-                dtype=torch.long,
-                device=device,
-            )
-
-            selected_slot = remaining_slots[
-                row_idx,
-                selected_local,
-            ]
-
-            selected_abs_pos = masked_pos_t[
-                selected_slot
-            ]
-
-            selected_token = sampled_tokens[
-                row_idx,
-                selected_local,
-            ]
-
-            selected_target = target_masked_tokens[
-                selected_slot
-            ]
-
-            del sampled_tokens
-
-            # ==========================================================
-            # Exact early stopping
-            #
-            # CRITICAL:
-            #
-            # Do NOT kill a trajectory merely because some OTHER masked
-            # position sampled a non-target candidate.
-            #
-            # Those candidates are remasked/discarded.
-            #
-            # Only the candidate selected for permanent transfer matters.
-            # ==========================================================
-
-            success = (
-                selected_token
-                == selected_target
-            )
-
-            survivor_idx = torch.nonzero(
-                success,
-                as_tuple=False,
-            ).squeeze(-1)
-
-            new_bsz = survivor_idx.numel()
-
-            if new_bsz == 0:
-                active_bsz = 0
-                break
-
-            # ----------------------------------------------------------
-            # Discard failed trajectories.
-            # ----------------------------------------------------------
-
-            x = x.index_select(
-                0,
-                survivor_idx,
-            )
-
-            survivor_selected_abs = selected_abs_pos[
-                survivor_idx
-            ]
-
-            survivor_selected_token = selected_token[
-                survivor_idx
-            ]
-
-            survivor_rows = torch.arange(
-                new_bsz,
-                dtype=torch.long,
-                device=device,
-            )
-
-            # Equivalent to:
-            #
-            #     x[transfer_index] = x0[transfer_index]
-            #
-            # Since every surviving row has selected_token == target.
-            x[
-                survivor_rows,
-                survivor_selected_abs,
-            ] = survivor_selected_token
-
-            # ----------------------------------------------------------
-            # Remove transferred position from future consideration.
-            # ----------------------------------------------------------
-
-            survivor_remaining = remaining_slots.index_select(
-                0,
-                survivor_idx,
-            )
-
-            survivor_selected_local = selected_local[
-                survivor_idx
-            ]
-
-            if num_remaining > 1:
-                columns = torch.arange(
-                    num_remaining,
-                    dtype=torch.long,
-                    device=device,
-                ).unsqueeze(0)
-
-                keep = (
-                    columns
-                    != survivor_selected_local.unsqueeze(1)
-                )
-
-                remaining_slots = survivor_remaining[
-                    keep
-                ].view(
-                    new_bsz,
-                    num_remaining - 1,
-                )
-
             else:
-                remaining_slots = survivor_remaining[
-                    :,
-                    :0,
+                winner_active_col = torch.multinomial(
+                    tie_weights.detach().cpu(),
+                    num_samples=1,
+                    replacement=True,
+                    generator=rng,
+                ).squeeze(-1).to(device)
+
+            winner_slot = torch.gather(
+                active_slots,
+                dim=1,
+                index=winner_active_col.unsqueeze(-1),
+            ).squeeze(-1)
+            # compact masked slot in [0, masked_len)
+
+            winner_abs_position = masked_pos_t[
+                winner_slot
+            ]
+
+            winner_token = torch.gather(
+                candidate_ids,
+                dim=1,
+                index=winner_active_col.unsqueeze(-1),
+            ).squeeze(-1)
+
+            winner_target = masked_target_row[
+                winner_slot
+            ]
+
+            matches_target = (
+                winner_token
+                == winner_target
+            )
+
+            # A mismatch is an immediate Bernoulli failure.  Only successful
+            # live trajectories survive to the next denoising step.
+            surviving_live_rows = live_rows[
+                matches_target
+            ]
+
+            failed_live_rows = live_rows[
+                ~matches_target
+            ]
+
+            if failed_live_rows.numel() > 0:
+                alive[
+                    failed_live_rows
+                ] = False
+
+            if surviving_live_rows.numel() > 0:
+                surviving_winner_slots = winner_slot[
+                    matches_target
+                ]
+                surviving_abs_positions = winner_abs_position[
+                    matches_target
+                ]
+                surviving_target_ids = winner_target[
+                    matches_target
                 ]
 
-            active_bsz = new_bsz
+                # Successful revelation fixes exactly the target token.
+                x[
+                    surviving_live_rows,
+                    surviving_abs_positions,
+                ] = surviving_target_ids
 
-        # Every rollout still alive reconstructed every transferred target.
-        hits += int(active_bsz)
+                revealed[
+                    surviving_live_rows,
+                    surviving_winner_slots,
+                ] = True
+
+            del x_live
+            del revealed_live
+            del active_slots
+            del active_abs_positions
+            del candidate_ids
+            del candidate_log_conf
+            del max_log_conf
+            del tied_for_max
+            del tie_weights
+            del winner_active_col
+            del winner_slot
+            del winner_abs_position
+            del winner_token
+            del winner_target
+            del matches_target
+
+        # A row is alive after all masked positions have been processed iff
+        # every revealed token matched the target.  Such a trajectory
+        # contributes 1 to the Bernoulli MC estimator.
+        hits += int(alive.sum().item())
 
     # ------------------------------------------------------------------
-    # Bernoulli estimate
+    # Bernoulli estimate + confidence intervals
     # ------------------------------------------------------------------
 
     estimate, se, wald, wilson = _safe_wald_and_wilson(
@@ -5224,6 +5259,7 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
         hits=hits,
         num_samples=num_samples,
     )
+
 @torch.no_grad()
 def compute_autoregressive_probabilistic_extraction(
     model,
