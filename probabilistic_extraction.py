@@ -3843,172 +3843,657 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     mc_batch_size: int = 512,
 ) -> MonteCarloResult:
     """
-    Monte Carlo estimate of the probability that the sampler exactly regenerates
-    the masked part of `sequence_tokens`, conditioned on the unmasked part.
+    Naive Monte Carlo estimate of the probability that low-confidence
+    remasking exactly regenerates the masked part of `sequence_tokens`,
+    conditioned on the unmasked part.
 
     Specialization:
-      - one token is transferred/kept per step
-      - therefore steps must equal the number of masked positions
-      - selection rule is: among currently masked positions, keep the sampled
-        token with highest confidence under the actual decoding distribution
+      - exactly one token is permanently transferred per step;
+      - therefore steps == len(masked_indexes);
+      - all currently masked positions independently sample a candidate;
+      - the position whose sampled candidate has the largest confidence
+        is permanently transferred.
+
+    IMPORTANT: sampling and confidence are different distributions.
+
+    Candidate sampling:
+        p_i(v | S) = softmax(logits_i / temperature)_v
+
+    Low-confidence ranking:
+        c_i(v | S) = softmax(logits_i)_v
+
+    Thus temperature affects which token is sampled, but confidence is
+    always the standard untempered softmax confidence.
+
+    For decoding_scheme == "top_k":
+      - candidate sampling is restricted to the top-k raw-logit tokens and
+        uses the temperature-scaled distribution within that support;
+      - confidence is STILL the full-vocabulary untempered softmax
+        confidence c_i(v | S).
+
+    GPU / numerical strategy:
+      - model forward stays in the model's native dtype;
+      - only logits at currently masked positions are gathered;
+      - gathered logits are promoted to FP32;
+      - categorical sampling uses Gumbel-max, avoiding explicit softmax
+        probability tensors and torch.multinomial over the full vocabulary;
+      - confidence is evaluated stably in log-space;
+      - failed trajectories are immediately removed from subsequent model
+        forwards;
+      - only currently unrevealed masked positions are processed;
+      - no FP64 vocabulary-sized tensors are created.
+
+    The returned estimate remains an ordinary Bernoulli Monte Carlo
+    estimate based on exact reconstruction hits.
     """
-    if temperature <= 0:
-        raise ValueError("temperature must be > 0")
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    if (
+        not math.isfinite(float(temperature))
+        or temperature <= 0
+    ):
+        raise ValueError(
+            "temperature must be finite and > 0"
+        )
+
     if steps <= 0:
-        raise ValueError("steps must be positive")
+        raise ValueError(
+            "steps must be positive"
+        )
+
     if num_samples <= 0:
-        raise ValueError("num_samples must be positive")
+        raise ValueError(
+            "num_samples must be positive"
+        )
+
     if mc_batch_size <= 0:
-        raise ValueError("mc_batch_size must be positive")
+        raise ValueError(
+            "mc_batch_size must be positive"
+        )
+
     if decoding_scheme not in {"top_k", "full"}:
-        raise ValueError("decoding_scheme must be 'top_k' or 'full'")
+        raise ValueError(
+            "decoding_scheme must be 'top_k' or 'full'"
+        )
+
     if decoding_scheme == "top_k" and k <= 0:
-        raise ValueError("k must be >= 1 when decoding_scheme == 'top_k'")
+        raise ValueError(
+            "k must be >= 1 when decoding_scheme == 'top_k'"
+        )
 
     device = _model_device(model)
-    sequence_tokens = sequence_tokens.to(device, non_blocking=True)
 
-    if sequence_tokens.ndim != 2 or sequence_tokens.shape[0] != 1:
+    sequence_tokens = sequence_tokens.to(
+        device,
+        non_blocking=True,
+    )
+
+    if (
+        sequence_tokens.ndim != 2
+        or sequence_tokens.shape[0] != 1
+    ):
         raise ValueError(
-            f"sequence_tokens must have shape [1, L], got {tuple(sequence_tokens.shape)}"
+            "sequence_tokens must have shape [1, L], "
+            f"got {tuple(sequence_tokens.shape)}"
         )
 
     seq_len = sequence_tokens.shape[1]
 
-    # Convert 1-indexed -> 0-indexed, deduplicate, sort, validate.
-    masked_pos = sorted(set(int(i) - 1 for i in masked_indexes))
+    # Convert 1-indexed -> sorted unique 0-indexed positions.
+    masked_pos = sorted(
+        set(int(i) - 1 for i in masked_indexes)
+    )
+
     if len(masked_pos) == 0:
-        raise ValueError("masked_indexes must be non-empty")
-    if any(pos < 0 or pos >= seq_len for pos in masked_pos):
         raise ValueError(
-            f"masked_indexes must be 1-indexed positions in [1, {seq_len}]"
+            "masked_indexes must be non-empty"
+        )
+
+    if any(
+        pos < 0 or pos >= seq_len
+        for pos in masked_pos
+    ):
+        raise ValueError(
+            "masked_indexes must be 1-indexed positions "
+            f"in [1, {seq_len}]"
         )
 
     num_masked = len(masked_pos)
+
     if steps != num_masked:
         raise ValueError(
-            "This specialization assumes one token transferred per step, "
-            f"so steps must equal the number of masked positions. "
+            "This specialization assumes one token transferred "
+            "per step, so steps must equal the number of masked "
+            "positions. "
             f"Got steps={steps}, num_masked={num_masked}."
         )
 
-    masked_pos_t = torch.tensor(masked_pos, dtype=torch.long, device=device)   # [M]
-    target_masked_tokens = sequence_tokens[0, masked_pos_t]                    # [M]
+    masked_pos_t = torch.tensor(
+        masked_pos,
+        dtype=torch.long,
+        device=device,
+    )
+    # [M]
 
-    # Validate / store base attention mask
+    target_masked_tokens = sequence_tokens[
+        0,
+        masked_pos_t,
+    ]
+    # [M]
+
+    # ------------------------------------------------------------------
+    # Attention mask
+    # ------------------------------------------------------------------
+
     base_attn = None
+
     if attention_mask is not None:
-        attention_mask = attention_mask.to(device, non_blocking=True)
-        if attention_mask.ndim != 2 or attention_mask.shape != (1, seq_len):
+        attention_mask = attention_mask.to(
+            device,
+            non_blocking=True,
+        )
+
+        if (
+            attention_mask.ndim != 2
+            or attention_mask.shape != (1, seq_len)
+        ):
             raise ValueError(
                 f"attention_mask must have shape [1, {seq_len}], "
                 f"got {tuple(attention_mask.shape)}"
             )
+
         base_attn = attention_mask
 
-    rng = torch.Generator(device=device)
-    if seed is not None:
-        rng.manual_seed(seed)
+    # ------------------------------------------------------------------
+    # RNG
+    #
+    # seed=None uses PyTorch's global device RNG.
+    # ------------------------------------------------------------------
+
+    if seed is None:
+        rng = None
+    else:
+        rng = torch.Generator(device=device)
+        rng.manual_seed(int(seed))
+
+    tau = float(temperature)
 
     hits = 0
 
-    for start in range(0, num_samples, mc_batch_size):
-        bsz = min(mc_batch_size, num_samples - start)
+    # ==================================================================
+    # Monte Carlo batches
+    # ==================================================================
 
-        # Start from the observed sequence, with the chosen subset masked out.
-        x = sequence_tokens.expand(bsz, -1).clone()                            # [B,L]
+    for start in range(
+        0,
+        num_samples,
+        mc_batch_size,
+    ):
+        initial_bsz = min(
+            mc_batch_size,
+            num_samples - start,
+        )
+
+        # --------------------------------------------------------------
+        # Initial state
+        # --------------------------------------------------------------
+
+        x = sequence_tokens.expand(
+            initial_bsz,
+            -1,
+        ).clone()
+
         x[:, masked_pos_t] = mask_id
 
-        alive = torch.ones(bsz, dtype=torch.bool, device=device)
+        # Instead of maintaining an [B,M] revealed mask and repeatedly
+        # scanning it, directly maintain the masked slots still eligible
+        # for transfer.
+        #
+        # remaining_slots[b] contains indices into:
+        #
+        #     masked_pos_t
+        #     target_masked_tokens
+        #
+        remaining_slots = torch.arange(
+            num_masked,
+            dtype=torch.long,
+            device=device,
+        ).unsqueeze(0).expand(
+            initial_bsz,
+            -1,
+        ).clone()
+        # [B,M]
 
-        attn_batch = None
-        if base_attn is not None:
-            attn_batch = base_attn.expand(bsz, -1)
+        active_bsz = initial_bsz
 
-        for _step_idx in range(steps):
-            if not alive.any():
+        # ==============================================================
+        # One-token-per-step low-confidence decoding
+        # ==============================================================
+
+        for step_idx in range(steps):
+            if active_bsz == 0:
                 break
 
-            logits = model(x, attention_mask=attn_batch).logits                # [B,L,V]
+            num_remaining = num_masked - step_idx
 
-            # Restrict to candidate positions only.
-            masked_logits = logits[:, masked_pos_t, :]                         # [B,M,V]
+            # ----------------------------------------------------------
+            # Attention mask for surviving rollouts only.
+            # ----------------------------------------------------------
 
-            # Which candidate positions are still masked right now?
-            still_masked = (x[:, masked_pos_t] == mask_id)                     # [B,M]
+            attn_batch = None
 
-            # Decode from the actual temperature-scaled distribution.
-            scaled_masked_logits = masked_logits / temperature                 # [B,M,V]
+            if base_attn is not None:
+                attn_batch = base_attn.expand(
+                    active_bsz,
+                    -1,
+                )
+
+            # ----------------------------------------------------------
+            # Model forward.
+            #
+            # Dead rollouts have already been removed, so every row here
+            # can still produce an exact extraction hit.
+            # ----------------------------------------------------------
+
+            outputs = model(
+                x,
+                attention_mask=attn_batch,
+            )
+
+            logits = outputs.logits
+            # [B_active, L, V]
+
+            vocab_size = logits.shape[-1]
+
+            # ----------------------------------------------------------
+            # Absolute sequence positions of currently masked candidates.
+            # ----------------------------------------------------------
+
+            remaining_abs_positions = masked_pos_t[
+                remaining_slots
+            ]
+            # [B_active, m]
+
+            batch_idx = torch.arange(
+                active_bsz,
+                dtype=torch.long,
+                device=device,
+            ).unsqueeze(1)
+
+            # ----------------------------------------------------------
+            # Gather ONLY currently eligible positions.
+            #
+            # Promote after the model forward to FP32. This prevents
+            # BF16/FP16 softmax-confidence errors without forcing the
+            # expensive transformer forward to FP32.
+            # ----------------------------------------------------------
+
+            active_logits = logits[
+                batch_idx,
+                remaining_abs_positions,
+                :,
+            ].float()
+            # [B_active, m, V], FP32
+
+            del outputs
+            del logits
+
+            # ----------------------------------------------------------
+            # Untempered confidence normalizer.
+            #
+            # c_i(v) = softmax(raw_logits_i)_v
+            #
+            # Work in log-confidence:
+            #
+            # log c_i(v) =
+            #     raw_logit_i(v) - logsumexp(raw_logits_i)
+            #
+            # Argmax of confidence == argmax of log confidence.
+            # ----------------------------------------------------------
+
+            log_Z_conf = torch.logsumexp(
+                active_logits,
+                dim=-1,
+            )
+            # [B_active, m], FP32
+
+            # Catch NaN/+inf/all--inf model outputs without scanning a
+            # second full [B,m,V] boolean tensor.
+            if not bool(
+                torch.isfinite(log_Z_conf).all().item()
+            ):
+                raise FloatingPointError(
+                    "Encountered non-finite confidence normalizer "
+                    "during low-confidence Monte Carlo sampling."
+                )
+
+            # ==========================================================
+            # Sample one candidate token independently at every
+            # currently masked position.
+            #
+            # Gumbel-max:
+            #
+            #   argmax_v [l_v / tau + G_v]
+            #
+            # is equivalent, for tau > 0, to
+            #
+            #   argmax_v [l_v + tau * G_v].
+            #
+            # The latter is preferable numerically because very small
+            # temperatures do not require dividing logits by tiny tau.
+            #
+            # If E ~ Exp(1), then G = -log(E) is standard Gumbel.
+            # ==========================================================
 
             if decoding_scheme == "top_k":
-                top_k = min(k, scaled_masked_logits.shape[-1])
+                top_k = min(
+                    int(k),
+                    vocab_size,
+                )
 
+                # Temperature > 0 does not change top-k membership, so
+                # find support from raw logits before temperature enters.
                 top_vals, top_idx = torch.topk(
-                    scaled_masked_logits, k=top_k, dim=-1
-                )                                                              # [B,M,K]
+                    active_logits,
+                    k=top_k,
+                    dim=-1,
+                )
+                # [B_active,m,K]
 
-                top_probs = top_vals.softmax(dim=-1)                           # [B,M,K]
+                if top_k == 1:
+                    # No random sampling required.
+                    sampled_tokens = top_idx[
+                        ...,
+                        0,
+                    ]
+                    # [B_active,m]
 
-                sampled_local = torch.multinomial(
-                    top_probs.reshape(-1, top_k),
-                    num_samples=1,
+                else:
+                    # Generate Gumbel noise in-place from Exp(1).
+                    gumbel_scores = torch.empty_like(
+                        top_vals
+                    )
+
+                    gumbel_scores.exponential_(
+                        1.0,
+                        generator=rng,
+                    )
+
+                    # Protect log() against a finite-precision zero draw.
+                    gumbel_scores.clamp_min_(
+                        torch.finfo(
+                            gumbel_scores.dtype
+                        ).tiny
+                    )
+
+                    # E -> -tau log(E) + raw_logit
+                    gumbel_scores.log_()
+                    gumbel_scores.mul_(-tau)
+                    gumbel_scores.add_(top_vals)
+
+                    sampled_local = torch.argmax(
+                        gumbel_scores,
+                        dim=-1,
+                    )
+                    # [B_active,m]
+
+                    sampled_tokens = torch.gather(
+                        top_idx,
+                        dim=-1,
+                        index=sampled_local.unsqueeze(-1),
+                    ).squeeze(-1)
+                    # [B_active,m]
+
+                    del gumbel_scores
+                    del sampled_local
+
+                del top_vals
+                del top_idx
+
+            else:
+                # ------------------------------------------------------
+                # Full-vocabulary sampling.
+                #
+                # Avoid explicitly constructing:
+                #
+                #     softmax(logits / tau)
+                #
+                # and then feeding a [B*m,V] probability tensor into
+                # torch.multinomial.
+                #
+                # Gumbel-max samples exactly from the same categorical
+                # distribution while requiring only one temporary tensor.
+                # ------------------------------------------------------
+
+                gumbel_scores = torch.empty_like(
+                    active_logits
+                )
+
+                gumbel_scores.exponential_(
+                    1.0,
                     generator=rng,
-                ).reshape(bsz, num_masked)                                     # [B,M]
+                )
 
-                sampled_tokens = top_idx.gather(
+                gumbel_scores.clamp_min_(
+                    torch.finfo(
+                        gumbel_scores.dtype
+                    ).tiny
+                )
+
+                gumbel_scores.log_()
+                gumbel_scores.mul_(-tau)
+                gumbel_scores.add_(active_logits)
+
+                sampled_tokens = torch.argmax(
+                    gumbel_scores,
                     dim=-1,
-                    index=sampled_local.unsqueeze(-1),
-                ).squeeze(-1)                                                  # [B,M]
+                )
+                # [B_active,m]
 
-                # Confidence must match the actual sampling distribution.
-                chosen_confidence = top_probs.gather(
-                    dim=-1,
-                    index=sampled_local.unsqueeze(-1),
-                ).squeeze(-1)                                                  # [B,M]
+                del gumbel_scores
 
-            else:  # full-vocab sampling
-                vocab_size = scaled_masked_logits.shape[-1]
-                scaled_probs = scaled_masked_logits.softmax(dim=-1)            # [B,M,V]
+            # ==========================================================
+            # Compute confidence of the sampled candidates.
+            #
+            # IMPORTANT:
+            #
+            # sampled_tokens came from p_i(.; tau),
+            # but confidence comes from UNTEMPERED c_i(.).
+            # ==========================================================
 
-                sampled_tokens = torch.multinomial(
-                    scaled_probs.reshape(-1, vocab_size),
-                    num_samples=1,
-                    generator=rng,
-                ).reshape(bsz, num_masked)                                     # [B,M]
+            sampled_raw_logits = torch.gather(
+                active_logits,
+                dim=-1,
+                index=sampled_tokens.unsqueeze(-1),
+            ).squeeze(-1)
+            # [B_active,m], FP32
 
-                chosen_confidence = scaled_probs.gather(
-                    dim=-1,
-                    index=sampled_tokens.unsqueeze(-1),
-                ).squeeze(-1)                                                  # [B,M]
+            sampled_log_confidence = (
+                sampled_raw_logits
+                - log_Z_conf
+            )
+            # [B_active,m], FP32
 
-            # Only currently masked positions are eligible for transfer.
-            neg_inf = torch.full_like(chosen_confidence, float("-inf"))
-            confidence = torch.where(still_masked, chosen_confidence, neg_inf) # [B,M]
+            del active_logits
+            del sampled_raw_logits
+            del log_Z_conf
 
-            selected_slot = confidence.argmax(dim=-1)                          # [B]
-            batch_idx = torch.arange(bsz, device=device)
+            # ----------------------------------------------------------
+            # Low-confidence remasking:
+            #
+            # permanently reveal the position whose sampled candidate has
+            # the HIGHEST standard-softmax confidence.
+            #
+            # Using log confidence avoids unnecessary exponentiation.
+            # ----------------------------------------------------------
 
-            selected_abs_pos = masked_pos_t[selected_slot]                     # [B]
-            selected_token = sampled_tokens[batch_idx, selected_slot]          # [B]
-            selected_target = sequence_tokens[0, selected_abs_pos]             # [B]
+            selected_local = torch.argmax(
+                sampled_log_confidence,
+                dim=-1,
+            )
+            # [B_active]
+            #
+            # In the paper's no-ties regime this is unambiguous.
+            # Exact ties follow torch.argmax's deterministic convention.
 
-            # Transfer exactly one token for each active rollout.
-            active_idx = batch_idx[alive]
-            active_pos = selected_abs_pos[alive]
-            active_tok = selected_token[alive]
+            row_idx = torch.arange(
+                active_bsz,
+                dtype=torch.long,
+                device=device,
+            )
 
-            x[active_idx, active_pos] = active_tok
+            selected_slot = remaining_slots[
+                row_idx,
+                selected_local,
+            ]
+            # [B_active]
+            #
+            # Index into masked_pos_t / target_masked_tokens.
 
-            # If the transferred token is wrong, this rollout can no longer
-            # exactly match the target sequence.
-            mismatch = alive & (selected_token != selected_target)
-            alive = alive & (~mismatch)
+            selected_abs_pos = masked_pos_t[
+                selected_slot
+            ]
+            # [B_active]
 
-        if alive.any():
-            final_match = (x[:, masked_pos_t] == target_masked_tokens.unsqueeze(0)).all(dim=-1)
-            hits += (alive & final_match).sum().item()
+            selected_token = sampled_tokens[
+                row_idx,
+                selected_local,
+            ]
+            # [B_active]
 
-    estimate, se, wald, wilson = _safe_wald_and_wilson(hits, num_samples)
+            selected_target = target_masked_tokens[
+                selected_slot
+            ]
+            # [B_active]
+
+            del sampled_tokens
+            del sampled_log_confidence
+
+            # ----------------------------------------------------------
+            # Once a permanently transferred token is wrong, exact
+            # reconstruction is impossible. Such trajectories can be
+            # discarded immediately without changing the Bernoulli MC
+            # estimator.
+            # ----------------------------------------------------------
+
+            success = (
+                selected_token
+                == selected_target
+            )
+            # [B_active]
+
+            survivor_idx = torch.nonzero(
+                success,
+                as_tuple=False,
+            ).squeeze(-1)
+            # [B_survivors]
+
+            new_bsz = survivor_idx.numel()
+
+            if new_bsz == 0:
+                active_bsz = 0
+                break
+
+            # ----------------------------------------------------------
+            # Keep only surviving decoder states.
+            #
+            # Update selected position with its target token. Since these
+            # rows survived, selected_token == selected_target.
+            # ----------------------------------------------------------
+
+            x = x.index_select(
+                0,
+                survivor_idx,
+            )
+
+            survivor_selected_abs = selected_abs_pos[
+                survivor_idx
+            ]
+
+            survivor_selected_target = selected_target[
+                survivor_idx
+            ]
+
+            survivor_rows = torch.arange(
+                new_bsz,
+                dtype=torch.long,
+                device=device,
+            )
+
+            x[
+                survivor_rows,
+                survivor_selected_abs,
+            ] = survivor_selected_target
+
+            # ----------------------------------------------------------
+            # Remove the just-revealed slot from each survivor's compact
+            # list of remaining masked positions.
+            #
+            # Before: [B_survivors, m]
+            # After:  [B_survivors, m-1]
+            # ----------------------------------------------------------
+
+            survivor_remaining = remaining_slots.index_select(
+                0,
+                survivor_idx,
+            )
+            # [B_survivors,m]
+
+            survivor_selected_local = selected_local[
+                survivor_idx
+            ]
+            # [B_survivors]
+
+            if num_remaining > 1:
+                col_idx = torch.arange(
+                    num_remaining,
+                    dtype=torch.long,
+                    device=device,
+                ).unsqueeze(0)
+
+                keep_mask = (
+                    col_idx
+                    != survivor_selected_local.unsqueeze(1)
+                )
+                # [B_survivors,m]
+
+                remaining_slots = survivor_remaining[
+                    keep_mask
+                ].view(
+                    new_bsz,
+                    num_remaining - 1,
+                )
+
+            else:
+                # Final token has been revealed.
+                remaining_slots = survivor_remaining[
+                    :,
+                    :0,
+                ]
+
+            active_bsz = new_bsz
+
+        # ==============================================================
+        # Every trajectory still present after all M reveals is a hit.
+        #
+        # Every permanent transfer was checked against its corresponding
+        # target, and all M positions have now been transferred.
+        # ==============================================================
+
+        hits += int(active_bsz)
+
+    # ==================================================================
+    # Bernoulli Monte Carlo estimate / intervals
+    # ==================================================================
+
+    estimate, se, wald, wilson = _safe_wald_and_wilson(
+        hits,
+        num_samples,
+    )
+
     return MonteCarloResult(
         estimate=estimate,
         standard_error=se,
