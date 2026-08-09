@@ -4708,57 +4708,52 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     """
     Naive Monte Carlo estimator for one-token-per-step low-confidence remasking.
 
-    This samples the actual decoding process rather than conditioning on a
-    successful trajectory:
+    This version is numerically aligned as closely as possible with the
+    successful-trajectory sampler.
 
-      1. At every currently masked position i, sample a candidate token from
+    At every successful state S:
+
+      1. Candidate tokens are sampled from
 
              p_i(v | S) = softmax(logits_i / temperature)_v.
 
-      2. Score the sampled candidate with the UNTEMPERED confidence
+         Rather than using a separately normalized torch.multinomial weight
+         calculation, sampling uses the same sorted-logit / log-CDF
+         representation used by the successful-trajectory estimator.
+
+      2. Candidate confidence is the UNTEMPERED confidence
 
              c_i(v | S) = softmax(logits_i)_v.
 
-      3. Reveal the sampled position with maximum confidence.  If multiple
-         positions tie for the maximum confidence, choose uniformly at random
-         among those positions.
+      3. Competition between a proposed winner i and competitor j uses the
+         same FP64 threshold construction as the successful-trajectory
+         estimator:
 
-      4. If the revealed token is not the target token z_i, that Monte Carlo
-         trajectory immediately fails and contributes 0.
+             log c_i
+                 = l_i(v_i) - log Z_i
 
-      5. If all masked positions are revealed and all revealed tokens matched
-         the target, that trajectory contributes 1.
+             threshold_{j,i}
+                 = log Z_j + log c_i
 
-    The returned estimate is therefore hits / num_samples.
+         and competitor j is classified by comparing its sampled raw logit
+         l_j(v_j) against threshold_{j,i}.
 
-    Design choices deliberately match the successful-trajectory estimator:
-      - model parameters/buffers stay in their native dtype;
-      - autocast is disabled around model forwards;
-      - active-position logits are promoted to FP64 immediately after forward;
-      - candidate sampling uses temperature-scaled probabilities;
-      - confidence ranking is untempered;
-      - exact maximum-confidence ties are broken uniformly;
-      - only one token is permanently revealed per step;
-      - failed trajectories are removed from subsequent model forwards.
+         This is algebraically equivalent to comparing normalized
+         log-confidences directly, but importantly follows the same
+         floating-point operation ordering as the successful-trajectory
+         estimator.
 
-    Performance:
-      - Within each MC batch and denoising step, alive trajectories that occupy
-        the same successful state S are deduplicated before the model forward.
-        A single state forward is then reused to draw independent candidate
-        samples for every trajectory at that state.
-      - Unique states are evaluated in chunks of model_batch_size to cap VRAM.
-      - No vocabulary-sized tensors are cached across steps/batches.
+      4. If K competitors tie the proposed winner at the maximum confidence,
+         that proposed winner receives weight 1/(K+1). Sampling among the
+         resulting winner weights implements uniform tie-breaking.
 
-    API compatibility:
-      - This implementation is intended to validate the cached estimator's
-        "full" decoding scheme.  Therefore decoding_scheme must be "full".
-      - k is retained for compatibility with the existing Monte Carlo API but
-        is unused for full-distribution sampling.
+      5. If the chosen position's sampled token is not the target z_i, the
+         trajectory immediately fails. Otherwise the target token is
+         permanently revealed.
 
-    Requires the surrounding project to provide:
-      - _model_device(model)
-      - _safe_wald_and_wilson(hits, num_samples)
-      - MonteCarloResult
+    The returned estimate is hits / num_samples.
+
+    The public API and MonteCarloResult output format are unchanged.
     """
 
     # ------------------------------------------------------------------
@@ -4779,7 +4774,9 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     masked_pos = sorted(set(int(i) - 1 for i in masked_indexes))
 
     if not masked_pos:
-        raise ValueError("masked_indexes must contain at least one position.")
+        raise ValueError(
+            "masked_indexes must contain at least one position."
+        )
 
     if len(masked_pos) != len(masked_indexes):
         raise ValueError(
@@ -4804,16 +4801,24 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
         not math.isfinite(float(temperature))
         or float(temperature) <= 0.0
     ):
-        raise ValueError("temperature must be finite and > 0.")
+        raise ValueError(
+            "temperature must be finite and > 0."
+        )
 
     if num_samples <= 0:
-        raise ValueError("num_samples must be positive.")
+        raise ValueError(
+            "num_samples must be positive."
+        )
 
     if mc_batch_size <= 0:
-        raise ValueError("mc_batch_size must be positive.")
+        raise ValueError(
+            "mc_batch_size must be positive."
+        )
 
     if model_batch_size <= 0:
-        raise ValueError("model_batch_size must be positive.")
+        raise ValueError(
+            "model_batch_size must be positive."
+        )
 
     if str(decoding_scheme).lower() != "full":
         raise ValueError(
@@ -4826,6 +4831,7 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
 
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
+
         if attention_mask.shape != (1, seq_len):
             raise ValueError(
                 f"attention_mask must have shape [1, {seq_len}], "
@@ -4866,11 +4872,11 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
 
     hits = 0
 
-    # Deduplicating identical states is behavior-preserving only when the model
-    # forward itself is deterministic for a fixed state.  This is the normal
-    # inference/eval setting.  If someone calls this with model.training=True,
-    # retain independent forwards rather than silently sharing dropout draws.
-    deduplicate_states = not bool(getattr(model, "training", False))
+    # As in the successful-trajectory implementation, state sharing is valid
+    # only when the model itself is deterministic for a fixed input state.
+    deduplicate_states = not bool(
+        getattr(model, "training", False)
+    )
 
     slot_grid_base = torch.arange(
         masked_len,
@@ -4878,11 +4884,25 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
         device=device,
     ).unsqueeze(0)
 
-    for batch_start in range(0, num_samples, mc_batch_size):
-        bsz = min(mc_batch_size, num_samples - batch_start)
+    for batch_start in range(
+        0,
+        num_samples,
+        mc_batch_size,
+    ):
+        bsz = min(
+            mc_batch_size,
+            num_samples - batch_start,
+        )
 
-        # Every trajectory starts from z with M masked.
-        x = sequence_tokens.expand(bsz, -1).clone()
+        # --------------------------------------------------------------
+        # Initial state: z outside M, masks inside M.
+        # --------------------------------------------------------------
+
+        x = sequence_tokens.expand(
+            bsz,
+            -1,
+        ).clone()
+
         x[:, masked_pos_t] = mask_id
 
         revealed = torch.zeros(
@@ -4890,13 +4910,19 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
             dtype=torch.bool,
             device=device,
         )
+
         alive = torch.ones(
             bsz,
             dtype=torch.bool,
             device=device,
         )
 
+        # ==============================================================
+        # Sequential low-confidence decoding
+        # ==============================================================
+
         for step in range(masked_len):
+
             alive_rows_t = torch.nonzero(
                 alive,
                 as_tuple=False,
@@ -4908,51 +4934,78 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
             m = masked_len - step
 
             # ----------------------------------------------------------
-            # Build unique successful states S among currently alive rows.
+            # Group identical successful states S.
             #
-            # An alive trajectory has only target tokens at revealed slots,
-            # so its model input is completely determined by the revealed set.
+            # Preserve FIRST-OCCURRENCE order, matching the state grouping
+            # convention used by the successful-trajectory cache.
+            #
+            # torch.unique(dim=0) can reorder states, which can change the
+            # composition/order of model-forward batches and thereby create
+            # tiny GPU numerical differences.
             # ----------------------------------------------------------
 
-            alive_revealed = revealed.index_select(0, alive_rows_t)
+            alive_revealed = revealed.index_select(
+                0,
+                alive_rows_t,
+            )
+
+            alive_rows_cpu = (
+                alive_rows_t
+                .detach()
+                .cpu()
+                .tolist()
+            )
 
             if deduplicate_states:
-                unique_revealed, inverse = torch.unique(
-                    alive_revealed,
-                    dim=0,
-                    return_inverse=True,
+
+                revealed_cpu = (
+                    alive_revealed
+                    .detach()
+                    .cpu()
+                    .tolist()
                 )
 
-                # Find one representative alive row per unique state.
-                # The number of states is at most the number of alive rows, so
-                # this small CPU grouping is cheap relative to an 8B forward.
-                inverse_cpu = inverse.detach().cpu().tolist()
-                alive_rows_cpu = alive_rows_t.detach().cpu().tolist()
+                state_to_index: dict[tuple[bool, ...], int] = {}
+                rows_per_state: list[list[int]] = []
+                representative_rows: list[int] = []
 
-                rows_per_state: list[list[int]] = [
-                    [] for _ in range(int(unique_revealed.shape[0]))
-                ]
-                for local_alive_idx, state_idx in enumerate(inverse_cpu):
-                    rows_per_state[int(state_idx)].append(
-                        int(alive_rows_cpu[local_alive_idx])
+                for row, state_bits in zip(
+                    alive_rows_cpu,
+                    revealed_cpu,
+                ):
+                    key = tuple(bool(v) for v in state_bits)
+
+                    state_idx = state_to_index.get(key)
+
+                    if state_idx is None:
+                        state_idx = len(rows_per_state)
+                        state_to_index[key] = state_idx
+
+                        rows_per_state.append([])
+                        representative_rows.append(
+                            int(row)
+                        )
+
+                    rows_per_state[state_idx].append(
+                        int(row)
                     )
 
-                representative_rows = [
-                    rows[0] for rows in rows_per_state
-                ]
             else:
-                # Training-mode fallback: every alive trajectory is treated as
-                # a separate state so stochastic forwards are not shared.
-                alive_rows_cpu = alive_rows_t.detach().cpu().tolist()
+                # Training-mode fallback: every alive trajectory gets its own
+                # model forward so stochastic model draws are not shared.
                 rows_per_state = [
-                    [int(row)] for row in alive_rows_cpu
+                    [int(row)]
+                    for row in alive_rows_cpu
                 ]
-                representative_rows = [
-                    int(row) for row in alive_rows_cpu
-                ]
-                unique_revealed = alive_revealed
 
-            num_states = len(representative_rows)
+                representative_rows = [
+                    int(row)
+                    for row in alive_rows_cpu
+                ]
+
+            num_states = len(
+                representative_rows
+            )
 
             # ----------------------------------------------------------
             # Evaluate unique states in VRAM-bounded chunks.
@@ -4969,8 +5022,12 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                 )
 
                 chunk_state_indices = list(
-                    range(state_chunk_start, state_chunk_end)
+                    range(
+                        state_chunk_start,
+                        state_chunk_end,
+                    )
                 )
+
                 rep_rows_chunk = [
                     representative_rows[s]
                     for s in chunk_state_indices
@@ -4982,16 +5039,36 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                     device=device,
                 )
 
-                state_x = x.index_select(0, rep_rows_t)
-                state_revealed = revealed.index_select(0, rep_rows_t)
-                chunk_n = len(rep_rows_chunk)
+                state_x = x.index_select(
+                    0,
+                    rep_rows_t,
+                )
+
+                state_revealed = revealed.index_select(
+                    0,
+                    rep_rows_t,
+                )
+
+                chunk_n = len(
+                    rep_rows_chunk
+                )
 
                 batched_attn = None
-                if attention_mask is not None:
-                    batched_attn = attention_mask.expand(chunk_n, -1)
 
-                # Keep the model in its native dtype and prevent an outer
-                # autocast context from silently changing the forward dtype.
+                if attention_mask is not None:
+                    batched_attn = attention_mask.expand(
+                        chunk_n,
+                        -1,
+                    )
+
+                # ------------------------------------------------------
+                # Model forward.
+                #
+                # Identical policy to STS:
+                #   - native model dtype
+                #   - outer autocast disabled
+                # ------------------------------------------------------
+
                 if device.type in {"cuda", "cpu"}:
                     with torch.autocast(
                         device_type=device.type,
@@ -5010,12 +5087,25 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                 logits = outputs.logits
                 del outputs
 
-                # Active masked slots for each unique state in this chunk.
-                slot_grid = slot_grid_base.expand(chunk_n, -1)
+                # ------------------------------------------------------
+                # Active masked slots.
+                # ------------------------------------------------------
+
+                slot_grid = slot_grid_base.expand(
+                    chunk_n,
+                    -1,
+                )
+
                 active_slots = slot_grid[
                     ~state_revealed
-                ].view(chunk_n, m)
-                active_abs_positions = masked_pos_t[active_slots]
+                ].view(
+                    chunk_n,
+                    m,
+                )
+
+                active_abs_positions = masked_pos_t[
+                    active_slots
+                ]
 
                 local_batch_ids = torch.arange(
                     chunk_n,
@@ -5023,26 +5113,30 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                     device=device,
                 ).unsqueeze(1)
 
-                # Pull only currently masked positions.  Keep the huge model
-                # output native; promote one state's active logits to FP64 at a
-                # time below to limit peak VRAM.
                 active_logits_native = logits[
                     local_batch_ids,
                     active_abs_positions,
                     :,
                 ]
+
                 del logits
 
-                # ------------------------------------------------------
-                # For each unique state, draw independent naive decoder
-                # samples for every trajectory currently occupying it.
-                # ------------------------------------------------------
+                # ======================================================
+                # One unique state at a time
+                # ======================================================
 
-                for local_state_idx, global_state_idx in enumerate(
-                    chunk_state_indices
-                ):
-                    trajectory_rows = rows_per_state[global_state_idx]
-                    group_size = len(trajectory_rows)
+                for (
+                    local_state_idx,
+                    global_state_idx,
+                ) in enumerate(chunk_state_indices):
+
+                    trajectory_rows = rows_per_state[
+                        global_state_idx
+                    ]
+
+                    group_size = len(
+                        trajectory_rows
+                    )
 
                     rows_t = torch.tensor(
                         trajectory_rows,
@@ -5050,117 +5144,337 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                         device=device,
                     )
 
-                    state_active_slots = active_slots[local_state_idx]
-                    state_active_logits = active_logits_native[
+                    state_active_slots = active_slots[
                         local_state_idx
-                    ].to(torch.float64)
+                    ]
+                    # [m]
+
+                    state_active_logits_native = (
+                        active_logits_native[
+                            local_state_idx
+                        ]
+                    )
+                    # [m, vocab], native dtype
+
+                    # STS widens active logits to FP64 before probability
+                    # calculations.
+                    state_active_logits = (
+                        state_active_logits_native
+                        .to(torch.float64)
+                    )
                     # [m, vocab]
 
-                    vocab_size = int(state_active_logits.shape[-1])
-
-                    # Candidate sampling:
-                    #
-                    #   p_i(v|S) ∝ exp(logit_i(v) / tau).
-                    #
-                    # torch.multinomial accepts unnormalized weights.  Subtract
-                    # each position's maximum first for numerical stability.
-                    scaled_logits = state_active_logits / tau
-                    scaled_logits = (
-                        scaled_logits
-                        - scaled_logits.max(
-                            dim=-1,
-                            keepdim=True,
-                        ).values
+                    vocab_size = int(
+                        state_active_logits.shape[-1]
                     )
-                    sampling_weights = torch.exp(scaled_logits)
 
-                    if sample_on_device:
-                        sampled_token_ids = torch.multinomial(
-                            sampling_weights,
-                            num_samples=group_size,
-                            replacement=True,
-                            generator=rng,
-                        )
-                    else:
-                        sampled_token_ids = torch.multinomial(
-                            sampling_weights.detach().cpu(),
-                            num_samples=group_size,
-                            replacement=True,
-                            generator=rng,
-                        ).to(device)
-                    # [m, group_size]
+                    # ==================================================
+                    # Normalizers -- same arithmetic as STS
+                    # ==================================================
 
-                    # Untempered confidence:
-                    #
-                    #   log c_i(v|S) = logit_i(v) - logsumexp(logits_i).
-                    #
-                    # Comparing log-confidence is exactly equivalent to
-                    # comparing confidence and is numerically preferable.
                     log_Z_conf = torch.logsumexp(
                         state_active_logits,
                         dim=-1,
                     )
-                    sampled_raw_logits = torch.gather(
-                        state_active_logits,
+                    # [m]
+
+                    if tau == 1.0:
+                        # In the requested temp=1 case this is literally
+                        # the same tensor/value as the confidence normalizer.
+                        log_Z_sample = log_Z_conf
+                    else:
+                        log_Z_sample = torch.logsumexp(
+                            state_active_logits / tau,
+                            dim=-1,
+                        )
+                    # [m]
+
+                    # ==================================================
+                    # Candidate sampling -- STS-aligned log-CDF method
+                    #
+                    # STS sorts in the model/native dtype and only then
+                    # widens to FP64. Do exactly the same here.
+                    # ==================================================
+
+                    (
+                        sorted_logits_native,
+                        sorted_token_ids,
+                    ) = torch.sort(
+                        state_active_logits_native,
                         dim=-1,
-                        index=sampled_token_ids,
                     )
+
+                    sorted_logits = (
+                        sorted_logits_native
+                        .to(torch.float64)
+                    )
+
+                    del sorted_logits_native
+
+                    if tau == 1.0:
+                        log_cdf = torch.logcumsumexp(
+                            sorted_logits,
+                            dim=-1,
+                        )
+                    else:
+                        log_cdf = torch.logcumsumexp(
+                            sorted_logits / tau,
+                            dim=-1,
+                        )
+
+                    log_cdf.sub_(
+                        log_Z_sample.unsqueeze(-1)
+                    )
+
+                    # Same numerical guard as STS.
+                    log_cdf.clamp_max_(0.0)
+
+                    # Draw one independent candidate at every masked
+                    # position for every trajectory occupying this state.
+                    if sample_on_device:
+                        uniform_draws = torch.rand(
+                            (m, group_size),
+                            dtype=torch.float64,
+                            device=device,
+                            generator=rng,
+                        )
+                    else:
+                        uniform_draws = torch.rand(
+                            (m, group_size),
+                            dtype=torch.float64,
+                            device="cpu",
+                            generator=rng,
+                        ).to(device)
+
+                    sampled_sorted_slots = torch.searchsorted(
+                        log_cdf,
+                        uniform_draws.log(),
+                        right=False,
+                    ).clamp_max(
+                        vocab_size - 1
+                    )
+                    # [m, group_size]
+
+                    sampled_token_ids = torch.gather(
+                        sorted_token_ids,
+                        dim=-1,
+                        index=sampled_sorted_slots,
+                    )
+                    # [m, group_size]
+
+                    # Pull sampled raw logits from the same sorted FP64
+                    # representation used to construct the STS CDF.
+                    sampled_raw_logits = torch.gather(
+                        sorted_logits,
+                        dim=-1,
+                        index=sampled_sorted_slots,
+                    )
+                    # [m, group_size]
+
+                    # ==================================================
+                    # Untempered sampled confidence
+                    #
+                    #     log c_i(V_i)
+                    #       =
+                    #     l_i(V_i) - log Z_i
+                    # ==================================================
+
                     sampled_log_confidence = (
                         sampled_raw_logits
                         - log_Z_conf.unsqueeze(-1)
                     )
                     # [m, group_size]
 
-                    max_log_confidence = sampled_log_confidence.max(
-                        dim=0,
-                        keepdim=True,
-                    ).values
+                    # ==================================================
+                    # Winner selection -- SAME threshold arithmetic as STS
+                    #
+                    # For proposed winner i and competitor j:
+                    #
+                    #     threshold_{j,i}
+                    #       =
+                    #     log Z_j + log c_i(V_i)
+                    #
+                    # Then:
+                    #
+                    #     below : l_j(V_j) < threshold_{j,i}
+                    #     equal : l_j(V_j) == threshold_{j,i}
+                    #     above : l_j(V_j) > threshold_{j,i}
+                    #
+                    # A proposed winner is eligible iff nobody is above it.
+                    # If K other positions tie it, its decoder probability
+                    # is 1/(K+1).
+                    #
+                    # This is exactly the pointwise counterpart of the
+                    # L/E + uniform-tie treatment in STS.
+                    # ==================================================
 
-                    tied_for_max = (
-                        sampled_log_confidence
-                        == max_log_confidence
+                    # competitor_raw_logits[j, 1, trajectory]
+                    competitor_raw_logits = (
+                        sampled_raw_logits
+                        .unsqueeze(1)
                     )
-                    # [m, group_size]
+                    # [competitor j, 1, group]
 
-                    # Uniform random tie-breaking among all positions sharing
-                    # the exact maximum confidence.
-                    tie_weights = tied_for_max.transpose(
-                        0, 1
-                    ).to(torch.float64)
-                    # [group_size, m]
+                    # thresholds[j, proposed i, trajectory]
+                    thresholds = (
+                        log_Z_conf.view(
+                            m,
+                            1,
+                            1,
+                        )
+                        + sampled_log_confidence.unsqueeze(0)
+                    )
+                    # [competitor j, proposed i, group]
 
+                    self_mask = torch.eye(
+                        m,
+                        dtype=torch.bool,
+                        device=device,
+                    ).unsqueeze(-1)
+                    # [j, i, 1]
+
+                    competitor_above = (
+                        competitor_raw_logits
+                        > thresholds
+                    ) & (~self_mask)
+
+                    competitor_equal = (
+                        competitor_raw_logits
+                        == thresholds
+                    ) & (~self_mask)
+
+                    has_competitor_above = (
+                        competitor_above.any(dim=0)
+                    )
+                    # [proposed i, group]
+
+                    tied_competitor_count = (
+                        competitor_equal.sum(dim=0)
+                    )
+                    # [proposed i, group]
+
+                    proposed_winner_weights = torch.where(
+                        ~has_competitor_above,
+                        1.0
+                        / (
+                            tied_competitor_count.to(
+                                torch.float64
+                            )
+                            + 1.0
+                        ),
+                        torch.zeros(
+                            (),
+                            dtype=torch.float64,
+                            device=device,
+                        ),
+                    )
+                    # [proposed i, group]
+
+                    winner_weights = (
+                        proposed_winner_weights
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+                    # [group, m]
+
+                    # --------------------------------------------------
+                    # In exact arithmetic, each row sums to exactly 1:
+                    #
+                    #   - strict max: one weight 1
+                    #   - r-way max tie: r weights 1/r
+                    #
+                    # The reconstructed STS thresholds can theoretically
+                    # create a pathological all-zero row through floating-
+                    # point round-trip effects. That should be extraordinarily
+                    # rare, but provide a deterministic semantic fallback
+                    # rather than passing an invalid row to multinomial.
+                    # --------------------------------------------------
+
+                    winner_mass = winner_weights.sum(
+                        dim=-1
+                    )
+
+                    invalid_winner_rows = (
+                        (~torch.isfinite(winner_mass))
+                        | (winner_mass <= 0.0)
+                    )
+
+                    if bool(
+                        invalid_winner_rows.any().item()
+                    ):
+                        # Fallback to the direct normalized-confidence
+                        # definition used by the decoder. This path exists
+                        # only for numerically pathological threshold rows.
+                        direct_conf = (
+                            sampled_log_confidence
+                            .transpose(0, 1)
+                        )
+                        # [group, m]
+
+                        direct_max = direct_conf.max(
+                            dim=-1,
+                            keepdim=True,
+                        ).values
+
+                        direct_ties = (
+                            direct_conf == direct_max
+                        ).to(torch.float64)
+
+                        winner_weights[
+                            invalid_winner_rows
+                        ] = direct_ties[
+                            invalid_winner_rows
+                        ]
+
+                    # Uniform tie-breaking is now represented by the
+                    # 1/(K+1) weights above. torch.multinomial normalizes
+                    # the row automatically.
                     if sample_on_device:
-                        chosen_local_positions = torch.multinomial(
-                            tie_weights,
-                            num_samples=1,
-                            replacement=True,
-                            generator=rng,
-                        ).squeeze(-1)
+                        chosen_local_positions = (
+                            torch.multinomial(
+                                winner_weights,
+                                num_samples=1,
+                                replacement=True,
+                                generator=rng,
+                            )
+                            .squeeze(-1)
+                        )
                     else:
-                        chosen_local_positions = torch.multinomial(
-                            tie_weights.detach().cpu(),
-                            num_samples=1,
-                            replacement=True,
-                            generator=rng,
-                        ).squeeze(-1).to(device)
+                        chosen_local_positions = (
+                            torch.multinomial(
+                                winner_weights.detach().cpu(),
+                                num_samples=1,
+                                replacement=True,
+                                generator=rng,
+                            )
+                            .squeeze(-1)
+                            .to(device)
+                        )
                     # [group_size]
 
-                    # Which masked slot was permanently revealed?
+                    # ==================================================
+                    # Permanently revealed position
+                    # ==================================================
+
                     chosen_slots = state_active_slots[
                         chosen_local_positions
                     ]
+
                     chosen_abs_positions = masked_pos_t[
                         chosen_slots
                     ]
 
-                    # Which sampled token was selected at that position?
                     sampled_token_ids_by_trajectory = (
-                        sampled_token_ids.transpose(0, 1)
+                        sampled_token_ids
+                        .transpose(0, 1)
                     )
+
                     chosen_token_ids = torch.gather(
                         sampled_token_ids_by_trajectory,
                         dim=1,
-                        index=chosen_local_positions.unsqueeze(-1),
+                        index=chosen_local_positions.unsqueeze(
+                            -1
+                        ),
                     ).squeeze(-1)
 
                     chosen_target_ids = masked_target_row[
@@ -5172,21 +5486,43 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                         == chosen_target_ids
                     )
 
-                    # Failures immediately contribute 0 and never enter another
-                    # model forward.
-                    failed_rows_t = rows_t[~matched]
-                    if failed_rows_t.numel() > 0:
-                        alive[failed_rows_t] = False
+                    # ==================================================
+                    # Failed trajectories terminate immediately
+                    # ==================================================
 
-                    # Successful rows reveal exactly the sampled target token.
-                    successful_rows_t = rows_t[matched]
+                    failed_rows_t = rows_t[
+                        ~matched
+                    ]
+
+                    if failed_rows_t.numel() > 0:
+                        alive[
+                            failed_rows_t
+                        ] = False
+
+                    # ==================================================
+                    # Successful trajectories reveal target token
+                    # ==================================================
+
+                    successful_rows_t = rows_t[
+                        matched
+                    ]
+
                     if successful_rows_t.numel() > 0:
-                        successful_slots = chosen_slots[matched]
+
+                        successful_slots = chosen_slots[
+                            matched
+                        ]
+
                         successful_abs_positions = (
-                            chosen_abs_positions[matched]
+                            chosen_abs_positions[
+                                matched
+                            ]
                         )
+
                         successful_token_ids = (
-                            chosen_token_ids[matched]
+                            chosen_token_ids[
+                                matched
+                            ]
                         )
 
                         x[
@@ -5199,24 +5535,42 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                             successful_slots,
                         ] = True
 
+                    # --------------------------------------------------
+                    # Release per-state temporaries
+                    # --------------------------------------------------
+
                     del state_active_logits
-                    del scaled_logits
-                    del sampling_weights
+                    del sorted_token_ids
+                    del sorted_logits
+                    del log_cdf
+                    del uniform_draws
+                    del sampled_sorted_slots
                     del sampled_token_ids
-                    del log_Z_conf
                     del sampled_raw_logits
                     del sampled_log_confidence
-                    del max_log_confidence
-                    del tied_for_max
-                    del tie_weights
+                    del competitor_raw_logits
+                    del thresholds
+                    del self_mask
+                    del competitor_above
+                    del competitor_equal
+                    del has_competitor_above
+                    del tied_competitor_count
+                    del proposed_winner_weights
+                    del winner_weights
+                    del winner_mass
+                    del invalid_winner_rows
                     del chosen_local_positions
                     del sampled_token_ids_by_trajectory
 
                 del active_logits_native
 
-        # Any trajectory still alive after all |M| steps reconstructed every
-        # target token exactly, hence contributes one Bernoulli hit.
-        hits += int(alive.sum().item())
+        # --------------------------------------------------------------
+        # A surviving trajectory reconstructed all masked target tokens.
+        # --------------------------------------------------------------
+
+        hits += int(
+            alive.sum().item()
+        )
 
     # ------------------------------------------------------------------
     # Bernoulli estimate + uncertainty
