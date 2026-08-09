@@ -2186,7 +2186,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     seed: Optional[int],
     temperature: float,
     batch_size: int = 64,
-    validate_no_ties: bool = False,  # retained for API compatibility; ties are handled uniformly
+    validate_no_ties: bool = False,  # retained for API compatibility; ties use smallest index
     return_samples: bool = True,
     verbose: bool = False,
     verbose_compact: bool = False,
@@ -2207,18 +2207,20 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
         hat p_z = prod_t A(S_{t-1}),
 
-    where ties at the maximum confidence are broken uniformly.  For a
-    proposed successful winner i, define
+    where ties at the maximum confidence are resolved by taking the smallest
+    sequence index.  For a proposed successful winner i, define
 
-        L_{j,i}(S) = P[c_j(V_j | S) <  c_i^*(S)]
-        E_{j,i}(S) = P[c_j(V_j | S) == c_i^*(S)].
+        L_{j,i}(S)  = P[c_j(V_j | S) <  c_i^*(S)]
+        LE_{j,i}(S) = P[c_j(V_j | S) <= c_i^*(S)].
 
-    If exactly k competitors tie i and every other competitor is below i,
-    the decoder selects i with probability 1/(k+1).  Thus a_i(S) is the
-    target-token sampling probability p_i(z_i | S) times the total probability
-    that i wins after this uniform tie-break.  The implementation computes that
-    total exactly with a log-space dynamic program over the number of tied
-    competitors.
+    Then a smaller-index competitor j < i must be strictly below i, while a
+    larger-index competitor j > i may be below or tied with i.  Thus a_i(S) is
+    the target-token sampling probability p_i(z_i | S) times
+
+        prod_{j < i} L_{j,i}(S) * prod_{j > i} LE_{j,i}(S).
+
+    All confidence comparisons are performed directly in FP64 log-confidence
+    space; no raw-logit confidence threshold is reconstructed.
 
         A(S) = sum_i a_i(S),
 
@@ -2246,7 +2248,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         cannot silently change that dtype;
       - logits at active masked positions are immediately promoted to FP64;
       - from that point onward, all full-vocabulary normalizers, sorting, CDFs,
-        confidence thresholds, successful-transition probabilities, proposal
+        log-confidence comparisons, successful-transition probabilities, proposal
         probabilities, trajectory log weights, and Monte Carlo averaging are FP64;
       - all multiplicative probabilities are accumulated in log-space.
 
@@ -2270,10 +2272,10 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
     TIE BREAKING
     ------------
-    If multiple sampled positions share the maximum confidence, the decoder is
-    assumed to choose uniformly among those tied maxima.  The estimator
-    marginalizes this uniform tie-breaking exactly inside a_i(S); it does not
-    need to sample an additional tie-break RNG draw.
+    If multiple sampled positions share the maximum confidence, the decoder
+    chooses the smallest sequence index deterministically.  The estimator
+    marginalizes this rule exactly inside a_i(S): smaller-index competitors use
+    strict '<' mass and larger-index competitors use '<=' mass.
 
     Note: validate_no_ties is retained only for backwards API compatibility and
     no longer changes the estimator; ties are supported exactly.
@@ -2437,9 +2439,6 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     eye_base = torch.eye(
         masked_len, dtype=torch.bool, device=device
     )
-    tie_denominators_log_base = torch.arange(
-        1, masked_len + 1, dtype=torch.float64, device=device
-    ).log()
     reveal_true_base = torch.ones(
         (max_bsz, 1), dtype=torch.bool, device=device
     )
@@ -2829,49 +2828,53 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
 
         # --------------------------------------------------------------
-        # Construct confidence thresholds.
+        # Direct FP64 log-confidence comparison.
         #
-        # For competitor position j and proposed successful winner i, let
+        # For competitor position j and proposed successful winner i,
+        # compare
         #
-        #   c* = c_i(z_i | S).
+        #     log c_j(V_j)
         #
-        # We need the competitor probabilities
+        # directly with
         #
-        #   L_{j,i} = P[c_j(V_j) <  c*]
-        #   E_{j,i} = P[c_j(V_j) == c*]
+        #     log c_i^*.
         #
-        # under the sampling distribution p_j.  Any competitor with confidence
-        # above c* makes i unable to win.  If K competitors tie exactly at c*,
-        # uniform tie-breaking selects i with probability 1/(K+1).
-        #
-        # In logit coordinates, c_j(v) compared with c* is equivalent to
-        # comparing l_j(v) against
-        #
-        #   threshold_{j,i} = log Z_conf,j + log c_i*.
+        # Because sorted_logits is already ordered within each position,
+        # subtracting that position's log Z preserves the ordering.  We can
+        # therefore search directly in sorted log-confidence space without
+        # reconstructing a raw-logit threshold.
         # --------------------------------------------------------------
 
-        thresholds = (
-            log_Z_conf.unsqueeze(2)
-            + target_conf_log_probs.unsqueeze(1)
-        ).contiguous()
+        sorted_log_confidence = (
+            sorted_logits
+            - log_Z_conf.unsqueeze(-1)
+        )
+        # [bsz, competitor j, vocab], FP64
+
+        target_conf_values = (
+            target_conf_log_probs
+            .unsqueeze(1)
+            .expand(-1, m, -1)
+            .contiguous()
+        )
         # [bsz, competitor j, proposed winner i], FP64
 
-        # left_idx: first competitor token with confidence >= c*.
-        # right_idx: first competitor token with confidence >  c*.
+        # left_idx: first competitor token with confidence >= c_i*.
+        # right_idx: first competitor token with confidence >  c_i*.
         left_idx = torch.searchsorted(
-            sorted_logits,
-            thresholds,
+            sorted_log_confidence,
+            target_conf_values,
             right=False,
         )
         right_idx = torch.searchsorted(
-            sorted_logits,
-            thresholds,
+            sorted_log_confidence,
+            target_conf_values,
             right=True,
         )
-        # [bsz, m, m]
+        # [bsz, competitor j, proposed winner i]
 
         # --------------------------------------------------------------
-        # L_{j,i} = P(confidence < c*) in log-space.
+        # L_{j,i} = P(confidence < c_i*) in log-space.
         # --------------------------------------------------------------
 
         left_gather_idx = (left_idx - 1).clamp(
@@ -2885,154 +2888,124 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             index=left_gather_idx,
         )
 
-        # Exact CDF endpoints.
         log_L.masked_fill_(left_idx == 0, float("-inf"))
         log_L.masked_fill_(left_idx == vocab_size, 0.0)
         # [bsz, competitor j, proposed winner i], FP64
 
         # --------------------------------------------------------------
-        # E_{j,i} = P(confidence == c*) in log-space.
-        #
-        # All vocabulary entries in [left_idx, right_idx) have the same raw
-        # logit, so their sampling probabilities are equal.  Computing the tie
-        # mass as count * p(one tied token) avoids subtracting nearly equal CDFs.
+        # LE_{j,i} = P(confidence <= c_i*) in log-space.
         # --------------------------------------------------------------
 
+        right_gather_idx = (right_idx - 1).clamp(
+            min=0,
+            max=vocab_size - 1,
+        )
+
+        log_LE = torch.gather(
+            log_cdf,
+            dim=-1,
+            index=right_gather_idx,
+        )
+
+        log_LE.masked_fill_(right_idx == 0, float("-inf"))
+        log_LE.masked_fill_(right_idx == vocab_size, 0.0)
+        # [bsz, competitor j, proposed winner i], FP64
+
+        # Potential exact cross-position ties are retained as a diagnostic.
         equal_count = right_idx - left_idx
         has_equal = equal_count > 0
-
-        # --------------------------------------------------------------
-        # Exclude j == i from the competitor set.  The neutral factor is
-        # L=1.  Cross-position exact ties are usually absent, so detect them
-        # before constructing E or the O(m^3) tie-count dynamic program.
-        # --------------------------------------------------------------
-
         eye_m = eye_base[:m, :m].unsqueeze(0)
-        log_L.masked_fill_(eye_m, 0.0)
-
         cross_tie_mask = has_equal & (~eye_m)
-        has_cross_tie = bool(cross_tie_mask.any().item())
 
         tie_count = torch.zeros(bsz, dtype=torch.long, device=device)
-        if verbose and has_cross_tie:
+        if verbose and bool(cross_tie_mask.any().item()):
             tie_count = (
                 cross_tie_mask & alive.view(bsz, 1, 1)
             ).sum(dim=(1, 2))
 
         # validate_no_ties is deliberately ignored.  It remains in the public
-        # signature only so existing callers do not break; ties are handled by
-        # exact uniform tie-breaking.
+        # signature only so existing callers do not break; ties are handled
+        # exactly by deterministic smallest-index tie-breaking.
         _ = validate_no_ties
 
-        if not has_cross_tie:
-            # Fast path: with no cross-position tie mass, uniform tie-breaking
-            # reduces exactly to the original strict-order product.  Accumulate
-            # in competitor order to preserve the same FP64 operation ordering
-            # as the k=0 branch of the full dynamic program, but only over a
-            # [bsz, m] tensor instead of [bsz, m, m].
-            log_uniform_win_mass = torch.zeros(
-                (bsz, m), dtype=torch.float64, device=device
+        # --------------------------------------------------------------
+        # Smallest-index tie rule.
+        #
+        # active_slots is in increasing masked-slot order, and masked_pos is
+        # sorted, so local active index order is sequence-index order.
+        # For proposed winner i:
+        #   competitor j < i  -> must satisfy confidence <  c_i*
+        #   competitor j > i  -> may satisfy confidence <= c_i*
+        #   competitor j == i -> neutral factor 1
+        # --------------------------------------------------------------
+
+        proposed_i = torch.arange(
+            m,
+            dtype=torch.long,
+            device=device,
+        ).view(1, m)
+
+        log_smallest_index_win_mass = torch.zeros(
+            (bsz, m),
+            dtype=torch.float64,
+            device=device,
+        )
+
+        # Accumulate in competitor order, preserving the previous no-tie
+        # multiplication/addition order as closely as possible.
+        for competitor_j in range(m):
+            strict_for_smaller = (competitor_j < proposed_i)
+            non_strict_for_larger = (competitor_j > proposed_i)
+
+            competitor_factor = torch.where(
+                strict_for_smaller,
+                log_L[:, competitor_j, :],
+                torch.where(
+                    non_strict_for_larger,
+                    log_LE[:, competitor_j, :],
+                    torch.zeros(
+                        (),
+                        dtype=torch.float64,
+                        device=device,
+                    ),
+                ),
             )
-            for competitor_j in range(m):
-                log_uniform_win_mass = (
-                    log_uniform_win_mass + log_L[:, competitor_j, :]
-                )
 
-            log_E = None
-            log_dp = None
-            log_L_by_i = None
-            log_E_by_i = None
-
-        else:
-            # ----------------------------------------------------------
-            # E_{j,i} = P(confidence == c*) in log-space.
-            #
-            # All vocabulary entries in [left_idx, right_idx) have the same raw
-            # logit, so their sampling probabilities are equal.  Computing the
-            # tie mass as count * p(one tied token) avoids subtracting nearly
-            # equal CDFs.
-            # ----------------------------------------------------------
-
-            equal_gather_idx = left_idx.clamp(
-                min=0,
-                max=vocab_size - 1,
+            log_smallest_index_win_mass = (
+                log_smallest_index_win_mass
+                + competitor_factor
             )
-            equal_raw_logit = torch.gather(
-                sorted_logits,
-                dim=-1,
-                index=equal_gather_idx,
-            )
-
-            log_E = (
-                equal_count.clamp_min(1).to(torch.float64).log()
-                + equal_raw_logit / tau
-                - log_Z_sample.unsqueeze(2)
-            )
-            log_E.masked_fill_(~has_equal, float("-inf"))
-            log_E.masked_fill_(eye_m, float("-inf"))
-
-            # ----------------------------------------------------------
-            # Exact uniform tie-breaking probability.
-            #
-            # For proposed winner i, let K be the number of competitors whose
-            # sampled confidence equals c_i*.  Conditional on no competitor
-            # being above c_i*, i wins with probability 1/(K+1).
-            # ----------------------------------------------------------
-
-            log_dp = torch.full(
-                (bsz, m, m),
-                float("-inf"),
-                dtype=torch.float64,
-                device=device,
-            )
-            log_dp[:, :, 0] = 0.0
-
-            # transpose() is only a view; contiguous copies are unnecessary.
-            log_L_by_i = log_L.transpose(1, 2)
-            log_E_by_i = log_E.transpose(1, 2)
-
-            for competitor_j in range(m):
-                log_l = log_L_by_i[:, :, competitor_j].unsqueeze(-1)
-                log_e = log_E_by_i[:, :, competitor_j].unsqueeze(-1)
-
-                stay_below = log_dp + log_l
-
-                become_tie = torch.full_like(log_dp, float("-inf"))
-                become_tie[:, :, 1:] = log_dp[:, :, :-1] + log_e
-
-                log_dp = torch.logaddexp(
-                    stay_below,
-                    become_tie,
-                )
-
-            log_uniform_win_mass = torch.logsumexp(
-                log_dp
-                - tie_denominators_log_base[:m].view(1, 1, m),
-                dim=-1,
-            )
-            # [bsz, proposed winner i], FP64
 
         log_a_active = (
             target_sample_log_probs
-            + log_uniform_win_mass
+            + log_smallest_index_win_mass
         )
         # [bsz, m], FP64
 
-        # Retain a diagnostic quantity with the old name/shape expectation:
-        # this is now the log probability that the competitor field permits i
-        # to win after exact uniform tie-breaking, rather than simply sum log F.
-        log_product = log_uniform_win_mass
+        # Retain the existing diagnostic field name/shape.  It is the log
+        # probability that the competitor field permits i to win under the
+        # deterministic smallest-index tie rule.
+        log_product = log_smallest_index_win_mass
         target_sample_log_probs_64 = target_sample_log_probs
 
         # No longer needed before returning.
         del sorted_logits
+        del sorted_log_confidence
+        del target_conf_values
         del log_cdf
         del log_L
-        if has_cross_tie:
-            del log_E
-            del log_dp
-            del log_L_by_i
-            del log_E_by_i
+        del log_LE
+        del left_idx
+        del right_idx
+        del left_gather_idx
+        del right_gather_idx
+        del equal_count
+        del has_equal
+        del eye_m
+        del cross_tie_mask
+        del proposed_i
+        del competitor_factor
+        del log_smallest_index_win_mass
 
         # --------------------------------------------------------------
         # Scatter back into the fixed 50-slot representation.
@@ -3086,8 +3059,8 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
         The cached estimator values do not retain vocabulary-sized tensors.
         Therefore a cache hit performs only a diagnostic model forward and
-        categorical sampling; it does NOT recompute sorting, CDF thresholds,
-        tie DP, a_i(S), A(S), or q(i|S).
+        categorical sampling; it does NOT recompute sorting, CDF comparisons,
+        a_i(S), A(S), or q(i|S).
 
         Returns one CPU bool tensor [draw_count, m] per representative state.
         """
@@ -3797,7 +3770,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         ],
         "num_masked": masked_len,
         "validated_no_ties": False,
-        "tie_breaking": "uniform_among_max_confidence",
+        "tie_breaking": "smallest_index_among_max_confidence",
         "model_forward_dtype": "native",
         "estimator_dtype_after_logits": "float64",
         "state_cache_enabled": cache_enabled,
@@ -4725,27 +4698,17 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
 
              c_i(v | S) = softmax(logits_i)_v.
 
-      3. Competition between a proposed winner i and competitor j uses the
-         same FP64 threshold construction as the successful-trajectory
-         estimator:
+      3. Ranking compares FP64 log-confidences directly:
 
-             log c_i
-                 = l_i(v_i) - log Z_i
+             log c_i(V_i)
+                 = l_i(V_i) - log Z_i.
 
-             threshold_{j,i}
-                 = log Z_j + log c_i
+         No raw-logit confidence threshold is reconstructed.
 
-         and competitor j is classified by comparing its sampled raw logit
-         l_j(v_j) against threshold_{j,i}.
-
-         This is algebraically equivalent to comparing normalized
-         log-confidences directly, but importantly follows the same
-         floating-point operation ordering as the successful-trajectory
-         estimator.
-
-      4. If K competitors tie the proposed winner at the maximum confidence,
-         that proposed winner receives weight 1/(K+1). Sampling among the
-         resulting winner weights implements uniform tie-breaking.
+      4. If multiple positions tie at the maximum sampled confidence, the
+         smallest sequence index is selected deterministically. Because
+         masked_pos is sorted and active slots preserve that order, this is
+         the first tied active slot.
 
       5. If the chosen position's sampled token is not the target z_i, the
          trajectory immediately fails. Otherwise the target token is
@@ -5286,171 +5249,79 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                     # [m, group_size]
 
                     # ==================================================
-                    # Winner selection -- SAME threshold arithmetic as STS
+                    # Winner selection -- direct FP64 log-confidence ranking
                     #
-                    # For proposed winner i and competitor j:
+                    # Compare
                     #
-                    #     threshold_{j,i}
+                    #     log c_i(V_i)
                     #       =
-                    #     log Z_j + log c_i(V_i)
+                    #     l_i(V_i) - log Z_i
                     #
-                    # Then:
+                    # directly across positions.  This avoids reconstructing
+                    # raw-logit thresholds and therefore removes the associated
+                    # subtraction/addition round trip.
                     #
-                    #     below : l_j(V_j) < threshold_{j,i}
-                    #     equal : l_j(V_j) == threshold_{j,i}
-                    #     above : l_j(V_j) > threshold_{j,i}
-                    #
-                    # A proposed winner is eligible iff nobody is above it.
-                    # If K other positions tie it, its decoder probability
-                    # is 1/(K+1).
-                    #
-                    # This is exactly the pointwise counterpart of the
-                    # L/E + uniform-tie treatment in STS.
+                    # Ties are resolved deterministically in favor of the
+                    # smallest sequence index.  masked_pos is sorted and
+                    # state_active_slots preserves that order, so the first
+                    # tied local position is exactly the smallest sequence index.
                     # ==================================================
 
-                    # competitor_raw_logits[j, 1, trajectory]
-                    competitor_raw_logits = (
-                        sampled_raw_logits
-                        .unsqueeze(1)
-                    )
-                    # [competitor j, 1, group]
-
-                    # thresholds[j, proposed i, trajectory]
-                    thresholds = (
-                        log_Z_conf.view(
-                            m,
-                            1,
-                            1,
-                        )
-                        + sampled_log_confidence.unsqueeze(0)
-                    )
-                    # [competitor j, proposed i, group]
-
-                    self_mask = torch.eye(
-                        m,
-                        dtype=torch.bool,
-                        device=device,
-                    ).unsqueeze(-1)
-                    # [j, i, 1]
-
-                    competitor_above = (
-                        competitor_raw_logits
-                        > thresholds
-                    ) & (~self_mask)
-
-                    competitor_equal = (
-                        competitor_raw_logits
-                        == thresholds
-                    ) & (~self_mask)
-
-                    has_competitor_above = (
-                        competitor_above.any(dim=0)
-                    )
-                    # [proposed i, group]
-
-                    tied_competitor_count = (
-                        competitor_equal.sum(dim=0)
-                    )
-                    # [proposed i, group]
-
-                    proposed_winner_weights = torch.where(
-                        ~has_competitor_above,
-                        1.0
-                        / (
-                            tied_competitor_count.to(
-                                torch.float64
-                            )
-                            + 1.0
-                        ),
-                        torch.zeros(
-                            (),
-                            dtype=torch.float64,
-                            device=device,
-                        ),
-                    )
-                    # [proposed i, group]
-
-                    winner_weights = (
-                        proposed_winner_weights
-                        .transpose(0, 1)
-                        .contiguous()
-                    )
-                    # [group, m]
-
-                    # --------------------------------------------------
-                    # In exact arithmetic, each row sums to exactly 1:
-                    #
-                    #   - strict max: one weight 1
-                    #   - r-way max tie: r weights 1/r
-                    #
-                    # The reconstructed STS thresholds can theoretically
-                    # create a pathological all-zero row through floating-
-                    # point round-trip effects. That should be extraordinarily
-                    # rare, but provide a deterministic semantic fallback
-                    # rather than passing an invalid row to multinomial.
-                    # --------------------------------------------------
-
-                    winner_mass = winner_weights.sum(
-                        dim=-1
-                    )
-
-                    invalid_winner_rows = (
-                        (~torch.isfinite(winner_mass))
-                        | (winner_mass <= 0.0)
-                    )
-
-                    if bool(
-                        invalid_winner_rows.any().item()
-                    ):
-                        # Fallback to the direct normalized-confidence
-                        # definition used by the decoder. This path exists
-                        # only for numerically pathological threshold rows.
-                        direct_conf = (
-                            sampled_log_confidence
-                            .transpose(0, 1)
-                        )
-                        # [group, m]
-
-                        direct_max = direct_conf.max(
-                            dim=-1,
+                    max_sampled_log_confidence = (
+                        sampled_log_confidence.max(
+                            dim=0,
                             keepdim=True,
                         ).values
+                    )
+                    # [1, group_size]
 
-                        direct_ties = (
-                            direct_conf == direct_max
-                        ).to(torch.float64)
+                    is_max_confidence = (
+                        sampled_log_confidence
+                        == max_sampled_log_confidence
+                    )
+                    # [m, group_size]
 
-                        winner_weights[
-                            invalid_winner_rows
-                        ] = direct_ties[
-                            invalid_winner_rows
-                        ]
+                    chosen_local_positions = (
+                        is_max_confidence
+                        .to(torch.int64)
+                        .argmax(dim=0)
+                    )
+                    # [group_size]
 
-                    # Uniform tie-breaking is now represented by the
-                    # 1/(K+1) weights above. torch.multinomial normalizes
-                    # the row automatically.
+                    # Preserve the historical RNG-consumption pattern of this
+                    # function.  Previously every step sampled a winner from the
+                    # (uniform-on-tied-maxima) winner weights, even when the
+                    # maximum was unique.  The draw is now semantically ignored
+                    # because tie-breaking is deterministic, but retaining it
+                    # keeps all later candidate-token draws aligned with the old
+                    # implementation whenever the preceding state path is the same.
+                    winner_weights = (
+                        is_max_confidence
+                        .transpose(0, 1)
+                        .to(torch.float64)
+                        .contiguous()
+                    )
+                    winner_weights.div_(
+                        winner_weights.sum(
+                            dim=-1,
+                            keepdim=True,
+                        )
+                    )
+
                     if sample_on_device:
-                        chosen_local_positions = (
-                            torch.multinomial(
-                                winner_weights,
-                                num_samples=1,
-                                replacement=True,
-                                generator=rng,
-                            )
-                            .squeeze(-1)
+                        discarded_tie_draw = torch.multinomial(
+                            winner_weights,
+                            num_samples=1,
+                            replacement=True,
+                            generator=rng,
                         )
                     else:
-                        chosen_local_positions = (
-                            torch.multinomial(
-                                winner_weights.detach().cpu(),
-                                num_samples=1,
-                                replacement=True,
-                                generator=rng,
-                            )
-                            .squeeze(-1)
-                            .to(device)
+                        discarded_tie_draw = torch.multinomial(
+                            winner_weights.detach().cpu(),
+                            num_samples=1,
+                            replacement=True,
+                            generator=rng,
                         )
-                    # [group_size]
 
                     # ==================================================
                     # Permanently revealed position
@@ -5548,17 +5419,10 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                     del sampled_token_ids
                     del sampled_raw_logits
                     del sampled_log_confidence
-                    del competitor_raw_logits
-                    del thresholds
-                    del self_mask
-                    del competitor_above
-                    del competitor_equal
-                    del has_competitor_above
-                    del tied_competitor_count
-                    del proposed_winner_weights
+                    del max_sampled_log_confidence
+                    del is_max_confidence
                     del winner_weights
-                    del winner_mass
-                    del invalid_winner_rows
+                    del discarded_tie_draw
                     del chosen_local_positions
                     del sampled_token_ids_by_trajectory
 
