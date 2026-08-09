@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--decoding-scheme', choices=['auto', 'full', 'top_k', 'greedy', 'ELBO', 'elbo', 'random'], default='full')
     parser.add_argument('--k', type=int, default=40, help='Top-k value when --decoding-scheme top_k')
-    parser.add_argument('--temperature', type=float, default=0.0, help='Temperature for non-greedy llama decoding and llada target-token-confidence remasking')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for non-greedy llama decoding and llada target-token-confidence remasking')
     parser.add_argument('--remasking', choices=['low-confidence', 'target-token-confidence', 'random', 'highest-index'], default='low-confidence',
                         help='Remasking strategy when --model-family llada')
     parser.add_argument(
