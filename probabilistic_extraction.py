@@ -2,7 +2,7 @@ import math
 import secrets
 from dataclasses import dataclass
 from itertools import combinations
-from typing import Dict, List, Optional, Sequence, Tuple, Any
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +19,7 @@ class MonteCarloResult:
     wilson_ci: Tuple[float, float]
     hits: int
     num_samples: int
+    verbose_samples: Optional[List[Dict[str, object]]] = None
 
 
 def validate_masked_indexes(masked_indexes: Optional[Sequence[int]]) -> Optional[List[int]]:
@@ -4273,6 +4274,7 @@ def compute_diffusion_probabilistic_extraction(
     masked_indexes: Optional[Sequence[int]] = None,
     verbose: bool = False,
     verbose_compact: bool = False,
+    verbose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
 ):
     """
     Compute probabilistic extraction under LLaDA Algorithm-5 style low-confidence remasking.
@@ -4317,18 +4319,29 @@ def compute_diffusion_probabilistic_extraction(
     normalized_decoding_scheme = decoding_scheme.lower()
     if verbose_compact and not verbose:
         raise ValueError('verbose_compact requires verbose=True.')
+    if verbose_callback is not None and not verbose:
+        raise ValueError('verbose_callback requires verbose=True.')
     if verbose:
-        valid_verbose = (
+        valid_path_verbose = (
             normalized_masked_indexes is not None
             and remasking == 'low-confidence'
             and estimation_method == 'path_sampling'
             and normalized_decoding_scheme == 'full'
             and math.isclose(float(temperature), 1.0, rel_tol=0.0, abs_tol=1e-9)
         )
-        if not valid_verbose:
+        valid_mc_verbose = (
+            normalized_masked_indexes is not None
+            and remasking == 'low-confidence'
+            and estimation_method == 'monte-carlo'
+            and normalized_decoding_scheme == 'full'
+            and math.isfinite(float(temperature))
+            and float(temperature) > 0.0
+        )
+        if not (valid_path_verbose or valid_mc_verbose):
             raise ValueError(
                 'verbose diagnostics require partially masked low-confidence '
-                'path sampling with full decoding and temperature 1.'
+                'path sampling at temperature 1 or Monte Carlo sampling at '
+                'positive temperature, both with full decoding.'
             )
     if normalized_decoding_scheme not in {'full', 'top_k', 'elbo'}:
         raise ValueError("decoding_scheme must be one of {'full', 'top_k', 'ELBO'} for model_family='llada'.")
@@ -4598,6 +4611,9 @@ def compute_diffusion_probabilistic_extraction(
                 temperature=temperature,
                 decoding_scheme=decoding_scheme,
                 k=k,
+                verbose=verbose,
+                verbose_compact=verbose_compact,
+                verbose_callback=verbose_callback,
             )
         
     else:
@@ -4625,6 +4641,7 @@ def compute_diffusion_probabilistic_extraction(
         'wilson_ci': mc.wilson_ci,
         'hits': mc.hits,
         'num_samples': mc.num_samples,
+        'verbose_samples': mc.verbose_samples,
         'decoding_scheme': decoding_scheme,
         'k': k if decoding_scheme == 'top_k' else None,
     }
@@ -4662,6 +4679,44 @@ def _add_gumbel_noise_with_generator(
 
     return logits.exp() / gumbel_noise
 
+
+def _monte_carlo_verbose_step_record(
+    step: int,
+    sequence_indices: List[int],
+    sampled_log_confidence: List[float],
+    highest_possible_confidence_indices: List[int],
+    sampled_tie_indices: List[int],
+    compact: bool,
+) -> Dict[str, object]:
+    """Build one JSON-safe Monte Carlo verbose step record."""
+    record: Dict[str, object] = {
+        'step_index': int(step),
+        'highest_possible_confidence_indices': [
+            int(index) for index in highest_possible_confidence_indices
+        ],
+    }
+    if compact:
+        record['sequence_indices'] = [int(index) for index in sequence_indices]
+        record['sampled_log_confidence'] = [
+            float(value) for value in sampled_log_confidence
+        ]
+    else:
+        record['candidates'] = [
+            {
+                'sequence_index': int(index),
+                'sampled_log_confidence': float(log_confidence),
+            }
+            for index, log_confidence in zip(
+                sequence_indices, sampled_log_confidence
+            )
+        ]
+    if len(sampled_tie_indices) > 1:
+        record['sampled_tie_indices'] = [
+            int(index) for index in sampled_tie_indices
+        ]
+    return record
+
+
 @torch.inference_mode()
 def _monte_carlo_probability_temperature_fast_from_partially_masked(
     model,
@@ -4677,6 +4732,9 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     k: int,
     mc_batch_size: int = 512,
     model_batch_size: int = 64,
+    verbose: bool = False,
+    verbose_compact: bool = False,
+    verbose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
 ) -> MonteCarloResult:
     """
     Naive Monte Carlo estimator for one-token-per-step low-confidence remasking.
@@ -4716,7 +4774,8 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
 
     The returned estimate is hits / num_samples.
 
-    The public API and MonteCarloResult output format are unchanged.
+    Verbose diagnostics are observational only: they add no random draws and
+    do not participate in winner selection or state transitions.
     """
 
     # ------------------------------------------------------------------
@@ -4783,6 +4842,12 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
             "model_batch_size must be positive."
         )
 
+    if verbose_compact and not verbose:
+        raise ValueError("verbose_compact requires verbose=True.")
+
+    if verbose_callback is not None and not verbose:
+        raise ValueError("verbose_callback requires verbose=True.")
+
     if str(decoding_scheme).lower() != "full":
         raise ValueError(
             "This convergence-check sampler matches the cached estimator's "
@@ -4834,6 +4899,7 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     # ------------------------------------------------------------------
 
     hits = 0
+    verbose_samples: List[Dict[str, object]] = []
 
     # As in the successful-trajectory implementation, state sharing is valid
     # only when the model itself is deterministic for a fixed input state.
@@ -4879,6 +4945,19 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
             dtype=torch.bool,
             device=device,
         )
+
+        batch_verbose: List[Dict[str, object]] = []
+        if verbose:
+            batch_verbose = [
+                {
+                    'sample_index': batch_start + row,
+                    'is_hit': False,
+                    'reveal_path_indices': [],
+                    'tie_count': 0,
+                    'steps': [],
+                }
+                for row in range(bsz)
+            ]
 
         # ==============================================================
         # Sequential low-confidence decoding
@@ -5358,6 +5437,78 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                     )
 
                     # ==================================================
+                    # Observational verbose diagnostics
+                    #
+                    # These reductions and host copies happen only after
+                    # candidate sampling and winner selection. They consume no
+                    # randomness and do not feed back into the estimator.
+                    # ==================================================
+
+                    if verbose:
+                        maximum_confidence = (
+                            state_active_logits.max(dim=-1).values
+                            - log_Z_conf
+                        )
+                        highest_possible = (
+                            maximum_confidence
+                            == maximum_confidence.max()
+                        )
+
+                        sequence_indices = (
+                            masked_pos_t[state_active_slots] + 1
+                        ).detach().cpu().tolist()
+                        highest_possible_indices = [
+                            int(index)
+                            for index, selected in zip(
+                                sequence_indices,
+                                highest_possible.detach().cpu().tolist(),
+                            )
+                            if selected
+                        ]
+                        sampled_logs_cpu = (
+                            sampled_log_confidence.detach().cpu()
+                        )
+                        sampled_maxima_cpu = (
+                            is_max_confidence.detach().cpu()
+                        )
+                        chosen_indices = (
+                            chosen_abs_positions + 1
+                        ).detach().cpu().tolist()
+
+                        for column, row in enumerate(trajectory_rows):
+                            sampled_tie_indices = [
+                                int(index)
+                                for index, selected in zip(
+                                    sequence_indices,
+                                    sampled_maxima_cpu[:, column].tolist(),
+                                )
+                                if selected
+                            ]
+                            step_record = _monte_carlo_verbose_step_record(
+                                step=step,
+                                sequence_indices=sequence_indices,
+                                sampled_log_confidence=(
+                                    sampled_logs_cpu[:, column].tolist()
+                                ),
+                                highest_possible_confidence_indices=(
+                                    highest_possible_indices
+                                ),
+                                sampled_tie_indices=sampled_tie_indices,
+                                compact=verbose_compact,
+                            )
+                            batch_verbose[row]['steps'].append(step_record)
+                            batch_verbose[row]['reveal_path_indices'].append(
+                                int(chosen_indices[column])
+                            )
+                            if len(sampled_tie_indices) > 1:
+                                batch_verbose[row]['tie_count'] += 1
+
+                        del maximum_confidence
+                        del highest_possible
+                        del sampled_logs_cpu
+                        del sampled_maxima_cpu
+
+                    # ==================================================
                     # Failed trajectories terminate immediately
                     # ==================================================
 
@@ -5436,6 +5587,16 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
             alive.sum().item()
         )
 
+        if verbose:
+            hit_flags = alive.detach().cpu().tolist()
+            for row, is_hit in enumerate(hit_flags):
+                batch_verbose[row]['is_hit'] = bool(is_hit)
+
+            if verbose_callback is None:
+                verbose_samples.extend(batch_verbose)
+            else:
+                verbose_callback(batch_verbose)
+
     # ------------------------------------------------------------------
     # Bernoulli estimate + uncertainty
     # ------------------------------------------------------------------
@@ -5452,6 +5613,11 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
         wilson_ci=wilson,
         hits=hits,
         num_samples=num_samples,
+        verbose_samples=(
+            verbose_samples
+            if verbose and verbose_callback is None
+            else None
+        ),
     )
 
 

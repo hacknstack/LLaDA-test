@@ -10,7 +10,7 @@ from bisect import bisect_left
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, median
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -62,7 +62,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--verbose',
         action='store_true',
-        help='Write verbose.jsonl for partially masked low-confidence path sampling.',
+        help=(
+            'Write verbose.jsonl for supported partially masked '
+            'low-confidence path sampling or Monte Carlo estimation.'
+        ),
     )
     parser.add_argument(
         '--compact',
@@ -120,6 +123,27 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, list):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _write_verbose_samples(
+    verbose_file,
+    samples: List[Dict[str, object]],
+    evaluation_index: int,
+    window_index: int,
+    masked_indexes: Optional[List[int]],
+) -> None:
+    for sample in samples:
+        record = {
+            'evaluation_index': evaluation_index,
+            'window_index': window_index,
+            'masked_indexes': masked_indexes,
+            **sample,
+        }
+        verbose_file.write(
+            json.dumps(_json_safe(record), separators=(',', ':'), allow_nan=False)
+            + '\n'
+        )
+    verbose_file.flush()
 
 
 def _prepare_requested_windows(requested, text, word_starts, tokenizer, args):
@@ -206,7 +230,11 @@ def _load_model(model_name: str, model_family: str, device: str):
 
 
 def _compute_probability(
-    model, prefix_ids: List[int], suffix_ids: List[int], args: argparse.Namespace
+    model,
+    prefix_ids: List[int],
+    suffix_ids: List[int],
+    args: argparse.Namespace,
+    verbose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
 ) -> Tuple[float, Optional[List[Dict[str, object]]]]:
     prompt_tokens = torch.tensor([prefix_ids], dtype=torch.long)
     target_tokens = torch.tensor([suffix_ids], dtype=torch.long)
@@ -244,11 +272,14 @@ def _compute_probability(
         masked_indexes=args.masked_indexes,
         verbose=args.verbose,
         verbose_compact=args.compact,
+        verbose_callback=verbose_callback,
     )
     if args.mode in {'exact', 'path_sampling'} or str(decoding_scheme).lower() == 'elbo':
         probability = float(result['probability'])
     else:
         probability = float(result['estimate'])
+    if verbose_callback is not None and result['method'] == 'monte-carlo':
+        return probability, []
     return probability, result.get('verbose_samples')
 
 
@@ -322,7 +353,7 @@ def main() -> None:
             raise ValueError("--decoding-scheme must be 'full' when --masked_indexes is used with --mode path_sampling and --remasking low-confidence.")
 
     if args.verbose:
-        valid_verbose = (
+        valid_path_verbose = (
             args.model_family == 'llada'
             and args.mode == 'path_sampling'
             and args.remasking == 'low-confidence'
@@ -330,10 +361,20 @@ def main() -> None:
             and decoding_scheme.lower() == 'full'
             and math.isclose(args.temperature, 1.0, rel_tol=0.0, abs_tol=1e-9)
         )
-        if not valid_verbose:
+        valid_mc_verbose = (
+            args.model_family == 'llada'
+            and args.mode == 'monte-carlo'
+            and args.remasking == 'low-confidence'
+            and args.masked_indexes is not None
+            and decoding_scheme.lower() == 'full'
+            and math.isfinite(args.temperature)
+            and args.temperature > 0.0
+        )
+        if not (valid_path_verbose or valid_mc_verbose):
             raise ValueError(
                 '--verbose requires partially masked LLaDA low-confidence path '
-                'sampling with full decoding and temperature 1.'
+                'sampling at temperature 1 or Monte Carlo sampling at positive '
+                'temperature, both with full decoding.'
             )
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -382,24 +423,36 @@ def main() -> None:
         error = ''
 
         try:
+            verbose_callback = None
+            if verbose_file is not None and args.mode == 'monte-carlo':
+                def _stream_verbose_batch(samples):
+                    _write_verbose_samples(
+                        verbose_file=verbose_file,
+                        samples=samples,
+                        evaluation_index=evaluation_index,
+                        window_index=window_index,
+                        masked_indexes=args.masked_indexes,
+                    )
+
+                verbose_callback = _stream_verbose_batch
+
             p_z, verbose_samples = _compute_probability(
-                model=model, prefix_ids=prefix_ids, suffix_ids=suffix_ids, args=args
+                model=model,
+                prefix_ids=prefix_ids,
+                suffix_ids=suffix_ids,
+                args=args,
+                verbose_callback=verbose_callback,
             )
             if verbose_file is not None:
                 if verbose_samples is None:
                     raise RuntimeError('Verbose estimator data was not returned.')
-                for sample in verbose_samples:
-                    record = {
-                        'evaluation_index': evaluation_index,
-                        'window_index': window_index,
-                        'masked_indexes': args.masked_indexes,
-                        **sample,
-                    }
-                    verbose_file.write(
-                        json.dumps(_json_safe(record), separators=(',', ':'), allow_nan=False)
-                        + '\n'
-                    )
-                verbose_file.flush()
+                _write_verbose_samples(
+                    verbose_file=verbose_file,
+                    samples=verbose_samples,
+                    evaluation_index=evaluation_index,
+                    window_index=window_index,
+                    masked_indexes=args.masked_indexes,
+                )
             print(f"pz {p_z}")
             extracted = int(p_z >= args.tau)
         except Exception as exc:  # noqa: BLE001

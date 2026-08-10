@@ -39,9 +39,12 @@ again and retained in the requested order.
 python sliding_window_extraction.py texts/book.txt --windows 5 1 4 5
 ```
 
-For partially masked LLaDA low-confidence path sampling, `--verbose` writes one
-JSONL record per window/sample to `verbose.jsonl`. Add `--compact` to store the
-per-step candidate values as parallel arrays instead of repeated JSON objects.
+For partially masked LLaDA low-confidence path sampling or Monte Carlo
+estimation, `--verbose` writes one JSONL record per window/sample to
+`verbose.jsonl`. Monte Carlo records include the reveal path, hit status,
+sampled-confidence tie count, and per-step untempered sampled log-confidences.
+Add `--compact` to store per-step candidate values as parallel arrays instead
+of repeated JSON objects.
 `--windows` and `--max-windows` are mutually exclusive, and `--compact` requires
 `--verbose`.
 
