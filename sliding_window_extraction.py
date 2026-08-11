@@ -17,6 +17,7 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from probabilistic_extraction import (
+    _duel_low_confidence_probability_fast_from_partially_masked,
     compute_autoregressive_probabilistic_extraction,
     compute_diffusion_probabilistic_extraction,
     validate_masked_indexes,
@@ -37,7 +38,11 @@ def parse_args() -> argparse.Namespace:
         description='Sliding-window probabilistic extraction for a single text file.'
     )
     parser.add_argument('txt_path', type=Path, help='Input txt file path (e.g. texts/book.txt)')
-    parser.add_argument('--mode', choices=['exact', 'monte-carlo', 'path_sampling'], default='exact')
+    parser.add_argument(
+        '--mode',
+        choices=['exact', 'monte-carlo', 'path_sampling', 'duel'],
+        default='exact',
+    )
     parser.add_argument('--tau', type=float, default=0.001)
     parser.add_argument('--chunk-chars', type=int, default=800)
     parser.add_argument('--stride-words', type=int, default=1)
@@ -64,7 +69,7 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help=(
             'Write verbose.jsonl for supported partially masked '
-            'low-confidence path sampling or Monte Carlo estimation.'
+            'low-confidence path sampling, Monte Carlo, or DUEL estimation.'
         ),
     )
     parser.add_argument(
@@ -125,19 +130,19 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _write_verbose_samples(
+def _write_verbose_records(
     verbose_file,
-    samples: List[Dict[str, object]],
+    records: List[Dict[str, object]],
     evaluation_index: int,
     window_index: int,
     masked_indexes: Optional[List[int]],
 ) -> None:
-    for sample in samples:
+    for item in records:
         record = {
             'evaluation_index': evaluation_index,
             'window_index': window_index,
             'masked_indexes': masked_indexes,
-            **sample,
+            **item,
         }
         verbose_file.write(
             json.dumps(_json_safe(record), separators=(',', ':'), allow_nan=False)
@@ -255,6 +260,21 @@ def _compute_probability(
         )
         return float(result['probability']), None
 
+    if args.mode == 'duel':
+        sequence_tokens = torch.cat([prompt_tokens, target_tokens], dim=1)
+        result = _duel_low_confidence_probability_fast_from_partially_masked(
+            model=model,
+            sequence_tokens=sequence_tokens,
+            masked_indexes=args.masked_indexes,
+            steps=len(args.masked_indexes),
+            attention_mask=None,
+            mask_id=MASK_ID,
+            temperature=args.temperature,
+            verbose=args.verbose,
+            verbose_compact=args.compact,
+        )
+        return float(result['probability']), result.get('verbose_steps')
+
     result = compute_diffusion_probabilistic_extraction(
         model=model,
         prompt_tokens=prompt_tokens,
@@ -329,6 +349,15 @@ def main() -> None:
     else:
         if decoding_scheme.lower() not in {'top_k', 'full', 'elbo', 'random'}:
             raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'ELBO', 'random'} when --model-family llada.")
+    if args.model_family == 'llada' and args.mode == 'duel':
+        if args.remasking != 'low-confidence':
+            raise ValueError("--mode duel requires --remasking low-confidence.")
+        if args.masked_indexes is None:
+            raise ValueError("--mode duel requires --masked_indexes with exactly 50 positions.")
+        if decoding_scheme.lower() != 'full':
+            raise ValueError("--mode duel requires --decoding-scheme full (or auto for LLaDA).")
+        if not math.isfinite(args.temperature) or args.temperature <= 0:
+            raise ValueError("--mode duel requires a finite --temperature greater than 0.")
     if decoding_scheme == 'top_k' and args.k <= 0:
         raise ValueError("--k must be > 0 when --decoding-scheme top_k.")
     if args.model_family == 'llada' and args.remasking == 'target-token-confidence':
@@ -370,11 +399,20 @@ def main() -> None:
             and math.isfinite(args.temperature)
             and args.temperature > 0.0
         )
-        if not (valid_path_verbose or valid_mc_verbose):
+        valid_duel_verbose = (
+            args.model_family == 'llada'
+            and args.mode == 'duel'
+            and args.remasking == 'low-confidence'
+            and args.masked_indexes is not None
+            and decoding_scheme.lower() == 'full'
+            and math.isfinite(args.temperature)
+            and args.temperature > 0.0
+        )
+        if not (valid_path_verbose or valid_mc_verbose or valid_duel_verbose):
             raise ValueError(
                 '--verbose requires partially masked LLaDA low-confidence path '
-                'sampling at temperature 1 or Monte Carlo sampling at positive '
-                'temperature, both with full decoding.'
+                'sampling at temperature 1, or Monte Carlo/DUEL estimation at '
+                'positive temperature, all with full decoding.'
             )
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -426,9 +464,9 @@ def main() -> None:
             verbose_callback = None
             if verbose_file is not None and args.mode == 'monte-carlo':
                 def _stream_verbose_batch(samples):
-                    _write_verbose_samples(
+                    _write_verbose_records(
                         verbose_file=verbose_file,
-                        samples=samples,
+                        records=samples,
                         evaluation_index=evaluation_index,
                         window_index=window_index,
                         masked_indexes=args.masked_indexes,
@@ -436,7 +474,7 @@ def main() -> None:
 
                 verbose_callback = _stream_verbose_batch
 
-            p_z, verbose_samples = _compute_probability(
+            p_z, verbose_records = _compute_probability(
                 model=model,
                 prefix_ids=prefix_ids,
                 suffix_ids=suffix_ids,
@@ -444,11 +482,11 @@ def main() -> None:
                 verbose_callback=verbose_callback,
             )
             if verbose_file is not None:
-                if verbose_samples is None:
+                if verbose_records is None:
                     raise RuntimeError('Verbose estimator data was not returned.')
-                _write_verbose_samples(
+                _write_verbose_records(
                     verbose_file=verbose_file,
-                    samples=verbose_samples,
+                    records=verbose_records,
                     evaluation_index=evaluation_index,
                     window_index=window_index,
                     masked_indexes=args.masked_indexes,

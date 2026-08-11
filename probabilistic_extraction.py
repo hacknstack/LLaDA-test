@@ -5620,6 +5620,456 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
         ),
     )
 
+@torch.inference_mode()
+def _duel_low_confidence_probability_fast_from_partially_masked(
+    model,
+    sequence_tokens: torch.Tensor,          # [1, 100], full target sequence z
+    masked_indexes: list[int],              # 1-indexed masked positions M
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    temperature: float,
+    verbose: bool = False,
+    verbose_compact: bool = False,
+) -> Dict[str, object]:
+    """
+    Deterministic DUEL estimator for low-confidence remasking.
+
+    DUEL constructs one deterministic reveal path and then evaluates the
+    target-token probability along that path.
+
+    At state S, every still-masked position i is assigned its highest possible
+    UNTEMPERED confidence
+
+        h_i(S) = max_v softmax(logits_i)_v.
+
+    For numerical alignment with the low-confidence MC and successful-
+    trajectory implementations, positions are ranked directly in FP64
+    log-confidence space:
+
+        log h_i(S)
+            = max_v logits_i(v)
+              - logsumexp_v logits_i(v).
+
+    The position with largest log h_i(S) is revealed next.  Exact ties are
+    resolved by taking the smallest sequence index.  The selected position is
+    then forced to its target token z_i and the model is evaluated again at the
+    next state.  All other unrevealed positions remain masked.
+
+    If the resulting deterministic reveal path is
+
+        pi = (pi_1, ..., pi_|M|),
+
+    DUEL returns the chain-rule target probability along that path:
+
+        p_DUEL(z_M | z_not_M)
+            = prod_k p_{pi_k}(z_{pi_k} | S_{k-1}),
+
+    where target-token sampling probabilities use the requested temperature
+
+        p_i(v | S) = softmax(logits_i / temperature)_v.
+
+    Importantly, DUEL does NOT multiply by the probability of selecting the
+    reveal path itself.  The reveal path is treated as deterministic.
+
+    The implementation performs path construction and path scoring in one pass:
+    the same model forward that determines pi_k also supplies
+    p_{pi_k}(z_{pi_k} | S_{k-1}).  For a deterministic model this is
+    mathematically identical to first constructing the complete path and then
+    replaying that path to score it, while requiring half as many model forwards.
+
+    NUMERICAL STRATEGY
+    ------------------
+    To match the other low-confidence estimators as closely as possible:
+      - the model forward stays in the model's existing/native dtype;
+      - autocast is disabled around the forward so an outer autocast context
+        cannot silently change that dtype;
+      - logits at active masked positions are immediately promoted to FP64;
+      - confidence ranking and target-token probabilities are computed in FP64;
+      - multiplicative target probabilities are accumulated in log-space;
+      - low-confidence ranking is UNTEMPERED, while target-token probability
+        uses the requested sampling temperature;
+      - exact cross-position confidence ties choose the smallest sequence index.
+
+    Assumptions aligned with the successful-trajectory implementation:
+      - sequence_tokens has shape [1, 100];
+      - masked_indexes contains exactly 50 valid 1-indexed positions;
+      - steps == len(masked_indexes);
+      - attention_mask, if provided, has shape [1, 100].
+
+    Notes
+    -----
+    DUEL itself uses no random sampling and therefore has no num_samples or seed
+    argument.  Determinism additionally assumes the model is deterministic for a
+    fixed input state (normally model.eval()).
+    """
+
+    device = _model_device(model)
+
+    # Keep model parameters/buffers in their existing dtype.  As in the other
+    # estimators, only active-position logits are widened to FP64 after forward.
+    sequence_tokens = sequence_tokens.to(device)
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    if sequence_tokens.ndim != 2 or sequence_tokens.shape[0] != 1:
+        raise ValueError(
+            f"sequence_tokens must have shape [1, 100], "
+            f"got {tuple(sequence_tokens.shape)}"
+        )
+
+    seq_len = int(sequence_tokens.shape[1])
+
+    if seq_len != 100:
+        raise ValueError(
+            f"Expected sequence length 100, got {seq_len}"
+        )
+
+    # Convert 1-indexed masked positions to sorted unique 0-indexed positions.
+    # Keeping them sorted makes torch.argmax's first-maximum behavior exactly
+    # implement smallest-sequence-index tie breaking below.
+    masked_pos = sorted(
+        set(int(i) - 1 for i in masked_indexes)
+    )
+
+    if len(masked_pos) != 50:
+        raise ValueError(
+            f"Expected exactly 50 masked positions out of 100, "
+            f"got {len(masked_pos)}"
+        )
+
+    if len(masked_pos) != len(masked_indexes):
+        raise ValueError(
+            "masked_indexes must not contain duplicate positions."
+        )
+
+    if any(pos < 0 or pos >= seq_len for pos in masked_pos):
+        raise ValueError(
+            "masked_indexes must be 1-indexed positions in [1, 100]"
+        )
+
+    masked_len = len(masked_pos)
+
+    if steps != masked_len:
+        raise ValueError(
+            "DUEL reveals exactly one masked token per step, so steps must equal "
+            f"len(masked_indexes)={masked_len}."
+        )
+
+    if (
+        not math.isfinite(float(temperature))
+        or float(temperature) <= 0.0
+    ):
+        raise ValueError(
+            "DUEL full-distribution estimator requires finite temperature > 0."
+        )
+
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+
+        if attention_mask.shape != (1, seq_len):
+            raise ValueError(
+                f"attention_mask must have shape [1, {seq_len}], "
+                f"got {tuple(attention_mask.shape)}"
+            )
+
+    tau = float(temperature)
+
+    masked_pos_t = torch.tensor(
+        masked_pos,
+        dtype=torch.long,
+        device=device,
+    )  # [50]
+
+    full_target_row = sequence_tokens[0]
+    masked_target_row = full_target_row[masked_pos_t]
+    # [50]
+
+    # ------------------------------------------------------------------
+    # Initial state: observed positions = z, masked positions = M
+    # ------------------------------------------------------------------
+
+    x = sequence_tokens.clone()
+    x[:, masked_pos_t] = mask_id
+
+    revealed = torch.zeros(
+        masked_len,
+        dtype=torch.bool,
+        device=device,
+    )
+
+    slot_grid = torch.arange(
+        masked_len,
+        dtype=torch.long,
+        device=device,
+    )
+
+    # Accumulate log P = sum_k log p_{pi_k}(z_{pi_k} | S_{k-1}).
+    log_probability = torch.zeros(
+        (),
+        dtype=torch.float64,
+        device=device,
+    )
+
+    reveal_path_indices: List[int] = []
+    verbose_steps: List[Dict[str, object]] = []
+
+    # ==================================================================
+    # Deterministic DUEL path construction + chain-rule scoring
+    # ==================================================================
+
+    for step in range(masked_len):
+        m = masked_len - step
+
+        # Active masked slots remain in ascending masked-slot order, and
+        # masked_pos itself is ascending absolute sequence-index order.
+        active_slots = slot_grid[~revealed]
+        # [m]
+
+        active_abs_positions = masked_pos_t[active_slots]
+        # [m]
+
+        batched_attn = attention_mask
+
+        # --------------------------------------------------------------
+        # Model forward -- same dtype policy as MC / STS
+        # --------------------------------------------------------------
+
+        if device.type in {"cuda", "cpu"}:
+            with torch.autocast(
+                device_type=device.type,
+                enabled=False,
+            ):
+                outputs = model(
+                    x,
+                    attention_mask=batched_attn,
+                )
+        else:
+            outputs = model(
+                x,
+                attention_mask=batched_attn,
+            )
+
+        logits = outputs.logits
+        del outputs
+
+        # Gather logits only for still-masked positions, then widen to FP64.
+        active_logits_native = logits[
+            0,
+            active_abs_positions,
+            :,
+        ]
+        del logits
+
+        active_logits = active_logits_native.to(torch.float64)
+        del active_logits_native
+        # [m, vocab]
+
+        # ==============================================================
+        # 1. DUEL ranking: highest POSSIBLE untempered confidence
+        #
+        #    log h_i = max_v l_i(v) - logsumexp_v l_i(v)
+        #
+        # Compare these FP64 log-confidences directly.
+        # ==============================================================
+
+        log_Z_conf = torch.logsumexp(
+            active_logits,
+            dim=-1,
+        )
+        # [m]
+
+        max_raw_logits = active_logits.max(
+            dim=-1,
+        ).values
+        # [m]
+
+        highest_log_confidence = (
+            max_raw_logits
+            - log_Z_conf
+        )
+        # [m]
+
+        # torch.argmax returns the first exact maximum.  Because active_slots
+        # and active_abs_positions are ascending, this is precisely the
+        # smallest sequence index among tied maxima.
+        chosen_local = torch.argmax(
+            highest_log_confidence
+        )
+
+        chosen_slot = active_slots[chosen_local]
+        chosen_abs_position = active_abs_positions[chosen_local]
+
+        # ==============================================================
+        # 2. Target-token probability at the SAME state
+        #
+        # Sampling probability uses temperature, while DUEL ranking above
+        # remains untempered.
+        # ==============================================================
+
+        if tau == 1.0:
+            log_Z_sample = log_Z_conf
+        else:
+            log_Z_sample = torch.logsumexp(
+                active_logits / tau,
+                dim=-1,
+            )
+
+        active_target_ids = masked_target_row[active_slots]
+        target_raw_logits = torch.gather(
+            active_logits,
+            dim=-1,
+            index=active_target_ids.unsqueeze(-1),
+        ).squeeze(-1)
+        # [m]
+
+        target_sample_log_probs = (
+            target_raw_logits / tau
+            - log_Z_sample
+        )
+        # [m]
+
+        chosen_target_log_probability = target_sample_log_probs[
+            chosen_local
+        ]
+
+        log_probability = (
+            log_probability
+            + chosen_target_log_probability
+        )
+
+        # ==============================================================
+        # 3. Force the selected position to its target token
+        # ==============================================================
+
+        chosen_target_id = masked_target_row[chosen_slot]
+
+        x[0, chosen_abs_position] = chosen_target_id
+        revealed[chosen_slot] = True
+
+        # Public/API-facing reveal path uses 1-indexed absolute positions.
+        chosen_abs_position_1idx = int(
+            chosen_abs_position.item()
+        ) + 1
+        reveal_path_indices.append(
+            chosen_abs_position_1idx
+        )
+
+        if verbose:
+            chosen_local_int = int(chosen_local.item())
+
+            if verbose_compact:
+                step_record: Dict[str, object] = {
+                    "step": step + 1,
+                    "revealed_index": chosen_abs_position_1idx,
+                    "target_log_probability": float(
+                        chosen_target_log_probability.item()
+                    ),
+                    "highest_log_confidence": float(
+                        highest_log_confidence[chosen_local].item()
+                    ),
+                }
+            else:
+                active_indices_1idx = (
+                    active_abs_positions + 1
+                ).detach().cpu().tolist()
+
+                step_record = {
+                    "step": step + 1,
+                    "revealed_index": chosen_abs_position_1idx,
+                    "revealed_masked_slot": int(chosen_slot.item()),
+                    "target_token_id": int(chosen_target_id.item()),
+                    "target_log_probability": float(
+                        chosen_target_log_probability.item()
+                    ),
+                    "target_probability": float(
+                        torch.exp(chosen_target_log_probability).item()
+                    ),
+                    "highest_log_confidence": float(
+                        highest_log_confidence[chosen_local].item()
+                    ),
+                    "highest_confidence": float(
+                        torch.exp(
+                            highest_log_confidence[chosen_local]
+                        ).item()
+                    ),
+                    "active_indices": [
+                        int(v) for v in active_indices_1idx
+                    ],
+                    "active_highest_log_confidences": (
+                        highest_log_confidence
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ),
+                    "active_target_log_probabilities": (
+                        target_sample_log_probs
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ),
+                    "chosen_local_index": chosen_local_int,
+                }
+
+            verbose_steps.append(step_record)
+
+        del active_logits
+        del log_Z_conf
+        del max_raw_logits
+        del highest_log_confidence
+        del log_Z_sample
+        del active_target_ids
+        del target_raw_logits
+        del target_sample_log_probs
+        del chosen_target_log_probability
+
+    # ==================================================================
+    # Final probability
+    # ==================================================================
+
+    log_probability_value = float(
+        log_probability.item()
+    )
+
+    if math.isfinite(log_probability_value):
+        try:
+            probability = float(
+                math.exp(log_probability_value)
+            )
+        except OverflowError:
+            probability = float("inf")
+    else:
+        probability = 0.0
+
+    # ==================================================================
+    # Output -- dictionary style aligned with the successful-trajectory API
+    # ==================================================================
+
+    result: Dict[str, object] = {
+        "probability": probability,
+        "log_probability": log_probability_value,
+        "estimation_method": "duel_low_confidence_fast_from_partially_masked",
+        "decoding_scheme": "full",
+        "temperature": temperature,
+        "masked_indexes": [
+            int(i) for i in masked_indexes
+        ],
+        "num_masked": masked_len,
+        "reveal_path_indices": reveal_path_indices,
+        "tie_breaking": "smallest_index_among_max_confidence",
+        "path_construction": "max_possible_untempered_confidence",
+        "path_probability": "target_token_chain_rule_only",
+        "model_forward_dtype": "native",
+        "estimator_dtype_after_logits": "float64",
+    }
+
+    result["verbose_steps"] = (
+        verbose_steps if verbose else None
+    )
+
+    return result
 
 @torch.no_grad()
 def compute_autoregressive_probabilistic_extraction(

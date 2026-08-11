@@ -48,6 +48,19 @@ of repeated JSON objects.
 `--windows` and `--max-windows` are mutually exclusive, and `--compact` requires
 `--verbose`.
 
+DUEL is a deterministic, partially masked LLaDA low-confidence estimator. It
+requires exactly 50 unique, 1-indexed masked positions in a 100-token window,
+full decoding, and a positive temperature. For example, to mask the 50-token
+suffix:
+
+```bash
+python sliding_window_extraction.py texts/book.txt --mode duel --model-family llada --temperature 1.0 --masked_indexes 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100
+```
+
+With DUEL, `--verbose` writes one JSONL record per reveal step (50 records per
+window), rather than one record per sampled trajectory. `--num-samples` and
+`--seed` are not used by DUEL.
+
 ### `results/`
 Contains experiment outputs, organized by model and result type.
 - `LLaDA 8B Base/` — output folders for the LLaDA 8B Base model
