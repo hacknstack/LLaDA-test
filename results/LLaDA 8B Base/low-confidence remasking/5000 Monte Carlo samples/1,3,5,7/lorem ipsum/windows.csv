@@ -1,0 +1,6 @@
+evaluation_index,window_index,char_start,char_end,p_z,extracted,error,n_tokens_in_chunk,sequence_len_tokens
+0,17,110,910,0.0016,1,,271,100
+1,50,326,1126,0.0,0,,227,100
+2,68,438,1238,0.0,0,,188,100
+3,77,500,1300,0.0,0,,168,100
+4,83,544,1344,0.0,0,,152,100

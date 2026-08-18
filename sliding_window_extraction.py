@@ -17,6 +17,7 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from probabilistic_extraction import (
+    MAX_EXACT_LOW_CONFIDENCE_MASKED,
     _duel_low_confidence_probability_fast_from_partially_masked,
     compute_autoregressive_probabilistic_extraction,
     compute_diffusion_probabilistic_extraction,
@@ -79,15 +80,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--decoding-scheme', choices=['auto', 'full', 'top_k', 'greedy', 'ELBO', 'elbo', 'random'], default='full')
     parser.add_argument('--k', type=int, default=40, help='Top-k value when --decoding-scheme top_k')
-    parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for non-greedy llama decoding and llada target-token-confidence remasking')
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=1.0,
+        help=(
+            'Sampling temperature. Partially masked exact low-confidence '
+            'LLaDA requires a finite value greater than 0.'
+        ),
+    )
     parser.add_argument('--remasking', choices=['low-confidence', 'target-token-confidence', 'random', 'highest-index'], default='low-confidence',
                         help='Remasking strategy when --model-family llada')
     parser.add_argument(
         '--masked_indexes',
         type=int,
-        nargs=50,
+        nargs='+',
         default=None,
-        help='Exactly 50 1-indexed positions in the 100-token sequence to mask for partially-masked LLaDA conditioning.',
+        help=(
+            '1-indexed positions in the 100-token sequence to mask. Exact '
+            f'low-confidence LLaDA supports 1-{MAX_EXACT_LOW_CONFIDENCE_MASKED}; '
+            'other partially masked modes require exactly 50.'
+        ),
     )
     return parser.parse_args()
 
@@ -305,7 +318,25 @@ def _compute_probability(
 
 def main() -> None:
     args = parse_args()
-    args.masked_indexes = validate_masked_indexes(args.masked_indexes)
+    use_exact_low_confidence_dp = (
+        args.model_family == 'llada'
+        and args.mode == 'exact'
+        and args.remasking == 'low-confidence'
+        and args.masked_indexes is not None
+    )
+    args.masked_indexes = validate_masked_indexes(
+        args.masked_indexes,
+        expected_count=None if use_exact_low_confidence_dp else 50,
+    )
+    if (
+        use_exact_low_confidence_dp
+        and len(args.masked_indexes) > MAX_EXACT_LOW_CONFIDENCE_MASKED
+    ):
+        raise ValueError(
+            'Exact low-confidence DP supports at most '
+            f'{MAX_EXACT_LOW_CONFIDENCE_MASKED} masked positions; got '
+            f'{len(args.masked_indexes)}.'
+        )
 
     if args.stride_words <= 0:
         raise ValueError('--stride-words must be > 0.')
@@ -380,6 +411,18 @@ def main() -> None:
             raise ValueError("--temperature must be exactly 1 when --mode path_sampling with --model-family llada and --remasking low-confidence.")
         if args.masked_indexes is not None and decoding_scheme.lower() != 'full':
             raise ValueError("--decoding-scheme must be 'full' when --masked_indexes is used with --mode path_sampling and --remasking low-confidence.")
+    if use_exact_low_confidence_dp:
+        if decoding_scheme.lower() != 'full':
+            raise ValueError(
+                "--decoding-scheme must be 'full' when --masked_indexes is used "
+                'with --mode exact and --remasking low-confidence.'
+            )
+        if not math.isfinite(args.temperature) or args.temperature <= 0:
+            raise ValueError(
+                '--temperature must be finite and greater than 0 when '
+                '--masked_indexes is used with --mode exact and '
+                '--remasking low-confidence.'
+            )
 
     if args.verbose:
         valid_path_verbose = (

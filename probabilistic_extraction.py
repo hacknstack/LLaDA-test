@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from get_log_likelihood import get_log_likelihood, get_log_likelihood_from_partially_masked
 
 AUTOREGRESSIVE_MODEL_FAMILIES = {'llama', 'llama2', 'olmo', 'mistral'}
+MAX_EXACT_LOW_CONFIDENCE_MASKED = 12
 
 
 @dataclass
@@ -22,13 +23,19 @@ class MonteCarloResult:
     verbose_samples: Optional[List[Dict[str, object]]] = None
 
 
-def validate_masked_indexes(masked_indexes: Optional[Sequence[int]]) -> Optional[List[int]]:
+def validate_masked_indexes(
+    masked_indexes: Optional[Sequence[int]],
+    expected_count: Optional[int] = 50,
+) -> Optional[List[int]]:
     if masked_indexes is None:
         return None
 
     normalized = [int(index) for index in masked_indexes]
-    if len(normalized) != 50:
-        raise ValueError('--masked_indexes must contain exactly 50 integers.')
+    if expected_count is None:
+        if not normalized:
+            raise ValueError('--masked_indexes must contain at least one integer.')
+    elif len(normalized) != expected_count:
+        raise ValueError(f'--masked_indexes must contain exactly {expected_count} integers.')
     if any(index < 1 or index > 100 for index in normalized):
         raise ValueError('--masked_indexes entries must be 1-indexed positions in [1, 100].')
     if len(set(normalized)) != len(normalized):
@@ -44,7 +51,8 @@ def _unsupported_partially_masked_configuration(
     raise ValueError(
         '--masked_indexes is only supported for LLaDA configurations that use '
         '_elbo_probability, _path_sampling_random_probability, or '
-        '_monte_carlo_probability_temperature_fast. '
+        '_monte_carlo_probability_temperature_fast, or the exact '
+        'low-confidence subset DP. '
         f'Got remasking={remasking!r}, estimation_method={estimation_method!r}, '
         f'decoding_scheme={decoding_scheme!r}.'
     )
@@ -4303,7 +4311,16 @@ def compute_diffusion_probabilistic_extraction(
     if target_tokens.ndim != 2 or target_tokens.shape[0] != 1:
         raise ValueError('target_tokens must have shape (1, j).')
 
-    normalized_masked_indexes = validate_masked_indexes(masked_indexes)
+    use_exact_low_confidence_dp = (
+        model_family.lower() == 'llada'
+        and estimation_method == 'exact'
+        and remasking == 'low-confidence'
+        and masked_indexes is not None
+    )
+    normalized_masked_indexes = validate_masked_indexes(
+        masked_indexes,
+        expected_count=None if use_exact_low_confidence_dp else 50,
+    )
     sequence_tokens = None
     if normalized_masked_indexes is not None:
         sequence_tokens = torch.cat([prompt_tokens, target_tokens], dim=1)
@@ -4565,11 +4582,27 @@ def compute_diffusion_probabilistic_extraction(
 
     if estimation_method == 'exact':
         if normalized_masked_indexes is not None:
-            _unsupported_partially_masked_configuration(
-                remasking=remasking,
-                estimation_method=estimation_method,
-                decoding_scheme=normalized_decoding_scheme,
+            if normalized_decoding_scheme != 'full':
+                raise ValueError(
+                    'estimation_method="exact" with partially masked '
+                    'low-confidence remasking requires decoding_scheme="full".'
+                )
+            result = _exact_low_confidence_probability_dp_from_partially_masked(
+                model=model,
+                sequence_tokens=sequence_tokens,
+                masked_indexes=normalized_masked_indexes,
+                steps=steps,
+                attention_mask=attention_mask,
+                mask_id=mask_id,
+                temperature=temperature,
             )
+            return {
+                **result,
+                'method': 'exact',
+                'remasking': 'low-confidence',
+                'decoding_scheme': 'full',
+                'k': None,
+            }
         return {
             'method': 'exact',
             'probability': _exact_probability(
@@ -6071,6 +6104,939 @@ def _duel_low_confidence_probability_fast_from_partially_masked(
 
     return result
 
+
+def _logaddexp_scalar(a: float, b: float) -> float:
+    """Stable scalar log(exp(a) + exp(b))."""
+    if a == -math.inf:
+        return b
+    if b == -math.inf:
+        return a
+
+    hi = max(a, b)
+    return hi + math.log1p(math.exp(-abs(a - b)))
+
+
+def _exact_low_conf_log_a(
+    active_logits_native: torch.Tensor,   # [B, r, V]
+    active_target_ids: torch.Tensor,      # [B, r]
+    temperature: float,
+) -> torch.Tensor:
+    """
+    Compute exact log a_i(S) for every currently masked position i.
+
+    Matches the supplied low-confidence STS / Monte-Carlo semantics:
+
+        candidate:
+            V_i ~ softmax(logits_i / temperature)
+
+        ranking confidence:
+            c_i(v) = softmax(logits_i)_v
+
+        winner:
+            largest sampled confidence
+
+        tie:
+            smallest absolute sequence index
+
+    active positions must be ordered by increasing absolute sequence index.
+    """
+    device = active_logits_native.device
+    B, r, V = active_logits_native.shape
+    tau = float(temperature)
+
+    # --------------------------------------------------------------
+    # Same numerical convention as STS / MC:
+    #
+    # model output remains native dtype;
+    # all probability calculations after that are FP64.
+    # --------------------------------------------------------------
+    active_logits = active_logits_native.to(torch.float64)
+
+    log_Z_conf = torch.logsumexp(
+        active_logits,
+        dim=-1,
+    )
+
+    if tau == 1.0:
+        log_Z_sample = log_Z_conf
+    else:
+        log_Z_sample = torch.logsumexp(
+            active_logits / tau,
+            dim=-1,
+        )
+
+    # Raw logit of target token z_i.
+    target_raw_logits = torch.gather(
+        active_logits,
+        dim=-1,
+        index=active_target_ids.unsqueeze(-1),
+    ).squeeze(-1)
+
+    # log p_i(z_i | S), where sampling uses temperature.
+    target_sample_log_probs = (
+        target_raw_logits / tau
+        - log_Z_sample
+    )
+
+    # log c_i(z_i | S), where confidence is UNTEMPERED.
+    target_conf_log_probs = (
+        target_raw_logits
+        - log_Z_conf
+    )
+
+    # No competitors on the final step.
+    if r == 1:
+        return target_sample_log_probs
+
+    # --------------------------------------------------------------
+    # Same strategy as STS:
+    #
+    # sorting only needs the ordering, so sort in native dtype and
+    # widen to FP64 afterward.
+    # --------------------------------------------------------------
+    del active_logits
+
+    sorted_logits_native = torch.sort(
+        active_logits_native,
+        dim=-1,
+    ).values
+
+    sorted_logits = sorted_logits_native.to(torch.float64)
+    del sorted_logits_native
+
+    # --------------------------------------------------------------
+    # CDF under the SAMPLING distribution.
+    #
+    # Sorting by raw logit is equivalent to sorting by confidence,
+    # because softmax is monotone within a position.
+    # --------------------------------------------------------------
+    if tau == 1.0:
+        log_cdf = torch.logcumsumexp(
+            sorted_logits,
+            dim=-1,
+        )
+    else:
+        log_cdf = torch.logcumsumexp(
+            sorted_logits / tau,
+            dim=-1,
+        )
+
+    log_cdf.sub_(
+        log_Z_sample.unsqueeze(-1)
+    )
+
+    # Numerical guard identical in spirit to STS.
+    log_cdf.clamp_max_(0.0)
+
+    # --------------------------------------------------------------
+    # Compare directly in FP64 log-confidence space.
+    # --------------------------------------------------------------
+    sorted_log_confidence = (
+        sorted_logits
+        - log_Z_conf.unsqueeze(-1)
+    )
+
+    # Shape convention:
+    #
+    #   axis 1 = competitor j
+    #   axis 2 = proposed winner i
+    #
+    # [B, competitor_j, proposed_i]
+    target_conf_values = (
+        target_conf_log_probs
+        .unsqueeze(1)
+        .expand(-1, r, -1)
+        .contiguous()
+    )
+
+    # first competitor token with:
+    #
+    #   confidence >= c_i*
+    #   confidence >  c_i*
+    #
+    # respectively.
+    left_idx = torch.searchsorted(
+        sorted_log_confidence,
+        target_conf_values,
+        right=False,
+    )
+
+    right_idx = torch.searchsorted(
+        sorted_log_confidence,
+        target_conf_values,
+        right=True,
+    )
+
+    # --------------------------------------------------------------
+    # L_{j,i}
+    #
+    # P[c_j(V_j) < c_i*]
+    # --------------------------------------------------------------
+    left_gather_idx = (
+        left_idx - 1
+    ).clamp(
+        min=0,
+        max=V - 1,
+    )
+
+    log_L = torch.gather(
+        log_cdf,
+        dim=-1,
+        index=left_gather_idx,
+    )
+
+    log_L.masked_fill_(
+        left_idx == 0,
+        -math.inf,
+    )
+
+    log_L.masked_fill_(
+        left_idx == V,
+        0.0,
+    )
+
+    # --------------------------------------------------------------
+    # LE_{j,i}
+    #
+    # P[c_j(V_j) <= c_i*]
+    # --------------------------------------------------------------
+    right_gather_idx = (
+        right_idx - 1
+    ).clamp(
+        min=0,
+        max=V - 1,
+    )
+
+    log_LE = torch.gather(
+        log_cdf,
+        dim=-1,
+        index=right_gather_idx,
+    )
+
+    log_LE.masked_fill_(
+        right_idx == 0,
+        -math.inf,
+    )
+
+    log_LE.masked_fill_(
+        right_idx == V,
+        0.0,
+    )
+
+    # --------------------------------------------------------------
+    # Exact deterministic smallest-index tie rule.
+    #
+    # active positions are ordered by increasing absolute sequence
+    # index.
+    #
+    # For proposed winner i:
+    #
+    #   competitor j < i:
+    #       j would win an exact tie,
+    #       therefore j MUST be strictly below i.
+    #
+    #   competitor j > i:
+    #       i wins an exact tie,
+    #       therefore j may be <= i.
+    #
+    # This is exactly the STS tie correction.
+    # --------------------------------------------------------------
+    proposed_i = torch.arange(
+        r,
+        dtype=torch.long,
+        device=device,
+    ).view(1, r)
+
+    log_win_mass = torch.zeros(
+        (B, r),
+        dtype=torch.float64,
+        device=device,
+    )
+
+    # Deliberately preserve STS's competitor accumulation order.
+    for competitor_j in range(r):
+
+        strict_for_smaller = (
+            competitor_j < proposed_i
+        )
+
+        nonstrict_for_larger = (
+            competitor_j > proposed_i
+        )
+
+        competitor_factor = torch.where(
+            strict_for_smaller,
+            log_L[:, competitor_j, :],
+            torch.where(
+                nonstrict_for_larger,
+                log_LE[:, competitor_j, :],
+                torch.zeros(
+                    (),
+                    dtype=torch.float64,
+                    device=device,
+                ),
+            ),
+        )
+
+        log_win_mass = (
+            log_win_mass
+            + competitor_factor
+        )
+
+    # --------------------------------------------------------------
+    # a_i(S)
+    #
+    # = probability i samples target
+    #   * probability i wins confidence competition.
+    # --------------------------------------------------------------
+    return (
+        target_sample_log_probs
+        + log_win_mass
+    )
+
+
+@torch.inference_mode()
+def _exact_low_confidence_probability_dp_from_partially_masked(
+    model,
+    sequence_tokens: torch.Tensor,          # [1, L], complete target z
+    masked_indexes: list[int],              # 1-indexed masked positions M
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    temperature: float,
+    state_batch_size: int = 64,
+    max_masked: int = MAX_EXACT_LOW_CONFIDENCE_MASKED,
+) -> Dict[str, object]:
+    """
+    Exact extraction probability under one-token-per-step
+    low-confidence remasking.
+
+    Uses dynamic programming over subsets S of correctly revealed
+    target positions.
+
+    Forward recurrence:
+
+        DP[empty] = 1
+
+        DP[S U {i}]
+            +=
+        DP[S] * a_i(S)
+
+    where a_i(S) is the exact probability that, from S,
+
+      1. position i samples target token z_i, and
+      2. position i wins the sampled-confidence competition.
+
+    The answer is DP[M].
+
+    Semantics match the supplied low-confidence MC and STS:
+
+      * sampling:
+            softmax(logits / temperature)
+
+      * ranking:
+            untempered softmax(logits)
+
+      * one reveal per step
+
+      * maximum sampled confidence wins
+
+      * exact confidence ties:
+            smallest absolute sequence index wins
+
+      * native model-forward dtype
+
+      * FP64 probability calculations after logits
+
+      * probability products/sums accumulated in log-space
+
+    Complexity for m masked positions:
+
+        states = 2^m
+
+    and every nonterminal state is evaluated exactly once.
+
+    For m=12:
+        4095 model-state evaluations
+
+    instead of:
+        12! = 479,001,600 reveal orders.
+    """
+    device = _model_device(model)
+    sequence_tokens = sequence_tokens.to(device)
+
+    # ==============================================================
+    # Validation
+    # ==============================================================
+
+    if (
+        sequence_tokens.ndim != 2
+        or sequence_tokens.shape[0] != 1
+    ):
+        raise ValueError(
+            "sequence_tokens must have shape [1, L]."
+        )
+
+    seq_len = int(
+        sequence_tokens.shape[1]
+    )
+
+    raw_masked_pos = [
+        int(i) - 1
+        for i in masked_indexes
+    ]
+
+    if not raw_masked_pos:
+        raise ValueError(
+            "masked_indexes must contain at least one position."
+        )
+
+    if (
+        len(raw_masked_pos)
+        != len(set(raw_masked_pos))
+    ):
+        raise ValueError(
+            "masked_indexes must not contain duplicate positions."
+        )
+
+    # This matches MC / STS and is important for the tie rule:
+    # local active-slot order == absolute sequence-index order.
+    masked_pos = sorted(
+        raw_masked_pos
+    )
+
+    if any(
+        pos < 0 or pos >= seq_len
+        for pos in masked_pos
+    ):
+        raise ValueError(
+            "masked_indexes must be 1-indexed positions "
+            f"in [1, {seq_len}]."
+        )
+
+    masked_len = len(
+        masked_pos
+    )
+
+    if steps != masked_len:
+        raise ValueError(
+            "Exact low-confidence DP reveals exactly one "
+            "masked token per step, so steps must equal "
+            f"len(masked_indexes)={masked_len}."
+        )
+
+    if masked_len > max_masked:
+        raise ValueError(
+            f"masked_len={masked_len} exceeds "
+            f"max_masked={max_masked}; exact DP is exponential."
+        )
+
+    if (
+        not math.isfinite(float(temperature))
+        or float(temperature) <= 0.0
+    ):
+        raise ValueError(
+            "temperature must be finite and > 0."
+        )
+
+    if state_batch_size <= 0:
+        raise ValueError(
+            "state_batch_size must be positive."
+        )
+
+    # Exact DP assumes one deterministic set of logits for each x(S).
+    #
+    # The supplied MC explicitly stops sharing states in training mode,
+    # because dropout/etc. would make a fixed state stochastic.
+    # Integrating that additional randomness would no longer be this
+    # finite exact DP.
+    if bool(
+        getattr(model, "training", False)
+    ):
+        raise ValueError(
+            "Exact DP requires deterministic logits for each state. "
+            "Call model.eval() first."
+        )
+
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(
+            device
+        )
+
+        if attention_mask.shape != (
+            1,
+            seq_len,
+        ):
+            raise ValueError(
+                "attention_mask must have shape "
+                f"[1, {seq_len}]."
+            )
+
+    tau = float(
+        temperature
+    )
+
+    masked_pos_t = torch.tensor(
+        masked_pos,
+        dtype=torch.long,
+        device=device,
+    )
+
+    masked_target_row = sequence_tokens[
+        0,
+        masked_pos_t,
+    ]
+
+    # ==============================================================
+    # Subset representation
+    # ==============================================================
+
+    # Bit i == target position i in M has already been revealed.
+    num_states = (
+        1 << masked_len
+    )
+
+    full_state = (
+        num_states - 1
+    )
+
+    bit_values = torch.bitwise_left_shift(
+        torch.ones(
+            masked_len,
+            dtype=torch.int64,
+            device=device,
+        ),
+        torch.arange(
+            masked_len,
+            dtype=torch.int64,
+            device=device,
+        ),
+    )
+
+    slot_grid_base = torch.arange(
+        masked_len,
+        dtype=torch.long,
+        device=device,
+    ).unsqueeze(0)
+
+    # log_a_table[S, i] = log a_i(S).
+    #
+    # Revealed / invalid transitions remain -inf.
+    #
+    # For m=12 this is only:
+    #
+    #   4096 * 12 * 8 ~= 384 KiB.
+    log_a_table = torch.full(
+        (
+            num_states,
+            masked_len,
+        ),
+        -math.inf,
+        dtype=torch.float64,
+        device=device,
+    )
+
+    # ==============================================================
+    # Evaluate every nonterminal model state exactly once.
+    #
+    # Popcount sorting has two advantages:
+    #
+    # 1. equal active-set sizes remain contiguous for postprocessing;
+    # 2. we still chunk the FLATTENED state list, so a forward batch
+    #    can span two DP layers.
+    #
+    # Consequently the model-forward count is exactly
+    #
+    #   ceil((2^m - 1) / state_batch_size),
+    #
+    # instead of sum_k ceil(C(m,k)/batch).
+    # ==============================================================
+
+    state_order = sorted(
+        range(full_state),
+        key=int.bit_count,
+    )
+
+    for batch_start in range(
+        0,
+        full_state,
+        state_batch_size,
+    ):
+        batch_states_py = state_order[
+            batch_start:
+            batch_start + state_batch_size
+        ]
+
+        batch_size = len(
+            batch_states_py
+        )
+
+        state_ids = torch.tensor(
+            batch_states_py,
+            dtype=torch.int64,
+            device=device,
+        )
+
+        revealed = (
+            torch.bitwise_and(
+                state_ids.unsqueeze(1),
+                bit_values.unsqueeze(0),
+            )
+            != 0
+        )
+        # [B, m]
+
+        # ----------------------------------------------------------
+        # Construct x(S):
+        #
+        # outside M:
+        #     target token
+        #
+        # revealed inside M:
+        #     target token
+        #
+        # unrevealed inside M:
+        #     MASK
+        # ----------------------------------------------------------
+
+        x = sequence_tokens.expand(
+            batch_size,
+            -1,
+        ).clone()
+
+        x[
+            :,
+            masked_pos_t,
+        ] = torch.where(
+            revealed,
+            masked_target_row.unsqueeze(0),
+            torch.full(
+                (
+                    batch_size,
+                    masked_len,
+                ),
+                int(mask_id),
+                dtype=sequence_tokens.dtype,
+                device=device,
+            ),
+        )
+
+        batched_attn = None
+
+        if attention_mask is not None:
+            batched_attn = (
+                attention_mask.expand(
+                    batch_size,
+                    -1,
+                )
+            )
+
+        # ----------------------------------------------------------
+        # Model forward:
+        #
+        # identical dtype policy to supplied MC / STS.
+        # ----------------------------------------------------------
+
+        if device.type in {
+            "cuda",
+            "cpu",
+        }:
+            with torch.autocast(
+                device_type=device.type,
+                enabled=False,
+            ):
+                outputs = model(
+                    x,
+                    attention_mask=batched_attn,
+                )
+        else:
+            outputs = model(
+                x,
+                attention_mask=batched_attn,
+            )
+
+        # Retain only positions in M before releasing the much larger
+        # [B, sequence_length, vocab] output.
+        masked_logits_native = (
+            outputs.logits[
+                :,
+                masked_pos_t,
+                :,
+            ]
+        )
+
+        del outputs
+        del x
+
+        # ----------------------------------------------------------
+        # Rows with the same popcount have the same number r of
+        # still-masked positions, so process those together.
+        # ----------------------------------------------------------
+
+        popcounts = [
+            state.bit_count()
+            for state in batch_states_py
+        ]
+
+        group_start = 0
+
+        while group_start < batch_size:
+
+            num_revealed = (
+                popcounts[group_start]
+            )
+
+            group_end = (
+                group_start + 1
+            )
+
+            while (
+                group_end < batch_size
+                and popcounts[group_end]
+                == num_revealed
+            ):
+                group_end += 1
+
+            group_size = (
+                group_end
+                - group_start
+            )
+
+            num_unrevealed = (
+                masked_len
+                - num_revealed
+            )
+
+            group_revealed = revealed[
+                group_start:
+                group_end
+            ]
+
+            active_slots = (
+                slot_grid_base
+                .expand(
+                    group_size,
+                    -1,
+                )[
+                    ~group_revealed
+                ]
+                .view(
+                    group_size,
+                    num_unrevealed,
+                )
+            )
+
+            # Because masked_pos was sorted, active_slots are also in
+            # increasing ABSOLUTE sequence-index order.
+            #
+            # This is what makes local j < i exactly equivalent to
+            # the MC decoder's smallest-sequence-index tie rule.
+
+            local_rows = torch.arange(
+                group_start,
+                group_end,
+                dtype=torch.long,
+                device=device,
+            ).unsqueeze(1)
+
+            active_logits_native = (
+                masked_logits_native[
+                    local_rows,
+                    active_slots,
+                    :,
+                ]
+            )
+
+            active_target_ids = (
+                masked_target_row[
+                    active_slots
+                ]
+            )
+
+            group_log_a = (
+                _exact_low_conf_log_a(
+                    active_logits_native=(
+                        active_logits_native
+                    ),
+                    active_target_ids=(
+                        active_target_ids
+                    ),
+                    temperature=tau,
+                )
+            )
+
+            group_state_ids = state_ids[
+                group_start:
+                group_end
+            ]
+
+            log_a_table[
+                group_state_ids.unsqueeze(1),
+                active_slots,
+            ] = group_log_a
+
+            group_start = (
+                group_end
+            )
+
+        del masked_logits_native
+        del revealed
+        del state_ids
+
+    # ==============================================================
+    # Exact subset DP.
+    #
+    # Let D[S] be the total probability of reaching S while every
+    # revealed token has matched the target.
+    #
+    # D[empty] = 1
+    #
+    # D[S U {i}] += D[S] a_i(S)
+    #
+    # Every possible successful reveal order corresponds to exactly
+    # one path from empty -> full, so D[full] is the desired
+    # extraction probability.
+    # ==============================================================
+
+    # Tiny table; moving it to CPU avoids thousands of tiny GPU
+    # kernels during the combinatorial DP.
+    log_a_cpu = (
+        log_a_table
+        .detach()
+        .cpu()
+        .tolist()
+    )
+
+    log_dp = [
+        -math.inf
+    ] * num_states
+
+    log_dp[0] = 0.0
+
+    # Numeric state order is already topological:
+    #
+    #   S | (1 << i) > S.
+    for state in range(
+        full_state
+    ):
+        base = log_dp[
+            state
+        ]
+
+        if base == -math.inf:
+            continue
+
+        remaining = (
+            full_state ^ state
+        )
+
+        while remaining:
+
+            bit = (
+                remaining
+                & -remaining
+            )
+
+            slot = (
+                bit.bit_length()
+                - 1
+            )
+
+            log_transition = (
+                log_a_cpu[
+                    state
+                ][
+                    slot
+                ]
+            )
+
+            if (
+                log_transition
+                != -math.inf
+            ):
+                next_state = (
+                    state | bit
+                )
+
+                candidate = (
+                    base
+                    + log_transition
+                )
+
+                log_dp[
+                    next_state
+                ] = _logaddexp_scalar(
+                    log_dp[
+                        next_state
+                    ],
+                    candidate,
+                )
+
+            remaining ^= bit
+
+    log_probability = float(
+        log_dp[
+            full_state
+        ]
+    )
+
+    if math.isfinite(
+        log_probability
+    ):
+        probability = math.exp(
+            log_probability
+        )
+    else:
+        probability = 0.0
+
+    return {
+        "probability":
+            float(probability),
+
+        "log_probability":
+            log_probability,
+
+        "estimation_method":
+            "exact_low_confidence_subset_dp",
+
+        "decoding_scheme":
+            "full",
+
+        "temperature":
+            tau,
+
+        "masked_indexes": [
+            int(i)
+            for i in masked_indexes
+        ],
+
+        "num_masked":
+            masked_len,
+
+        "num_dp_states":
+            num_states,
+
+        "num_nonterminal_states":
+            full_state,
+
+        "state_batch_size":
+            state_batch_size,
+
+        "model_forward_calls":
+            math.ceil(
+                full_state
+                / state_batch_size
+            ),
+
+        "tie_breaking":
+            "smallest_index_among_max_confidence",
+
+        "model_forward_dtype":
+            "native",
+
+        "probability_dtype_after_logits":
+            "float64",
+    }
 @torch.no_grad()
 def compute_autoregressive_probabilistic_extraction(
     model,
