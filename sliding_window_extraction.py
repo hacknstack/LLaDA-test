@@ -41,12 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('txt_path', type=Path, help='Input txt file path (e.g. texts/book.txt)')
     parser.add_argument(
         '--mode',
-        choices=['exact', 'monte-carlo', 'path_sampling', 'verbosish', 'duel'],
+        choices=['exact', 'monte-carlo', 'path_sampling', 'duel'],
         default='exact',
-        help=(
-            "Estimator mode. 'verbosish' runs partially masked low-confidence "
-            'path sampling and writes only per-sample log estimates.'
-        ),
     )
     parser.add_argument('--tau', type=float, default=0.001)
     parser.add_argument('--chunk-chars', type=int, default=800)
@@ -69,12 +65,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--model-name', type=str, default=None)
     parser.add_argument('--num-samples', type=int, default=20, help='Samples for Monte Carlo or path sampling')
     parser.add_argument('--seed', type=int, default=None, help='Optional sampling seed')
-    parser.add_argument(
+    diagnostics_group = parser.add_mutually_exclusive_group()
+    diagnostics_group.add_argument(
         '--verbose',
         action='store_true',
         help=(
             'Write verbose.jsonl for supported partially masked '
             'low-confidence path sampling, Monte Carlo, or DUEL estimation.'
+        ),
+    )
+    diagnostics_group.add_argument(
+        '--verbosish',
+        action='store_true',
+        help=(
+            'Write verbosish.jsonl with only per-sample log estimates. Only '
+            'supported by partially masked low-confidence path sampling.'
         ),
     )
     parser.add_argument(
@@ -103,7 +108,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             '1-indexed positions in the 100-token sequence to mask. Exact '
             f'low-confidence LLaDA supports 1-{MAX_EXACT_LOW_CONFIDENCE_MASKED}; '
-            'low-confidence path sampling/verbosish supports 1-100; other '
+            'low-confidence path sampling supports 1-100; other '
             'partially masked modes require exactly 50.'
         ),
     )
@@ -312,7 +317,6 @@ def _compute_probability(
         )
         return float(result['probability']), result.get('verbose_steps')
 
-    estimation_method = 'path_sampling' if args.mode == 'verbosish' else args.mode
     result = compute_diffusion_probabilistic_extraction(
         model=model,
         prompt_tokens=prompt_tokens,
@@ -321,7 +325,7 @@ def _compute_probability(
         attention_mask=None,
         mask_id=MASK_ID,
         remasking=args.remasking,
-        estimation_method=estimation_method,
+        estimation_method=args.mode,
         num_samples=args.num_samples,
         seed=args.seed,
         decoding_scheme=decoding_scheme,
@@ -332,13 +336,13 @@ def _compute_probability(
         verbose_compact=args.compact,
         verbose_callback=verbose_callback,
     )
-    if args.mode in {'exact', 'path_sampling', 'verbosish'} or str(decoding_scheme).lower() == 'elbo':
+    if args.mode in {'exact', 'path_sampling'} or str(decoding_scheme).lower() == 'elbo':
         probability = float(result['probability'])
     else:
         probability = float(result['estimate'])
     if verbose_callback is not None and result['method'] == 'monte-carlo':
         return probability, []
-    if args.mode == 'verbosish':
+    if args.verbosish:
         sample_logs = result.get('sample_log_probabilities')
         if sample_logs is None:
             raise RuntimeError('Path sampler did not return per-sample log estimates.')
@@ -362,7 +366,7 @@ def main() -> None:
     )
     use_partially_masked_low_confidence_path_sampling = (
         args.model_family == 'llada'
-        and args.mode in {'path_sampling', 'verbosish'}
+        and args.mode == 'path_sampling'
         and args.remasking == 'low-confidence'
         and args.masked_indexes is not None
     )
@@ -456,12 +460,8 @@ def main() -> None:
     if (
         args.model_family == 'llada'
         and args.remasking == 'low-confidence'
-        and args.mode in {'path_sampling', 'verbosish'}
+        and args.mode == 'path_sampling'
     ):
-        if args.mode == 'verbosish' and args.masked_indexes is None:
-            raise ValueError(
-                '--mode verbosish requires --masked_indexes with at least one position.'
-            )
         if decoding_scheme.lower() not in {'full', 'top_k'}:
             raise ValueError("--decoding-scheme must be one of {'full', 'top_k'} for low-confidence path sampling.")
         if not math.isclose(args.temperature, 1.0, rel_tol=0.0, abs_tol=1e-9):
@@ -514,6 +514,20 @@ def main() -> None:
                 'sampling at temperature 1, or Monte Carlo/DUEL estimation at '
                 'positive temperature, all with full decoding.'
             )
+    if args.verbosish:
+        valid_verbosish = (
+            args.model_family == 'llada'
+            and args.mode == 'path_sampling'
+            and args.remasking == 'low-confidence'
+            and args.masked_indexes is not None
+            and decoding_scheme.lower() == 'full'
+            and math.isclose(args.temperature, 1.0, rel_tol=0.0, abs_tol=1e-9)
+        )
+        if not valid_verbosish:
+            raise ValueError(
+                '--verbosish requires partially masked LLaDA low-confidence '
+                'path sampling at temperature 1 with full decoding.'
+            )
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -547,7 +561,7 @@ def main() -> None:
     verbose_file = (run_dir / 'verbose.jsonl').open('w', encoding='utf-8') if args.verbose else None
     verbosish_file = (
         (run_dir / 'verbosish.jsonl').open('w', encoding='utf-8')
-        if args.mode == 'verbosish'
+        if args.verbosish
         else None
     )
     window_data = _iter_window_data(
@@ -683,14 +697,14 @@ def main() -> None:
             'seed': args.seed,
             'masked_indexes': args.masked_indexes,
             'verbose': args.verbose,
-            'verbosish': args.mode == 'verbosish',
+            'verbosish': args.verbosish,
             'compact': args.compact,
             'verbose_schema': (
                 'parallel-arrays' if args.compact else 'candidate-objects'
             ) if args.verbose else None,
             'verbosish_schema': (
                 'sample-index-and-log-estimate'
-                if args.mode == 'verbosish'
+                if args.verbosish
                 else None
             ),
         },
