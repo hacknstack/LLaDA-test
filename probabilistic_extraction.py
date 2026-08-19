@@ -50,7 +50,8 @@ def _unsupported_partially_masked_configuration(
 ) -> None:
     raise ValueError(
         '--masked_indexes is only supported for LLaDA configurations that use '
-        '_elbo_probability, _path_sampling_random_probability, or '
+        '_elbo_probability, _path_sampling_random_probability, '
+        '_path_sampling_low_confidence_probability_fast, '
         '_monte_carlo_probability_temperature_fast, or the exact '
         'low-confidence subset DP. '
         f'Got remasking={remasking!r}, estimation_method={estimation_method!r}, '
@@ -2263,8 +2264,8 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
     STATE CACHE
     -----------
-    When use_state_cache=True, log a(S) is memoized by the 50-bit revealed-set
-    state S.  Identical states are deduplicated within a Monte Carlo batch and
+    When use_state_cache=True, log a(S) is memoized by the revealed-set state
+    S.  Identical states are deduplicated within a Monte Carlo batch and
     reused across later batches, so the expensive estimator computation is
     performed only once per unique state encountered.
 
@@ -2291,7 +2292,8 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
     Assumptions:
       - sequence_tokens has shape [1, 100];
-      - masked_indexes contains exactly 50 valid 1-indexed positions;
+      - masked_indexes contains between 1 and 100 valid, unique,
+        1-indexed positions;
       - steps == len(masked_indexes);
       - attention_mask, if provided, has shape [1, 100].
     """
@@ -2320,16 +2322,13 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             f"Expected sequence length 100, got {seq_len}"
         )
 
-    # Convert 1-indexed masked positions to sorted unique 0-indexed slots.
-    masked_pos = sorted(
-        set(int(i) - 1 for i in masked_indexes)
-    )
-
-    if len(masked_pos) != 50:
-        raise ValueError(
-            f"Expected exactly 50 masked positions out of 100, "
-            f"got {len(masked_pos)}"
-        )
+    # Convert 1-indexed masked positions to sorted 0-indexed slots.
+    raw_masked_pos = [int(i) - 1 for i in masked_indexes]
+    if not raw_masked_pos:
+        raise ValueError("masked_indexes must contain at least one position.")
+    if len(raw_masked_pos) != len(set(raw_masked_pos)):
+        raise ValueError("masked_indexes must not contain duplicate positions.")
+    masked_pos = sorted(raw_masked_pos)
 
     if any(pos < 0 or pos >= seq_len for pos in masked_pos):
         raise ValueError(
@@ -2379,11 +2378,11 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         masked_pos,
         dtype=torch.long,
         device=device,
-    )  # [50]
+    )  # [masked_len]
 
     full_target_row = sequence_tokens[0]
     masked_target_row = full_target_row[masked_pos_t]
-    # [50]
+    # [masked_len]
 
     # ------------------------------------------------------------------
     # RNG
@@ -2452,17 +2451,11 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         (max_bsz, 1), dtype=torch.bool, device=device
     )
 
-    # Each revealed-set state S fits in 50 bits.  Keeping a compact state id
-    # lets us memoize log a(S) without transferring the full [50] boolean mask
-    # to the CPU for every trajectory and step.
-    state_bit_values = torch.bitwise_left_shift(
-        torch.ones(masked_len, dtype=torch.int64, device=device),
-        torch.arange(masked_len, dtype=torch.int64, device=device),
-    )
-
     # The estimator cache stays on the model device: each entry is only a
-    # 50-element FP64 log-a vector.  Verbose deterministic diagnostics are tiny
-    # and are cached on CPU so verbose caching adds negligible VRAM.
+    # masked_len-element FP64 log-a vector.  Revealed-set keys are tuples of
+    # booleans, so the cache supports any mask count without int64 overflow.
+    # Verbose deterministic diagnostics are tiny and are cached on CPU so
+    # verbose caching adds negligible VRAM.
     #
     # highest_sampled is intentionally never cached.  It is a stochastic
     # diagnostic and is resampled independently for every trajectory occurrence.
@@ -2470,8 +2463,8 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         use_state_cache
         and not bool(getattr(model, "training", False))
     )
-    state_log_a_cache: Dict[int, torch.Tensor] = {}
-    state_verbose_cache: Dict[int, Dict[str, torch.Tensor]] = {}
+    state_log_a_cache: Dict[Tuple[bool, ...], torch.Tensor] = {}
+    state_verbose_cache: Dict[Tuple[bool, ...], Dict[str, torch.Tensor]] = {}
     cache_requests = 0
     cache_hits = 0
     cache_misses = 0
@@ -2484,7 +2477,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
     def _compute_log_a_for_batch_uncached(
         x: torch.Tensor,              # [bsz, 100]
-        revealed: torch.Tensor,       # [bsz, 50]
+        revealed: torch.Tensor,       # [bsz, masked_len]
         alive: torch.Tensor,          # [bsz]
         num_unrevealed: int,
         verbose_draw_counts: Optional[List[int]] = None,
@@ -2492,7 +2485,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         """
         Returns
 
-            log_a_full : [bsz, 50], float64
+            log_a_full : [bsz, masked_len], float64
 
         where revealed positions and dead trajectories are -inf.
 
@@ -3017,7 +3010,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         del log_smallest_index_win_mass
 
         # --------------------------------------------------------------
-        # Scatter back into the fixed 50-slot representation.
+        # Scatter back into the fixed masked-slot representation.
         # --------------------------------------------------------------
 
         log_a_full = torch.full(
@@ -3199,7 +3192,6 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         revealed: torch.Tensor,
         alive: torch.Tensor,
         num_unrevealed: int,
-        state_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         """Memoized wrapper around the expensive state evaluation.
 
@@ -3276,23 +3268,23 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         if num_live == 0:
             return out, verbose_out
 
-        # One compact synchronization per step/batch: only state ids for live
+        # One synchronization per step/batch: revealed-set keys for live
         # trajectories are transferred to CPU.
         live_rows = live_rows_t.detach().cpu().tolist()
-        live_state_ids = state_ids[live_rows_t].detach().cpu().tolist()
+        live_states = revealed[live_rows_t].detach().cpu().tolist()
         cache_requests += num_live
 
         # Group rows by state while preserving first-occurrence order.
-        rows_by_state: Dict[int, List[int]] = {}
-        for row, state_id in zip(live_rows, live_state_ids):
-            key = int(state_id)
+        rows_by_state: Dict[Tuple[bool, ...], List[int]] = {}
+        for row, state in zip(live_rows, live_states):
+            key = tuple(bool(value) for value in state)
             rows_by_state.setdefault(key, []).append(int(row))
 
-        missing_keys: List[int] = []
+        missing_keys: List[Tuple[bool, ...]] = []
         missing_representative_rows: List[int] = []
         missing_draw_counts: List[int] = []
 
-        cached_diag_keys: List[int] = []
+        cached_diag_keys: List[Tuple[bool, ...]] = []
         cached_diag_representative_rows: List[int] = []
         cached_diag_draw_counts: List[int] = []
 
@@ -3455,7 +3447,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                 ] = state_draws
 
         if verbose:
-            # Derive log_a_active directly from the cached/full 50-slot output,
+            # Derive log_a_active directly from the cached/full masked-slot output,
             # so it is guaranteed to match the values used for A(S) and q.
             verbose_out['log_a_active'] = torch.gather(
                 out,
@@ -3494,12 +3486,6 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             (bsz, masked_len),
             dtype=torch.bool,
             device=device,
-        )
-
-        # Compact 50-bit representation of S for memoization.  Bit r is set iff
-        # masked slot r has already been successfully revealed.
-        state_ids = torch.zeros(
-            bsz, dtype=torch.int64, device=device
         )
 
         # Accumulate
@@ -3547,9 +3533,8 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                 revealed=revealed,
                 alive=alive,
                 num_unrevealed=num_unrevealed,
-                state_ids=state_ids,
             )
-            # [bsz, 50], FP64
+            # [bsz, masked_len], FP64
 
             # ----------------------------------------------------------
             # A(S) = sum_i a_i(S)
@@ -3615,7 +3600,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                 proposal_logits,
                 dim=-1,
             )
-            # [bsz, 50], FP64
+            # [bsz, masked_len], FP64
 
             # ----------------------------------------------------------
             # Sample next successful reveal index
@@ -3668,10 +3653,6 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                 dim=1,
                 index=next_slots.unsqueeze(-1),
                 src=reveal_true_base[:bsz],
-            )
-
-            state_ids.bitwise_or_(
-                state_bit_values[next_slots]
             )
 
         # --------------------------------------------------------------
@@ -4311,15 +4292,15 @@ def compute_diffusion_probabilistic_extraction(
     if target_tokens.ndim != 2 or target_tokens.shape[0] != 1:
         raise ValueError('target_tokens must have shape (1, j).')
 
-    use_exact_low_confidence_dp = (
+    use_variable_count_low_confidence_masks = (
         model_family.lower() == 'llada'
-        and estimation_method == 'exact'
+        and estimation_method in {'exact', 'path_sampling'}
         and remasking == 'low-confidence'
         and masked_indexes is not None
     )
     normalized_masked_indexes = validate_masked_indexes(
         masked_indexes,
-        expected_count=None if use_exact_low_confidence_dp else 50,
+        expected_count=None if use_variable_count_low_confidence_masks else 50,
     )
     sequence_tokens = None
     if normalized_masked_indexes is not None:

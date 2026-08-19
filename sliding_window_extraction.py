@@ -41,8 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('txt_path', type=Path, help='Input txt file path (e.g. texts/book.txt)')
     parser.add_argument(
         '--mode',
-        choices=['exact', 'monte-carlo', 'path_sampling', 'duel'],
+        choices=['exact', 'monte-carlo', 'path_sampling', 'verbosish', 'duel'],
         default='exact',
+        help=(
+            "Estimator mode. 'verbosish' runs partially masked low-confidence "
+            'path sampling and writes only per-sample log estimates.'
+        ),
     )
     parser.add_argument('--tau', type=float, default=0.001)
     parser.add_argument('--chunk-chars', type=int, default=800)
@@ -99,7 +103,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             '1-indexed positions in the 100-token sequence to mask. Exact '
             f'low-confidence LLaDA supports 1-{MAX_EXACT_LOW_CONFIDENCE_MASKED}; '
-            'other partially masked modes require exactly 50.'
+            'low-confidence path sampling/verbosish supports 1-100; other '
+            'partially masked modes require exactly 50.'
         ),
     )
     return parser.parse_args()
@@ -162,6 +167,25 @@ def _write_verbose_records(
             + '\n'
         )
     verbose_file.flush()
+
+
+def _write_verbosish_records(
+    verbosish_file,
+    records: List[Dict[str, object]],
+    evaluation_index: int,
+    window_index: int,
+) -> None:
+    for item in records:
+        record = {
+            'evaluation_index': evaluation_index,
+            'window_index': window_index,
+            **item,
+        }
+        verbosish_file.write(
+            json.dumps(_json_safe(record), separators=(',', ':'), allow_nan=False)
+            + '\n'
+        )
+    verbosish_file.flush()
 
 
 def _prepare_requested_windows(requested, text, word_starts, tokenizer, args):
@@ -288,6 +312,7 @@ def _compute_probability(
         )
         return float(result['probability']), result.get('verbose_steps')
 
+    estimation_method = 'path_sampling' if args.mode == 'verbosish' else args.mode
     result = compute_diffusion_probabilistic_extraction(
         model=model,
         prompt_tokens=prompt_tokens,
@@ -296,7 +321,7 @@ def _compute_probability(
         attention_mask=None,
         mask_id=MASK_ID,
         remasking=args.remasking,
-        estimation_method=args.mode,
+        estimation_method=estimation_method,
         num_samples=args.num_samples,
         seed=args.seed,
         decoding_scheme=decoding_scheme,
@@ -307,12 +332,23 @@ def _compute_probability(
         verbose_compact=args.compact,
         verbose_callback=verbose_callback,
     )
-    if args.mode in {'exact', 'path_sampling'} or str(decoding_scheme).lower() == 'elbo':
+    if args.mode in {'exact', 'path_sampling', 'verbosish'} or str(decoding_scheme).lower() == 'elbo':
         probability = float(result['probability'])
     else:
         probability = float(result['estimate'])
     if verbose_callback is not None and result['method'] == 'monte-carlo':
         return probability, []
+    if args.mode == 'verbosish':
+        sample_logs = result.get('sample_log_probabilities')
+        if sample_logs is None:
+            raise RuntimeError('Path sampler did not return per-sample log estimates.')
+        return probability, [
+            {
+                'sample_index': sample_index,
+                'sample_log_estimate': float(sample_log_estimate),
+            }
+            for sample_index, sample_log_estimate in enumerate(sample_logs)
+        ]
     return probability, result.get('verbose_samples')
 
 
@@ -324,9 +360,22 @@ def main() -> None:
         and args.remasking == 'low-confidence'
         and args.masked_indexes is not None
     )
+    use_partially_masked_low_confidence_path_sampling = (
+        args.model_family == 'llada'
+        and args.mode in {'path_sampling', 'verbosish'}
+        and args.remasking == 'low-confidence'
+        and args.masked_indexes is not None
+    )
     args.masked_indexes = validate_masked_indexes(
         args.masked_indexes,
-        expected_count=None if use_exact_low_confidence_dp else 50,
+        expected_count=(
+            None
+            if (
+                use_exact_low_confidence_dp
+                or use_partially_masked_low_confidence_path_sampling
+            )
+            else 50
+        ),
     )
     if (
         use_exact_low_confidence_dp
@@ -404,13 +453,21 @@ def main() -> None:
             raise ValueError("--mode must be 'path_sampling' when --remasking random.")
         if decoding_scheme.lower() not in {'full', 'top_k'}:
             raise ValueError("--decoding-scheme must be one of {'full', 'top_k'} when --remasking random.")
-    if args.model_family == 'llada' and args.remasking == 'low-confidence' and args.mode == 'path_sampling':
+    if (
+        args.model_family == 'llada'
+        and args.remasking == 'low-confidence'
+        and args.mode in {'path_sampling', 'verbosish'}
+    ):
+        if args.mode == 'verbosish' and args.masked_indexes is None:
+            raise ValueError(
+                '--mode verbosish requires --masked_indexes with at least one position.'
+            )
         if decoding_scheme.lower() not in {'full', 'top_k'}:
-            raise ValueError("--decoding-scheme must be one of {'full', 'top_k'} when --mode path_sampling with --remasking low-confidence.")
+            raise ValueError("--decoding-scheme must be one of {'full', 'top_k'} for low-confidence path sampling.")
         if not math.isclose(args.temperature, 1.0, rel_tol=0.0, abs_tol=1e-9):
-            raise ValueError("--temperature must be exactly 1 when --mode path_sampling with --model-family llada and --remasking low-confidence.")
+            raise ValueError("--temperature must be exactly 1 for low-confidence LLaDA path sampling.")
         if args.masked_indexes is not None and decoding_scheme.lower() != 'full':
-            raise ValueError("--decoding-scheme must be 'full' when --masked_indexes is used with --mode path_sampling and --remasking low-confidence.")
+            raise ValueError("--decoding-scheme must be 'full' for partially masked low-confidence path sampling.")
     if use_exact_low_confidence_dp:
         if decoding_scheme.lower() != 'full':
             raise ValueError(
@@ -488,6 +545,11 @@ def main() -> None:
         total_to_evaluate = total_possible
     pbar = tqdm(total=total_to_evaluate, desc='Sliding windows', unit='window')
     verbose_file = (run_dir / 'verbose.jsonl').open('w', encoding='utf-8') if args.verbose else None
+    verbosish_file = (
+        (run_dir / 'verbosish.jsonl').open('w', encoding='utf-8')
+        if args.mode == 'verbosish'
+        else None
+    )
     window_data = _iter_window_data(
         text, word_start_positions, tokenizer, args, requested_window_data
     )
@@ -534,6 +596,15 @@ def main() -> None:
                     window_index=window_index,
                     masked_indexes=args.masked_indexes,
                 )
+            elif verbosish_file is not None:
+                if verbose_records is None:
+                    raise RuntimeError('Verbosish estimator data was not returned.')
+                _write_verbosish_records(
+                    verbosish_file=verbosish_file,
+                    records=verbose_records,
+                    evaluation_index=evaluation_index,
+                    window_index=window_index,
+                )
             print(f"pz {p_z}")
             extracted = int(p_z >= args.tau)
         except Exception as exc:  # noqa: BLE001
@@ -559,6 +630,8 @@ def main() -> None:
     pbar.close()
     if verbose_file is not None:
         verbose_file.close()
+    if verbosish_file is not None:
+        verbosish_file.close()
 
     windows_path = run_dir / 'windows.csv'
     with windows_path.open('w', newline='', encoding='utf-8') as f:
@@ -610,10 +683,16 @@ def main() -> None:
             'seed': args.seed,
             'masked_indexes': args.masked_indexes,
             'verbose': args.verbose,
+            'verbosish': args.mode == 'verbosish',
             'compact': args.compact,
             'verbose_schema': (
                 'parallel-arrays' if args.compact else 'candidate-objects'
             ) if args.verbose else None,
+            'verbosish_schema': (
+                'sample-index-and-log-estimate'
+                if args.mode == 'verbosish'
+                else None
+            ),
         },
         'num_windows_total': num_windows_total,
         'num_windows_scored': num_windows_scored,
