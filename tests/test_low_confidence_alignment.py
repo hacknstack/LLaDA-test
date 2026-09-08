@@ -205,6 +205,65 @@ class LowConfidenceAlignmentTests(unittest.TestCase):
                 self.assertEqual(len(model.calls), len(set(model.calls)))
         self.assertLess(build_counts[1], build_counts[0])
 
+    def test_larger_sts_batch_preserves_masses_and_avoids_diagnostic_rebuilds(self):
+        reference = {}
+        build_counts = []
+        original = pe._low_confidence_distribution
+        for batch_size in (64, None):
+            model = ToyModel()
+            extra = {} if batch_size is None else {'batch_size': batch_size}
+            with patch.object(pe, '_low_confidence_distribution', wraps=original) as builds:
+                result = STS(**self.args(model, samples=640), **extra,
+                             verbose=True, verbose_compact=True)
+            build_counts.append(builds.call_count)
+            expected = exact_probability(1.0)
+            se = statistics.stdev(result['sample_probabilities']) / math.sqrt(640)
+            self.assertLess(abs(result['probability'] - expected), 6 * se + 1e-12)
+            for sample in result['verbose_samples']:
+                state = ()
+                for record, position in zip(sample['steps'], sample['reveal_path_indices']):
+                    values = {field: record[field] for field in (
+                        'sequence_indices', 'log_a_active', 'log_A',
+                        'target_sample_log_probs_64', 'log_product',
+                    )}
+                    if state not in reference:
+                        reference[state] = values
+                    else:
+                        self.assertEqual(values, reference[state])
+                    state = tuple(sorted((*state, position)))
+            if batch_size is None:
+                self.assertEqual(len(model.calls), len(set(model.calls)))
+                self.assertEqual(result['state_cache_entries'], 0)
+                self.assertEqual(result['state_cache_verbose_entries'], 0)
+                self.assertEqual(result['verbose_diagnostic_forward_rows'], 0)
+        self.assertLess(build_counts[1], build_counts[0])
+
+    def test_sts_only_caches_logits_for_future_verbose_batches(self):
+        original = pe._LowConfidenceStateEvaluator
+        instances = []
+
+        class ObservedEvaluator(original):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.write_requests = 0
+                instances.append(self)
+
+            def distribution(evaluator, *args, **kwargs):
+                evaluator.write_requests += evaluator.cache_writes_enabled
+                return super(ObservedEvaluator, evaluator).distribution(*args, **kwargs)
+
+        for verbose in (False, True):
+            for extra in ({}, {'batch_size': 64}):
+                with patch.object(pe, '_LowConfidenceStateEvaluator', ObservedEvaluator):
+                    STS(**self.args(ToyModel(), samples=300), verbose=verbose, **extra)
+                evaluator = instances[-1]
+                if verbose and extra:
+                    self.assertGreater(evaluator.write_requests, 0)
+                    self.assertGreater(evaluator.cache_bytes, 0)
+                else:
+                    self.assertEqual(evaluator.write_requests, 0)
+                    self.assertEqual(evaluator.cache_bytes, 0)
+
     def test_final_mc_batch_reads_cache_but_never_writes_it(self):
         instances = []
         original = pe._LowConfidenceStateEvaluator

@@ -65,6 +65,15 @@ The final trajectory batch skips CPU cache writes because those states will not
 recur. Changing trajectory batch size changes seeded draws but preserves the
 decoder's sampling and confidence rules.
 
+STS defaults to **1,024 trajectories per batch** (`batch_size`), covering typical
+300–1,000-sample runs in one batch while keeping model forwards at batch size one.
+Within each step, it evaluates each distinct state once and shares its success
+probabilities across trajectories. It retains state results only for later
+trajectory batches. Native logits are cached only for verbose diagnostics in
+those later batches; ordinary STS uses the smaller successful-transition cache.
+This removes unnecessary CPU copies and repeated diagnostics. Changing batch
+size changes seeded proposal draws, but preserves the STS estimator formulas.
+
 Both use the same per-state FP64 confidence, normalization, and CDF calculations,
 plus a bounded 64 MiB CPU cache of native active logits. `use_state_cache=False`
 disables this cache (and STS's successful-transition cache). Invalid numerical

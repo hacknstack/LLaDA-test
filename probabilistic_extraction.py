@@ -2344,7 +2344,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     num_samples: int,
     seed: Optional[int],
     temperature: float,
-    batch_size: int = 64,
+    batch_size: int = 1024,
     validate_no_ties: bool = False,  # retained for API compatibility; ties use smallest index
     return_samples: bool = True,
     verbose: bool = False,
@@ -2433,6 +2433,14 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     controls trajectory sampling only. Both estimators use identical per-state
     FP64 distribution calculations. Custom stochastic/stateful eval forwards
     remain unsupported.
+
+    The default trajectory batch is 1024, covering typical 300-1000-sample runs
+    in one batch. Identical states are grouped within each step. State results
+    are retained only when later trajectory batches can reuse them. Native
+    logits are cached only for verbose diagnostics in those later batches;
+    ordinary estimation reuses the much smaller log-a cache instead. Changing
+    batch_size changes seeded proposal draws, but not the state evaluator or
+    the STS proposal and importance-weight formulas.
 
     TIE BREAKING
     ------------
@@ -2611,6 +2619,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     # highest_sampled is intentionally never cached.  It is a stochastic
     # diagnostic and is resampled independently for every trajectory occurrence.
     cache_enabled = bool(use_state_cache)
+    retain_state_results = True
     state_evaluator = _LowConfidenceStateEvaluator(
         model, attention_mask, masked_pos_t, use_cache=use_state_cache,
     )
@@ -3346,8 +3355,10 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                     )
 
             for local_idx, key in enumerate(missing_keys):
-                value = missing_log_a[local_idx].clone()
-                state_log_a_cache[key] = value
+                value = missing_log_a[local_idx]
+                if retain_state_results:
+                    value = value.clone()
+                    state_log_a_cache[key] = value
 
                 rows = rows_by_state[key]
                 row_idx = torch.tensor(rows, dtype=torch.long, device=device)
@@ -3368,7 +3379,8 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                         'tie_count':
                             missing_verbose['tie_count'][local_idx].clone(),
                     }
-                    state_verbose_cache[key] = deterministic
+                    if retain_state_results:
+                        state_verbose_cache[key] = deterministic
                     _fill_verbose_deterministic(rows, deterministic)
 
                     state_draws = missing_draws[local_idx]
@@ -3428,6 +3440,13 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             batch_size,
             num_samples - batch_start,
         )
+
+        # A state only appears at its corresponding reveal count. All its
+        # occurrences in this batch are grouped at that step, so only LATER
+        # batches can reuse it. Logits are useful only for verbose cache hits:
+        # ordinary cache hits already have the complete log-a vector.
+        retain_state_results = batch_start + bsz < num_samples
+        state_evaluator.cache_writes_enabled = verbose and retain_state_results
 
         # Initial state:
         #
