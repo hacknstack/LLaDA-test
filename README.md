@@ -48,6 +48,26 @@ of repeated JSON objects.
 `--windows` and `--max-windows` are mutually exclusive, and `--compact` requires
 `--verbose`.
 
+The partially masked low-confidence STS and Monte Carlo estimators use a shared
+state evaluator: model forwards run one state at a time in temporary evaluation
+mode, with deterministic PyTorch algorithms and autocast disabled. The caller's
+module modes and backend settings are restored afterward. Trajectory sampling
+is still batched; the MC `model_batch_size` argument is retained for compatibility
+but does not batch model forwards. This prioritizes agreement between estimators
+and can reduce throughput compared with batched model evaluation.
+
+Both use the same per-state FP64 confidence, normalization, and CDF calculations,
+plus a bounded 64 MiB CPU cache of native active logits. `use_state_cache=False`
+disables this cache (and STS's successful-transition cache). Invalid numerical
+values raise `FloatingPointError` with the step and revealed positions; genuine
+zero success probability remains a valid result. Custom models with stochastic
+or mutable evaluation behavior are unsupported. CUDA operations that require a
+deterministic cuBLAS workspace need `CUBLAS_WORKSPACE_CONFIG=:4096:8` set before
+starting Python; unsupported deterministic operations raise a PyTorch error.
+
+Run the CPU regression tests with `python -B -m unittest discover -s tests -v`.
+They require PyTorch and use tiny models without downloading model weights.
+
 DUEL is a deterministic, partially masked LLaDA low-confidence estimator. It
 requires exactly 50 unique, 1-indexed masked positions in a 100-token window,
 full decoding, and a positive temperature. For example, to mask the 50-token
