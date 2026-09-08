@@ -56,6 +56,15 @@ is still batched; the MC `model_batch_size` argument is retained for compatibili
 but does not batch model forwards. This prioritizes agreement between estimators
 and can reduce throughput compared with batched model evaluation.
 
+Direct MC defaults to **16,384 trajectories per batch** (`mc_batch_size`), so a
+2–15k-sample run groups all occurrences of each successful state and evaluates
+its model logits and FP64 distribution only once. Model forwards remain batch
+size one. The candidate tensors grow with masked positions times trajectories,
+independently of vocabulary size; lower `mc_batch_size` if memory is limited.
+The final trajectory batch skips CPU cache writes because those states will not
+recur. Changing trajectory batch size changes seeded draws but preserves the
+decoder's sampling and confidence rules.
+
 Both use the same per-state FP64 confidence, normalization, and CDF calculations,
 plus a bounded 64 MiB CPU cache of native active logits. `use_state_cache=False`
 disables this cache (and STS's successful-transition cache). Invalid numerical

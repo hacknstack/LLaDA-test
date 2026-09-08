@@ -168,6 +168,74 @@ class LowConfidenceAlignmentTests(unittest.TestCase):
                         self.assertAlmostEqual(math.exp(log_a), masses[POSITIONS.index(index - 1)], places=12)
                     state = tuple(sorted((*state, POSITIONS.index(position - 1))))
 
+    def test_larger_mc_batches_preserve_state_distributions_and_reduce_rebuilds(self):
+        reference = {}
+        build_counts = []
+        original = pe._low_confidence_distribution
+        fields = ('logits', 'log_Z_conf', 'log_Z_sample', 'sorted_logits',
+                  'sorted_token_ids', 'log_cdf')
+        for batch_size in (512, None):
+            builds = []
+
+            def observe(logits, temperature, context):
+                distribution = original(logits, temperature, context)
+                builds.append(context)
+                if context not in reference:
+                    reference[context] = {
+                        field: getattr(distribution, field).clone() for field in fields
+                    }
+                else:
+                    for field in fields:
+                        self.assertTrue(torch.equal(
+                            getattr(distribution, field), reference[context][field],
+                        ), (context, field))
+                return distribution
+
+            extra = {} if batch_size is None else {'mc_batch_size': batch_size}
+            model = ToyModel()
+            with patch.object(pe, '_low_confidence_distribution', side_effect=observe):
+                result = MC(**self.args(model, samples=5000), decoding_scheme='full',
+                            k=1, **extra)
+            expected = exact_probability(1.0)
+            self.assertLess(abs(result.estimate - expected),
+                            6 * math.sqrt(expected * (1 - expected) / 5000))
+            build_counts.append(len(builds))
+            if batch_size is None:
+                self.assertEqual(len(builds), len(set(builds)))
+                self.assertEqual(len(model.calls), len(set(model.calls)))
+        self.assertLess(build_counts[1], build_counts[0])
+
+    def test_final_mc_batch_reads_cache_but_never_writes_it(self):
+        instances = []
+        original = pe._LowConfidenceStateEvaluator
+
+        class ObservedEvaluator(original):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.last_batch_requests = 0
+                self.last_batch_hits = 0
+                instances.append(self)
+
+            def distribution(evaluator, *args, **kwargs):
+                before_bytes = evaluator.cache_bytes
+                before_forwards = evaluator.forward_rows
+                result = super(ObservedEvaluator, evaluator).distribution(*args, **kwargs)
+                if not evaluator.cache_writes_enabled:
+                    self.assertEqual(evaluator.cache_bytes, before_bytes)
+                    evaluator.last_batch_requests += 1
+                    evaluator.last_batch_hits += evaluator.forward_rows == before_forwards
+                return result
+
+        for extra in ({}, {'mc_batch_size': 512}):
+            with patch.object(pe, '_LowConfidenceStateEvaluator', ObservedEvaluator):
+                MC(**self.args(ToyModel(), samples=1200), decoding_scheme='full', k=1, **extra)
+            evaluator = instances[-1]
+            self.assertGreater(evaluator.last_batch_requests, 0)
+            if extra:
+                self.assertGreater(evaluator.last_batch_hits, 0)
+            else:
+                self.assertEqual(evaluator.cache_bytes, 0)
+
     def test_cache_and_verbose_do_not_change_results(self):
         for estimator in (STS, MC):
             with self.subTest(estimator=estimator.__name__):

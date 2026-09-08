@@ -2262,6 +2262,7 @@ class _LowConfidenceStateEvaluator:
         self.cache_max_bytes = cache_max_bytes if use_cache else 0
         self.cache = OrderedDict()
         self.cache_bytes = 0
+        self.cache_writes_enabled = True
         self.forward_rows = 0
 
     def context(self, revealed):
@@ -2281,7 +2282,7 @@ class _LowConfidenceStateEvaluator:
             del outputs
             self.forward_rows += 1
             size = logits.numel() * logits.element_size()
-            if size <= self.cache_max_bytes:
+            if self.cache_writes_enabled and size <= self.cache_max_bytes:
                 while self.cache and self.cache_bytes + size > self.cache_max_bytes:
                     _, old = self.cache.popitem(last=False)
                     self.cache_bytes -= old.numel() * old.element_size()
@@ -4710,7 +4711,7 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     temperature: float,
     decoding_scheme: str,
     k: int,
-    mc_batch_size: int = 512,
+    mc_batch_size: int = 16384,
     model_batch_size: int = 64,
     verbose: bool = False,
     verbose_compact: bool = False,
@@ -4758,9 +4759,15 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     Model forwards always use batch size one and temporary eval mode; original
     module training flags are restored on return or error. model_batch_size is
     retained and validated for API compatibility, but no longer batches model
-    forwards. mc_batch_size still controls trajectory batching. Native active
-    logits use the same per-call 64 MiB CPU LRU cache as STS; use_state_cache=False
-    disables it. Custom stochastic/stateful eval forwards are unsupported.
+    forwards. mc_batch_size controls trajectory batching and defaults to 16384
+    so typical 2-15k-sample runs evaluate each successful state only once. The
+    candidate tensors scale with remaining_positions * mc_batch_size, not with
+    vocabulary size. Native active logits use the same per-call 64 MiB CPU LRU
+    cache as STS when multiple trajectory batches are needed. The last batch
+    reads existing cache entries but skips writes: its states cannot recur.
+    use_state_cache=False disables the cache. Custom stochastic/stateful eval
+    forwards are unsupported. Changing mc_batch_size changes RNG consumption,
+    but not the singleton forwards, distribution arithmetic, or decoder law.
 
     Verbose diagnostics are observational only: they add no random draws and
     do not participate in winner selection or state transitions.
@@ -4907,6 +4914,11 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
             mc_batch_size,
             num_samples - batch_start,
         )
+
+        # A revealed set determines the step, and all occurrences at that step
+        # are already grouped below. It can only recur in a LATER batch.
+        # Skip device-to-CPU cache copies when no later batch will use them.
+        state_evaluator.cache_writes_enabled = batch_start + bsz < num_samples
 
         # --------------------------------------------------------------
         # Initial state: z outside M, masks inside M.
