@@ -83,6 +83,16 @@ or mutable evaluation behavior are unsupported. CUDA operations that require a
 deterministic cuBLAS workspace need `CUBLAS_WORKSPACE_CONFIG=:4096:8` set before
 starting Python; unsupported deterministic operations raise a PyTorch error.
 
+Exact low-confidence subset DP uses this same state evaluator and FP64
+distribution calculation. Its `state_batch_size` only chunks state scheduling;
+model forward batch size is always one. With 10 masked positions, it evaluates
+1,023 nonterminal states once each, without a logits cache. DP preserves the
+smallest-index tie rule and accumulates all transitions in log space, without
+probability floors or pruning. `log_probability` is the natural-log result;
+`probability` remains FP64-compatible down to `1e-100` (use scientific notation
+when displaying or exporting it). Invalid transition masses, total success
+masses, and final results raise errors; `-inf` represents genuine zero probability.
+
 Run the CPU regression tests with `python -B -m unittest discover -s tests -v`.
 They require PyTorch and use tiny models without downloading model weights.
 

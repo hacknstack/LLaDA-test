@@ -5878,8 +5878,8 @@ def _logaddexp_scalar(a: float, b: float) -> float:
 
 
 def _exact_low_conf_log_a(
-    active_logits_native: torch.Tensor,   # [B, r, V]
-    active_target_ids: torch.Tensor,      # [B, r]
+    distribution: _LowConfidenceDistribution,  # one canonical state
+    active_target_ids: torch.Tensor,      # [1, r]
     temperature: float,
 ) -> torch.Tensor:
     """
@@ -5901,30 +5901,14 @@ def _exact_low_conf_log_a(
 
     active positions must be ordered by increasing absolute sequence index.
     """
-    device = active_logits_native.device
-    B, r, V = active_logits_native.shape
+    # Consume the same singleton distribution as STS. Do not recompute
+    # normalizers or CDFs in a batched tensor with a different reduction shape.
+    active_logits = distribution.logits.unsqueeze(0)
+    device = active_logits.device
+    B, r, V = active_logits.shape
     tau = float(temperature)
-
-    # --------------------------------------------------------------
-    # Same numerical convention as STS / MC:
-    #
-    # model output remains native dtype;
-    # all probability calculations after that are FP64.
-    # --------------------------------------------------------------
-    active_logits = active_logits_native.to(torch.float64)
-
-    log_Z_conf = torch.logsumexp(
-        active_logits,
-        dim=-1,
-    )
-
-    if tau == 1.0:
-        log_Z_sample = log_Z_conf
-    else:
-        log_Z_sample = torch.logsumexp(
-            active_logits / tau,
-            dim=-1,
-        )
+    log_Z_conf = distribution.log_Z_conf.unsqueeze(0)
+    log_Z_sample = distribution.log_Z_sample.unsqueeze(0)
 
     # Raw logit of target token z_i.
     target_raw_logits = torch.gather(
@@ -5949,45 +5933,9 @@ def _exact_low_conf_log_a(
     if r == 1:
         return target_sample_log_probs
 
-    # --------------------------------------------------------------
-    # Same strategy as STS:
-    #
-    # sorting only needs the ordering, so sort in native dtype and
-    # widen to FP64 afterward.
-    # --------------------------------------------------------------
+    sorted_logits = distribution.sorted_logits.unsqueeze(0)
+    log_cdf = distribution.log_cdf.unsqueeze(0)
     del active_logits
-
-    sorted_logits_native = torch.sort(
-        active_logits_native,
-        dim=-1,
-    ).values
-
-    sorted_logits = sorted_logits_native.to(torch.float64)
-    del sorted_logits_native
-
-    # --------------------------------------------------------------
-    # CDF under the SAMPLING distribution.
-    #
-    # Sorting by raw logit is equivalent to sorting by confidence,
-    # because softmax is monotone within a position.
-    # --------------------------------------------------------------
-    if tau == 1.0:
-        log_cdf = torch.logcumsumexp(
-            sorted_logits,
-            dim=-1,
-        )
-    else:
-        log_cdf = torch.logcumsumexp(
-            sorted_logits / tau,
-            dim=-1,
-        )
-
-    log_cdf.sub_(
-        log_Z_sample.unsqueeze(-1)
-    )
-
-    # Numerical guard identical in spirit to STS.
-    log_cdf.clamp_max_(0.0)
 
     # --------------------------------------------------------------
     # Compare directly in FP64 log-confidence space.
@@ -6157,6 +6105,7 @@ def _exact_low_conf_log_a(
 
 
 @torch.inference_mode()
+@_low_confidence_eval_mode
 def _exact_low_confidence_probability_dp_from_partially_masked(
     model,
     sequence_tokens: torch.Tensor,          # [1, L], complete target z
@@ -6205,6 +6154,10 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
       * exact confidence ties:
             smallest absolute sequence index wins
 
+      * singleton model forwards through the shared STS state evaluator
+
+      * temporary deterministic evaluation mode, with autocast disabled
+
       * native model-forward dtype
 
       * FP64 probability calculations after logits
@@ -6215,7 +6168,12 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
 
         states = 2^m
 
-    and every nonterminal state is evaluated exactly once.
+    and every nonterminal state is evaluated exactly once. state_batch_size
+    only chunks state scheduling; model forward batch size is always one.
+    The caller's module modes and deterministic backend settings are restored.
+
+    log_probability is the authoritative natural-log result. FP64 and log-space
+    accumulation support probabilities down to 1e-100 without floors or pruning.
 
     For m=12:
         4095 model-state evaluations
@@ -6305,20 +6263,6 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
             "state_batch_size must be positive."
         )
 
-    # Exact DP assumes one deterministic set of logits for each x(S).
-    #
-    # The supplied MC explicitly stops sharing states in training mode,
-    # because dropout/etc. would make a fixed state stochastic.
-    # Integrating that additional randomness would no longer be this
-    # finite exact DP.
-    if bool(
-        getattr(model, "training", False)
-    ):
-        raise ValueError(
-            "Exact DP requires deterministic logits for each state. "
-            "Call model.eval() first."
-        )
-
     if attention_mask is not None:
         attention_mask = attention_mask.to(
             device
@@ -6374,275 +6318,43 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
         ),
     )
 
-    slot_grid_base = torch.arange(
-        masked_len,
-        dtype=torch.long,
-        device=device,
-    ).unsqueeze(0)
+    # Every state is evaluated once, so caching native logits has no benefit.
+    state_evaluator = _LowConfidenceStateEvaluator(
+        model, attention_mask, masked_pos_t, use_cache=False,
+    )
 
-    # log_a_table[S, i] = log a_i(S).
-    #
-    # Revealed / invalid transitions remain -inf.
-    #
-    # For m=12 this is only:
-    #
-    #   4096 * 12 * 8 ~= 384 KiB.
+    # log_a_table[S, i] = log a_i(S); revealed transitions remain -inf.
     log_a_table = torch.full(
-        (
-            num_states,
-            masked_len,
-        ),
-        -math.inf,
-        dtype=torch.float64,
-        device=device,
+        (num_states, masked_len), -math.inf, dtype=torch.float64, device=device,
     )
 
-    # ==============================================================
-    # Evaluate every nonterminal model state exactly once.
-    #
-    # Popcount sorting has two advantages:
-    #
-    # 1. equal active-set sizes remain contiguous for postprocessing;
-    # 2. we still chunk the FLATTENED state list, so a forward batch
-    #    can span two DP layers.
-    #
-    # Consequently the model-forward count is exactly
-    #
-    #   ceil((2^m - 1) / state_batch_size),
-    #
-    # instead of sum_k ceil(C(m,k)/batch).
-    # ==============================================================
-
-    state_order = sorted(
-        range(full_state),
-        key=int.bit_count,
-    )
-
-    for batch_start in range(
-        0,
-        full_state,
-        state_batch_size,
-    ):
-        batch_states_py = state_order[
-            batch_start:
-            batch_start + state_batch_size
-        ]
-
-        batch_size = len(
-            batch_states_py
-        )
-
-        state_ids = torch.tensor(
-            batch_states_py,
-            dtype=torch.int64,
-            device=device,
-        )
-
-        revealed = (
-            torch.bitwise_and(
-                state_ids.unsqueeze(1),
-                bit_values.unsqueeze(0),
+    # Keep scheduling chunks for API compatibility, but evaluate each state
+    # using exactly STS's singleton forward and [remaining, vocabulary] math.
+    # The number of model forwards is 2^m - 1, regardless of chunk size.
+    state_order = sorted(range(full_state), key=int.bit_count)
+    for batch_start in range(0, full_state, state_batch_size):
+        for state in state_order[batch_start:batch_start + state_batch_size]:
+            revealed = torch.bitwise_and(state, bit_values) != 0
+            x_row = sequence_tokens[0].clone()
+            x_row[masked_pos_t] = torch.where(
+                revealed, masked_target_row,
+                torch.full_like(masked_target_row, int(mask_id)),
             )
-            != 0
-        )
-        # [B, m]
-
-        # ----------------------------------------------------------
-        # Construct x(S):
-        #
-        # outside M:
-        #     target token
-        #
-        # revealed inside M:
-        #     target token
-        #
-        # unrevealed inside M:
-        #     MASK
-        # ----------------------------------------------------------
-
-        x = sequence_tokens.expand(
-            batch_size,
-            -1,
-        ).clone()
-
-        x[
-            :,
-            masked_pos_t,
-        ] = torch.where(
-            revealed,
-            masked_target_row.unsqueeze(0),
-            torch.full(
-                (
-                    batch_size,
-                    masked_len,
-                ),
-                int(mask_id),
-                dtype=sequence_tokens.dtype,
-                device=device,
-            ),
-        )
-
-        batched_attn = None
-
-        if attention_mask is not None:
-            batched_attn = (
-                attention_mask.expand(
-                    batch_size,
-                    -1,
-                )
+            distribution = state_evaluator.distribution(x_row, revealed, tau)
+            log_a = _exact_low_conf_log_a(
+                distribution=distribution,
+                active_target_ids=masked_target_row[~revealed].unsqueeze(0),
+                temperature=tau,
+            )[0]
+            context = state_evaluator.context(revealed)
+            _check_low_confidence_log_mass(
+                log_a, "successful transition masses", context,
             )
-
-        # ----------------------------------------------------------
-        # Model forward:
-        #
-        # identical dtype policy to supplied MC / STS.
-        # ----------------------------------------------------------
-
-        if device.type in {
-            "cuda",
-            "cpu",
-        }:
-            with torch.autocast(
-                device_type=device.type,
-                enabled=False,
-            ):
-                outputs = model(
-                    x,
-                    attention_mask=batched_attn,
-                )
-        else:
-            outputs = model(
-                x,
-                attention_mask=batched_attn,
+            log_a_table[state, ~revealed] = log_a
+            _check_low_confidence_log_mass(
+                torch.logsumexp(log_a_table[state], dim=-1), "A(S)", context,
             )
-
-        # Retain only positions in M before releasing the much larger
-        # [B, sequence_length, vocab] output.
-        masked_logits_native = (
-            outputs.logits[
-                :,
-                masked_pos_t,
-                :,
-            ]
-        )
-
-        del outputs
-        del x
-
-        # ----------------------------------------------------------
-        # Rows with the same popcount have the same number r of
-        # still-masked positions, so process those together.
-        # ----------------------------------------------------------
-
-        popcounts = [
-            state.bit_count()
-            for state in batch_states_py
-        ]
-
-        group_start = 0
-
-        while group_start < batch_size:
-
-            num_revealed = (
-                popcounts[group_start]
-            )
-
-            group_end = (
-                group_start + 1
-            )
-
-            while (
-                group_end < batch_size
-                and popcounts[group_end]
-                == num_revealed
-            ):
-                group_end += 1
-
-            group_size = (
-                group_end
-                - group_start
-            )
-
-            num_unrevealed = (
-                masked_len
-                - num_revealed
-            )
-
-            group_revealed = revealed[
-                group_start:
-                group_end
-            ]
-
-            active_slots = (
-                slot_grid_base
-                .expand(
-                    group_size,
-                    -1,
-                )[
-                    ~group_revealed
-                ]
-                .view(
-                    group_size,
-                    num_unrevealed,
-                )
-            )
-
-            # Because masked_pos was sorted, active_slots are also in
-            # increasing ABSOLUTE sequence-index order.
-            #
-            # This is what makes local j < i exactly equivalent to
-            # the MC decoder's smallest-sequence-index tie rule.
-
-            local_rows = torch.arange(
-                group_start,
-                group_end,
-                dtype=torch.long,
-                device=device,
-            ).unsqueeze(1)
-
-            active_logits_native = (
-                masked_logits_native[
-                    local_rows,
-                    active_slots,
-                    :,
-                ]
-            )
-
-            active_target_ids = (
-                masked_target_row[
-                    active_slots
-                ]
-            )
-
-            group_log_a = (
-                _exact_low_conf_log_a(
-                    active_logits_native=(
-                        active_logits_native
-                    ),
-                    active_target_ids=(
-                        active_target_ids
-                    ),
-                    temperature=tau,
-                )
-            )
-
-            group_state_ids = state_ids[
-                group_start:
-                group_end
-            ]
-
-            log_a_table[
-                group_state_ids.unsqueeze(1),
-                active_slots,
-            ] = group_log_a
-
-            group_start = (
-                group_end
-            )
-
-        del masked_logits_native
-        del revealed
-        del state_ids
+            del distribution, log_a, x_row, revealed
 
     # ==============================================================
     # Exact subset DP.
@@ -6741,14 +6453,12 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
         ]
     )
 
-    if math.isfinite(
-        log_probability
-    ):
-        probability = math.exp(
-            log_probability
-        )
-    else:
-        probability = 0.0
+    _check_low_confidence_log_mass(
+        torch.tensor(log_probability, dtype=torch.float64),
+        "final DP probability", "full revealed subset",
+    )
+    # Only -inf denotes a genuine zero. NaN/+inf must never masquerade as zero.
+    probability = 0.0 if log_probability == -math.inf else math.exp(log_probability)
 
     return {
         "probability":
@@ -6784,10 +6494,13 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
             state_batch_size,
 
         "model_forward_calls":
-            math.ceil(
-                full_state
-                / state_batch_size
-            ),
+            state_evaluator.forward_rows,
+
+        "model_forward_batch_size":
+            1,
+
+        "model_eval_mode":
+            True,
 
         "tie_breaking":
             "smallest_index_among_max_confidence",
