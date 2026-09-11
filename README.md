@@ -86,9 +86,13 @@ starting Python; unsupported deterministic operations raise a PyTorch error.
 Exact low-confidence subset DP uses this same state evaluator and FP64
 distribution calculation. Its `state_batch_size` only chunks state scheduling;
 model forward batch size is always one. With 10 masked positions, it evaluates
-1,023 nonterminal states once each, without a logits cache. DP preserves the
-smallest-index tie rule and accumulates all transitions in log space, without
-probability floors or pruning. `log_probability` is the natural-log result;
+at most 1,023 nonterminal states once each, without a logits cache. It skips only
+states with exactly zero incoming probability, never small positive masses.
+`num_evaluated_states` and `num_skipped_unreachable_states` report the work done;
+`evaluate_all_states=True` evaluates unreachable states too for auditing. This
+optimization saves model calls only when some states are unreachable. DP preserves
+the smallest-index tie rule and accumulates all transitions in log space, without
+probability floors or approximate pruning. `log_probability` is the natural-log result;
 `probability` remains FP64-compatible down to `1e-100` (use scientific notation
 when displaying or exporting it). Invalid transition masses, total success
 masses, and final results raise errors; `-inf` represents genuine zero probability.

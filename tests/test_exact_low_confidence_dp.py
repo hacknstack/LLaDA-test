@@ -141,8 +141,12 @@ class ExactLowConfidenceDPTests(unittest.TestCase):
         self.assertAlmostEqual(result['log_probability'], expected_log, places=11)
         self.assertGreater(result['probability'], 0)
         self.assertLess(abs(result['probability'] / 1e-100 - 1), 1e-11)
-        self.assertEqual(model.calls, 1023)
-        self.assertEqual(result['model_forward_calls'], 1023)
+        self.assertEqual(model.calls, 10)
+        self.assertEqual(result['model_forward_calls'], 10)
+        self.assertEqual(result['num_skipped_unreachable_states'], 1013)
+        audit = DP(**args, evaluate_all_states=True)
+        self.assertEqual(audit['model_forward_calls'], 1023)
+        self.assertEqual(result['log_probability'], audit['log_probability'])
         args['model'] = ConstantLogitsModel(target_probability)
         sts = STS(**args, num_samples=8, seed=1729)
         self.assertAlmostEqual(result['log_probability'], sts['log_probability'], places=11)
@@ -154,12 +158,32 @@ class ExactLowConfidenceDPTests(unittest.TestCase):
             result = DP(**self.args(ConstantLogitsModel(probability)))
             self.assertEqual(result['probability'], probability)
             self.assertEqual(result['log_probability'], -math.inf if probability == 0 else 0)
+            self.assertEqual(result['model_forward_calls'], 1 if probability == 0 else 3)
         args = self.args(ConstantLogitsModel(1e-100))
         args.update(masked_indexes=[50], steps=1, attention_mask=None)
         result = DP(**args)
         self.assertAlmostEqual(result['log_probability'], math.log(1e-100), places=12)
         self.assertLess(abs(result['probability'] / 1e-100 - 1), 1e-12)
         self.assertEqual(result['model_forward_calls'], 1)
+
+    def test_reachable_and_all_state_modes_have_identical_totals(self):
+        for temperature in (0.5, 1.0, 2.0):
+            fast = DP(**self.args(ToyModel(), temperature))
+            audit = DP(**self.args(ToyModel(), temperature), evaluate_all_states=True)
+            self.assertEqual(fast['log_probability'], audit['log_probability'])
+            self.assertEqual(fast['probability'], audit['probability'])
+            self.assertLessEqual(fast['model_forward_calls'], audit['model_forward_calls'])
+
+    def test_log_reachability_preserves_paths_whose_linear_mass_underflows(self):
+        # Every successful prefix has positive mass, even when exp(log_mass)
+        # underflows. Reachability must inspect -inf, never exp(log_mass)==0.
+        args = self.args(ConstantLogitsModel(1e-100))
+        args.update(masked_indexes=list(range(1, 11)), steps=10)
+        result = DP(**args)
+        self.assertEqual(result['probability'], 0.0)
+        self.assertTrue(math.isfinite(result['log_probability']))
+        self.assertAlmostEqual(result['log_probability'], 55 * math.log(1e-100), places=9)
+        self.assertEqual(result['model_forward_calls'], 10)
 
     def test_settings_and_mixed_module_modes_restored_on_success_and_failure(self):
         def settings():

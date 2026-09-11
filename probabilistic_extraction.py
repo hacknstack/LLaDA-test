@@ -6062,35 +6062,16 @@ def _exact_low_conf_log_a(
         device=device,
     )
 
-    # Deliberately preserve STS's competitor accumulation order.
+    # Select all strict/non-strict factors together, avoiding several small
+    # GPU kernels per competitor. Keep additions in exactly STS's order.
+    competitor_j = proposed_i.transpose(0, 1)
+    competitor_factors = torch.where(
+        competitor_j < proposed_i,
+        log_L,
+        torch.where(competitor_j > proposed_i, log_LE, 0.0),
+    )
     for competitor_j in range(r):
-
-        strict_for_smaller = (
-            competitor_j < proposed_i
-        )
-
-        nonstrict_for_larger = (
-            competitor_j > proposed_i
-        )
-
-        competitor_factor = torch.where(
-            strict_for_smaller,
-            log_L[:, competitor_j, :],
-            torch.where(
-                nonstrict_for_larger,
-                log_LE[:, competitor_j, :],
-                torch.zeros(
-                    (),
-                    dtype=torch.float64,
-                    device=device,
-                ),
-            ),
-        )
-
-        log_win_mass = (
-            log_win_mass
-            + competitor_factor
-        )
+        log_win_mass = log_win_mass + competitor_factors[:, competitor_j, :]
 
     # --------------------------------------------------------------
     # a_i(S)
@@ -6116,6 +6097,7 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
     temperature: float,
     state_batch_size: int = 64,
     max_masked: int = MAX_EXACT_LOW_CONFIDENCE_MASKED,
+    evaluate_all_states: bool = False,
 ) -> Dict[str, object]:
     """
     Exact extraction probability under one-token-per-step
@@ -6168,15 +6150,18 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
 
         states = 2^m
 
-    and every nonterminal state is evaluated exactly once. state_batch_size
-    only chunks state scheduling; model forward batch size is always one.
+    and every reachable nonterminal state is evaluated exactly once. Only
+    states with exactly zero incoming probability are skipped; no small positive
+    probability is discarded. evaluate_all_states=True also evaluates unreachable
+    states for auditing. state_batch_size only chunks state scheduling; model
+    forward batch size is always one.
     The caller's module modes and deterministic backend settings are restored.
 
     log_probability is the authoritative natural-log result. FP64 and log-space
     accumulation support probabilities down to 1e-100 without floors or pruning.
 
     For m=12:
-        4095 model-state evaluations
+        at most 4095 model-state evaluations
 
     instead of:
         12! = 479,001,600 reveal orders.
@@ -6323,17 +6308,17 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
         model, attention_mask, masked_pos_t, use_cache=False,
     )
 
-    # log_a_table[S, i] = log a_i(S); revealed transitions remain -inf.
-    log_a_table = torch.full(
-        (num_states, masked_len), -math.inf, dtype=torch.float64, device=device,
-    )
-
-    # Keep scheduling chunks for API compatibility, but evaluate each state
-    # using exactly STS's singleton forward and [remaining, vocabulary] math.
-    # The number of model forwards is 2^m - 1, regardless of chunk size.
-    state_order = sorted(range(full_state), key=int.bit_count)
+    # Evaluate states on demand in numeric topological order. This preserves
+    # the original CPU logaddexp accumulation order, while avoiding forwards
+    # for states that cannot be reached by any successful reveal path.
+    log_dp = [-math.inf] * num_states
+    log_dp[0] = 0.0
     for batch_start in range(0, full_state, state_batch_size):
-        for state in state_order[batch_start:batch_start + state_batch_size]:
+        for state in range(batch_start, min(batch_start + state_batch_size, full_state)):
+            base = log_dp[state]
+            if base == -math.inf and not evaluate_all_states:
+                continue
+
             revealed = torch.bitwise_and(state, bit_values) != 0
             x_row = sequence_tokens[0].clone()
             x_row[masked_pos_t] = torch.where(
@@ -6346,106 +6331,39 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
                 active_target_ids=masked_target_row[~revealed].unsqueeze(0),
                 temperature=tau,
             )[0]
-            context = state_evaluator.context(revealed)
+            # Construct diagnostic context from the CPU subset instead of
+            # copying the revealed-position tensor back from the GPU again.
+            positions = [masked_pos[i] + 1 for i in range(masked_len) if state & (1 << i)]
+            context = f"step={len(positions)}, revealed_indices={positions}"
             _check_low_confidence_log_mass(
                 log_a, "successful transition masses", context,
             )
-            log_a_table[state, ~revealed] = log_a
+            # Match STS's full masked-slot reduction, including revealed -inf.
+            log_a_full = torch.full(
+                (masked_len,), -math.inf, dtype=torch.float64, device=device,
+            )
+            log_a_full[~revealed] = log_a
             _check_low_confidence_log_mass(
-                torch.logsumexp(log_a_table[state], dim=-1), "A(S)", context,
+                torch.logsumexp(log_a_full, dim=-1), "A(S)", context,
             )
-            del distribution, log_a, x_row, revealed
+            # The row is tiny (at most max_masked doubles). Moving it to CPU
+            # enables exact reachability decisions and avoids tiny GPU DP kernels.
+            log_a_cpu = log_a_full.detach().cpu().tolist()
+            del distribution, log_a, log_a_full, x_row, revealed
 
-    # ==============================================================
-    # Exact subset DP.
-    #
-    # Let D[S] be the total probability of reaching S while every
-    # revealed token has matched the target.
-    #
-    # D[empty] = 1
-    #
-    # D[S U {i}] += D[S] a_i(S)
-    #
-    # Every possible successful reveal order corresponds to exactly
-    # one path from empty -> full, so D[full] is the desired
-    # extraction probability.
-    # ==============================================================
-
-    # Tiny table; moving it to CPU avoids thousands of tiny GPU
-    # kernels during the combinatorial DP.
-    log_a_cpu = (
-        log_a_table
-        .detach()
-        .cpu()
-        .tolist()
-    )
-
-    log_dp = [
-        -math.inf
-    ] * num_states
-
-    log_dp[0] = 0.0
-
-    # Numeric state order is already topological:
-    #
-    #   S | (1 << i) > S.
-    for state in range(
-        full_state
-    ):
-        base = log_dp[
-            state
-        ]
-
-        if base == -math.inf:
-            continue
-
-        remaining = (
-            full_state ^ state
-        )
-
-        while remaining:
-
-            bit = (
-                remaining
-                & -remaining
-            )
-
-            slot = (
-                bit.bit_length()
-                - 1
-            )
-
-            log_transition = (
-                log_a_cpu[
-                    state
-                ][
-                    slot
-                ]
-            )
-
-            if (
-                log_transition
-                != -math.inf
-            ):
-                next_state = (
-                    state | bit
-                )
-
-                candidate = (
-                    base
-                    + log_transition
-                )
-
-                log_dp[
-                    next_state
-                ] = _logaddexp_scalar(
-                    log_dp[
-                        next_state
-                    ],
-                    candidate,
-                )
-
-            remaining ^= bit
+            if base == -math.inf:
+                continue  # Audit mode evaluated this state, but it has no mass.
+            remaining = full_state ^ state
+            while remaining:
+                bit = remaining & -remaining
+                slot = bit.bit_length() - 1
+                log_transition = log_a_cpu[slot]
+                if log_transition != -math.inf:
+                    next_state = state | bit
+                    log_dp[next_state] = _logaddexp_scalar(
+                        log_dp[next_state], base + log_transition,
+                    )
+                remaining ^= bit
 
     log_probability = float(
         log_dp[
@@ -6495,6 +6413,15 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
 
         "model_forward_calls":
             state_evaluator.forward_rows,
+
+        "num_evaluated_states":
+            state_evaluator.forward_rows,
+
+        "num_skipped_unreachable_states":
+            full_state - state_evaluator.forward_rows,
+
+        "evaluate_all_states":
+            bool(evaluate_all_states),
 
         "model_forward_batch_size":
             1,
