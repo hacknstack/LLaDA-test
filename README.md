@@ -97,6 +97,27 @@ probability floors or approximate pruning. `log_probability` is the natural-log 
 when displaying or exporting it). Invalid transition masses, total success
 masses, and final results raise errors; `-inf` represents genuine zero probability.
 
+Partially masked random remasking and DUEL also use deterministic singleton
+forwards and STS-shaped FP64 token normalization. They skip vocabulary sorting
+and CDF construction because neither estimator needs sampled-confidence
+competition probabilities. They retain their own reveal policies, so numerical
+alignment does not imply their final estimates equal low-confidence STS.
+
+Random remasking defaults to 512 trajectories per batch, covering a 500-sample
+run. It groups identical states, caches only compact target log probabilities
+(up to 64 MiB of tensor data), and stops paths with exactly zero weight. Full and
+top-k sampling and simultaneous reveal blocks remain supported. Results include
+`log_probability`, `sample_log_probabilities`, and `model_forward_calls`; seeded
+path scores are unchanged by trajectory batch size. Uniform random paths can
+still visit close to 25,000 states with 500 samples and 50 one-token steps, so
+singleton alignment can cost substantially more than the former batched FP32
+implementation on an A100. State reuse does not eliminate that cost.
+
+DUEL constructs and scores its path in 50 singleton forwards, without logits
+caching. Exact confidence ties still select the smallest sequence index. Both
+estimators validate numerical results, preserve legitimate zero probabilities,
+and restore the caller's model modes and backend settings even on failure.
+
 Run the CPU regression tests with `python -B -m unittest discover -s tests -v`.
 They require PyTorch and use tiny models without downloading model weights.
 
