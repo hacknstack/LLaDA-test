@@ -97,32 +97,31 @@ class RandomDuelAlignmentTests(unittest.TestCase):
         return dict(self.args(model, temperature), num_samples=8, seed=51,
                     decoding_scheme='full', k=1)
 
-    def test_duel_target_and_confidence_values_equal_sts_distribution(self):
-        original = pe._target_probability_state
+    def test_duel_confidence_ranking_matches_sts_and_target_scores_remain_fp64(self):
+        original = pe._duel_state_scores
         for temperature in (0.5, 1.0, 2.0):
-            for estimator in (DUEL,):
-                with self.subTest(temperature=temperature, estimator=estimator.__name__):
-                    model = StateModel()
+            for verbose in (False, True):
+                model = StateModel()
 
-                    def observe(model, x_row, positions, target_ids, attention_mask,
-                                temperature, context, *args, **kwargs):
-                        result = original(model, x_row, positions, target_ids,
-                                          attention_mask, temperature, context, *args, **kwargs)
-                        logits = model.last_logits[0, positions, :].contiguous()
-                        distribution = pe._low_confidence_distribution(logits, temperature, context)
-                        expected = distribution.logits.gather(-1, target_ids[:, None])[:, 0]
-                        expected = expected / temperature - distribution.log_Z_sample
-                        self.assertTrue(torch.equal(result[0], expected))
-                        if result[1] is not None:
-                            expected_conf = distribution.logits.max(dim=-1).values - distribution.log_Z_conf
-                            self.assertTrue(torch.equal(result[1], expected_conf))
-                        return result
+                def observe(model, x_row, positions, target_ids, attention_mask,
+                            temperature, context, *args, **kwargs):
+                    result = original(model, x_row, positions, target_ids,
+                                      attention_mask, temperature, context, *args, **kwargs)
+                    logits = model.last_logits[0, positions, :].contiguous()
+                    distribution = pe._low_confidence_distribution(logits, temperature, context)
+                    expected = distribution.logits.gather(-1, target_ids[:, None])[:, 0]
+                    expected = expected / temperature - distribution.log_Z_sample
+                    expected_conf = distribution.logits.max(dim=-1).values - distribution.log_Z_conf
+                    self.assertEqual(result[0], expected_conf.argmax().item())
+                    self.assertTrue(torch.equal(result[2], expected_conf))
+                    self.assertAlmostEqual(result[1].item(), expected[result[0]].item(), places=13)
+                    if result[3] is not None:
+                        torch.testing.assert_close(result[3], expected, rtol=0, atol=2e-14)
+                    return result
 
-                    args = self.random_args(model, temperature) if estimator is RANDOM else self.args(model, temperature)
-                    if estimator is RANDOM:
-                        args.update(num_samples=2, steps=5)
-                    with patch.object(pe, '_target_probability_state', side_effect=observe):
-                        estimator(**args)
+                with patch.object(pe, '_duel_state_scores', side_effect=observe) as calls:
+                    DUEL(**self.args(model, temperature), verbose=verbose)
+                self.assertEqual(calls.call_count, 50)
 
     def test_random_scores_match_across_batches_for_a_batch_independent_model(self):
         results = []
@@ -154,16 +153,18 @@ class RandomDuelAlignmentTests(unittest.TestCase):
             x_row[:50] = MASK_ID
             positions = torch.arange(50)
             ids = torch.zeros(50, dtype=torch.long)
-            actual, confidence = pe._target_probability_state(
+            chosen, actual, confidence, all_targets = pe._duel_state_scores(
                 model, x_row, positions, ids, None, temperature, 'native logits',
-                need_confidence=True,
+                full_diagnostics=True,
             )
             distribution = pe._low_confidence_distribution(
                 model.last_logits[0, positions, :].contiguous(), temperature, 'native logits',
             )
             expected = distribution.logits[:, 0] / temperature - distribution.log_Z_sample
             expected_conf = distribution.logits.max(dim=-1).values - distribution.log_Z_conf
-            self.assertTrue(torch.equal(actual, expected))
+            self.assertEqual(chosen, expected_conf.argmax().item())
+            self.assertAlmostEqual(actual.item(), expected[chosen].item(), places=13)
+            torch.testing.assert_close(all_targets, expected, rtol=0, atol=2e-14)
             self.assertTrue(torch.equal(confidence, expected_conf))
 
         for dtype in (torch.bfloat16, torch.float16):
@@ -249,6 +250,43 @@ class RandomDuelAlignmentTests(unittest.TestCase):
         self.assertEqual(result['reveal_path_indices'], list(range(1, 51)))
         self.assertAlmostEqual(result['log_probability'], math.log(1e-100), places=11)
         self.assertLess(abs(result['probability'] / 1e-100 - 1), 1e-11)
+
+    def test_duel_normalizes_only_chosen_tempered_rows_and_diagnostics_do_not_change_scores(self):
+        for temperature in (0.5, 1.0, 2.0):
+            original = torch.log_softmax
+            shapes = []
+
+            def observe(values, *args, **kwargs):
+                shapes.append(tuple(values.shape))
+                self.assertEqual(values.dtype, torch.float64)
+                return original(values, *args, **kwargs)
+
+            with patch.object(torch, 'log_softmax', side_effect=observe):
+                quiet = DUEL(**self.args(StateModel(), temperature))
+            if temperature == 1.0:
+                self.assertEqual(shapes, [])  # Reuses the ranking normalizer.
+            else:
+                self.assertEqual(shapes, [(1, 3)] * 50)
+            for compact in (False, True):
+                verbose = DUEL(**self.args(StateModel(), temperature),
+                               verbose=True, verbose_compact=compact)
+                self.assertEqual(verbose['log_probability'], quiet['log_probability'])
+                self.assertEqual(verbose['reveal_path_indices'], quiet['reveal_path_indices'])
+
+    def test_duel_tempered_tiny_probabilities_stay_in_log_space(self):
+        for temperature in (0.1, 0.5, 2.0):
+            p = 0.01
+            logits = [math.log(p) / temperature, math.log1p(-p) / temperature]
+            largest = max(logits)
+            expected_log = 50 * (logits[0] - largest - math.log(
+                math.fsum(math.exp(v - largest) for v in logits)))
+            result = DUEL(**self.args(StateModel(constant_p=p), temperature))
+            self.assertAlmostEqual(result['log_probability'], expected_log, places=10)
+            self.assertEqual(result['reveal_path_indices'], list(range(1, 51)))
+            self.assertEqual(result['model_forward_calls'], 50)
+            self.assertTrue(math.isfinite(result['log_probability']))
+            if temperature == 0.1:
+                self.assertEqual(result['probability'], 0.0)
 
     def test_zero_paths_and_topk_exclusion_are_valid(self):
         for scheme in ('full', 'top_k'):

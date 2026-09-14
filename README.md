@@ -101,11 +101,21 @@ Random remasking and DUEL skip vocabulary sorting and CDF construction because
 neither needs sampled-confidence competition probabilities. Their reveal policies
 differ from low-confidence STS, so their final estimates need not match STS.
 
-Random remasking defaults to **128 trajectories per actual model batch** for the
-A100 80GB. It evaluates the common initial state once, then scores only the
-positions being revealed in each batched forward. With 500 samples and 50
-one-token steps, this requires at most **197 model calls**, rather than tens of
-thousands of singleton calls. `batch_size` controls model batching;
+Random remasking recognizes the standard GSAI LLaDA model and gathers the
+requested hidden positions after its final layer norm, before vocabulary
+projection. All transformer layers still process the complete 100-token context;
+only the expensive output projection omits unused positions. The scoped hook is
+removed even on failure, and supports both separate and tied output weights.
+
+On this LLaDA path, random remasking defaults to **512 trajectories per actual
+model batch** for the A100 80GB. With 500 samples and 50 one-token steps, the
+shared initial state plus 49 batched steps require at most **50 model calls**.
+Only **24,550 position rows** are projected to vocabulary logits, instead of
+2,450,100. This reduces output-head computation and memory, but does not remove
+the transformer work for those trajectory states. Other architectures retain
+the generic full-logits path and a default batch size of 128 (up to 197 calls).
+`use_selected_logits=False` disables the LLaDA optimization for comparison.
+`batch_size` overrides automatic model batching;
 `normalization_batch_size` (default 128) independently bounds how many selected
 vocabulary rows are promoted to FP64 at once. The full model output stays in
 native dtype; normalization uses stable FP64 `log_softmax`. Full/top-k sampling
@@ -115,16 +125,25 @@ Path products and arithmetic averaging stay in log space, without probability
 floors. Only exactly zero paths are dropped, so finite log weights remain valid
 even below the ordinary floating-point probability range. Results include
 `log_probability`, `sample_log_probabilities`, `model_forward_calls`, and
-`model_forward_max_batch_size`. Seeded reveal permutations are independent of
+`model_forward_max_batch_size`, `selected_position_logits`, and
+`vocabulary_projection_rows`. Seeded reveal permutations are independent of
 batch size, but model logits and scores can differ slightly across batch shapes.
 This trades singleton numerical identity for batched throughput; it does not
 revert token normalization to FP32. Real A100 speed and batch-dependent model
 roundoff still require measurement on the actual model.
 
 DUEL constructs and scores its path in 50 singleton forwards, without logits
-caching. Exact confidence ties still select the smallest sequence index. Both
-estimators validate numerical results, preserve legitimate zero probabilities,
-and restore the caller's model modes and backend settings even on failure.
+caching. Its FP64 confidence calculation and smallest-index tie rule are
+unchanged. At temperature 1 it reuses the ranking normalizer to score the chosen
+target; other temperatures normalize only that position with stable FP64
+`log_softmax`, unless full diagnostics also require scores for the other
+positions. Compact diagnostics avoid that additional work and never change the
+chosen score. Validation flags and diagnostic values use compact host transfers;
+very large logit offsets retain a normalization-cancellation check. DUEL's 50
+dependent reveals cannot be batched together within a single window, so its
+speedup is limited when model inference dominates. Both estimators validate
+numerical results, preserve legitimate zero probabilities, and restore the
+caller's model modes and backend settings even on failure.
 
 Run the CPU regression tests with `python -B -m unittest discover -s tests -v`.
 They require PyTorch and use tiny models without downloading model weights.
