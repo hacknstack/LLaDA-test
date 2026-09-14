@@ -1764,11 +1764,14 @@ def _random_remasking_target_log_probs(
     flat_positions, flat_targets = positions.reshape(-1), target_ids.reshape(-1)
     result = torch.empty(flat_targets.numel(), dtype=torch.float64, device=logits.device)
     vocab_size = logits.shape[-1]
+    invalid_chunks = []
     for start in range(0, flat_targets.numel(), normalization_batch_size):
         end = min(start + normalization_batch_size, flat_targets.numel())
         selected = logits[row_ids[start:end], flat_positions[start:end], :].to(torch.float64)
-        if bool((torch.isnan(selected) | torch.isposinf(selected)).any().item()):
-            raise FloatingPointError(f"Invalid model logits ({context}): NaN or +inf.")
+        # A finite row maximum excludes NaN, +inf and all--inf rows. Queue
+        # small validation flags on device instead of synchronizing the GPU
+        # for every vocabulary chunk and scanning full log-probability arrays.
+        invalid_chunks.append(~torch.isfinite(selected.amax(dim=-1)).all())
         targets = flat_targets[start:end]
         if decoding_scheme == "top_k" and k < vocab_size:
             selected, token_ids = torch.topk(selected, k=int(k), dim=-1)
@@ -1779,14 +1782,99 @@ def _random_remasking_target_log_probs(
             target_columns = targets
         if temperature != 1.0:
             selected.div_(temperature)
+            invalid_chunks.append(~torch.isfinite(selected.amax(dim=-1)).all())
         log_probs = torch.log_softmax(selected, dim=-1)
-        _check_low_confidence_log_mass(log_probs, "token probabilities", context)
         target_logs = log_probs.gather(-1, target_columns[:, None]).squeeze(-1)
         if target_matches is not None:
             target_logs = target_logs.masked_fill(~target_matches.any(dim=-1), -math.inf)
         result[start:end] = target_logs
         del selected, log_probs
+    invalid_chunks.append((torch.isnan(result) | torch.isposinf(result)
+                           | (result > _LOW_CONFIDENCE_LOG_TOL)).any())
+    if bool(torch.stack(invalid_chunks).any().item()):
+        raise FloatingPointError(f"Invalid random token probabilities or model logits ({context}).")
     return result.view(batch_size, step_size)
+
+
+def _random_remasking_pooled_paths(
+    model, initial_x, attention_mask, masked_pos, target_row, schedule,
+    num_samples, rng, initial_scores, projection_layer, temperature,
+    decoding_scheme, k, state_batch_size, normalization_batch_size,
+):
+    """Batch predetermined states across BOTH trajectories and reveal steps.
+
+    Conditioning tokens along a successful path are always the target tokens;
+    they do not depend on previously computed probabilities. Construct each
+    state directly from its permutation prefix, while retaining full context.
+    Equal-sized reveal blocks are grouped so no padded vocabulary work is done.
+    Zero paths may be evaluated here, but no finite path is pruned.
+    """
+    device = initial_x.device
+    permutations = torch.argsort(torch.rand(
+        (num_samples, masked_pos.numel()), generator=rng, device="cpu", dtype=torch.float64,
+    ), dim=-1).to(device)
+    ranks = permutations.argsort(dim=-1)
+    offsets = [0]
+    for size in schedule:
+        offsets.append(offsets[-1] + size)
+    step_logs = torch.empty((num_samples, len(schedule)), device=device, dtype=torch.float64)
+    step_logs[:, 0] = initial_scores[permutations[:, :schedule[0]]].sum(dim=-1)
+    calls, rows, max_batch, projection_rows, oom_retries = 0, 0, 0, 0, 0
+    effective_batch = state_batch_size
+
+    def evaluate(trajectory_ids, starts, width):
+        slots = permutations[trajectory_ids].gather(
+            1, starts[:, None] + torch.arange(width, device=device)[None, :],
+        )
+        positions, targets = masked_pos[slots], target_row[slots]
+        x = initial_x.expand(trajectory_ids.numel(), -1).clone()
+        # Only the permutation PREFIX is revealed, including for simultaneous
+        # blocks. Other positions retain the caller's visible context.
+        revealed = ranks[trajectory_ids] < starts[:, None]
+        x[:, masked_pos] = torch.where(revealed, target_row[None, :], initial_x[:, masked_pos])
+        attn = None if attention_mask is None else attention_mask.expand(x.shape[0], -1)
+        logits = _random_remasking_forward_logits(model, x, attn, positions, projection_layer)
+        score_positions = (positions if projection_layer is None else
+                           torch.arange(width, device=device)[None, :].expand(x.shape[0], -1))
+        scores = _random_remasking_target_log_probs(
+            logits, score_positions, targets, temperature, decoding_scheme, k,
+            "pooled random states", normalization_batch_size,
+        ).sum(dim=-1)
+        return scores, logits.shape[0] * logits.shape[1]
+
+    # Group by block width (at most two widths for the balanced schedule).
+    for width in sorted(set(schedule[1:])):
+        group_steps = [step for step in range(1, len(schedule)) if schedule[step] == width]
+        task_steps = torch.tensor(group_steps, device=device).repeat_interleave(num_samples)
+        task_trajectories = torch.arange(num_samples, device=device).repeat(len(group_steps))
+        task_starts = torch.tensor(offsets[:-1], device=device)[task_steps]
+        begin = 0
+        while begin < task_steps.numel():
+            end = min(begin + effective_batch, task_steps.numel())
+            trajectories, step_ids = task_trajectories[begin:end], task_steps[begin:end]
+            try:
+                scores, projected = evaluate(trajectories, task_starts[begin:end], width)
+            except torch.cuda.OutOfMemoryError:
+                if device.type != "cuda" or end - begin <= 1:
+                    raise
+                effective_batch = max(1, (end - begin) // 2)
+                oom_retries += 1
+                # Retrying changes only execution shape, never the sampled paths.
+                torch.cuda.empty_cache()
+                continue
+            step_logs[trajectories, step_ids] = scores
+            calls += 1
+            rows += end - begin
+            max_batch = max(max_batch, end - begin)
+            projection_rows += projected
+            begin = end
+
+    # Preserve the original per-trajectory left-to-right FP64 addition order.
+    weights = step_logs[:, 0].clone()
+    for step in range(1, len(schedule)):
+        weights += step_logs[:, step]
+    return (weights.cpu().tolist(), calls, rows, max_batch, projection_rows,
+            effective_batch, oom_retries)
 
 
 @torch.inference_mode()
@@ -1806,6 +1894,7 @@ def _path_sampling_random_probability_from_partially_masked(
     batch_size: Optional[int] = None,
     normalization_batch_size: int = 128,
     use_selected_logits: bool = True,
+    state_batch_size: Optional[int] = None,
 ) -> Dict[str, object]:
     """Fast random reveal-order sampling with FP64 log-probability scoring.
 
@@ -1814,7 +1903,10 @@ def _path_sampling_random_probability_from_partially_masked(
     run in native dtype, in temporary deterministic eval mode without autocast.
     Standard LLaDA uses selected-position vocabulary projection and defaults to
     512 trajectories per model batch on the A100 80GB; other models default to
-    128. The common initial state is evaluated once, and exactly zero paths stop.
+    128. On CUDA devices with at least 70 GiB VRAM, full sampling with native
+    BF16/FP16 LLaDA instead pools states across steps, up to 2048 per forward.
+    state_batch_size overrides that pool size; zero selects stepwise execution.
+    The common initial state is evaluated once.
 
     Only selected token positions are normalized, using stable FP64 log_softmax
     in bounded chunks. Path products and the arithmetic mean stay in log space.
@@ -1838,6 +1930,7 @@ def _path_sampling_random_probability_from_partially_masked(
     if not 1 <= steps <= masked_len:
         raise ValueError(f"steps must be in [1, {masked_len}], got {steps}")
     projection_layer = (_random_remasking_projection_layer(model) if use_selected_logits else None)
+    auto_model_batch = batch_size is None
     if batch_size is None:
         batch_size = 512 if projection_layer is not None else 128
     if num_samples <= 0 or batch_size <= 0 or normalization_batch_size <= 0:
@@ -1858,6 +1951,20 @@ def _path_sampling_random_probability_from_partially_masked(
     masked_target_row = sequence_tokens[0, masked_pos_t]
     base, rem = divmod(masked_len, steps)
     schedule = [base + (step < rem) for step in range(steps)]
+    if state_batch_size is None:
+        state_batch_size = 0
+        if (auto_model_batch and device.type == "cuda" and projection_layer is not None
+                and decoding_scheme == "full"):
+            native_dtype = next(model.parameters()).dtype
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            if total_bytes >= 70 * 1024**3 and native_dtype in {torch.bfloat16, torch.float16}:
+                # Conservative workspace budget, including FP32 norm/rotary
+                # intermediates and the selected vocabulary head. Retry smaller
+                # batches on CUDA OOM for other allocations/model variants.
+                per_state_bytes = (24 + 0.5 * max(schedule)) * 1024**2
+                state_batch_size = max(1, min(2048, int((free_bytes - 8 * 1024**3) / per_state_bytes)))
+    if state_batch_size < 0:
+        raise ValueError("state_batch_size must be nonnegative (zero disables state pooling).")
     rng = None if seed is None else torch.Generator(device="cpu").manual_seed(int(seed))
     # All trajectories start at exactly the same state. Score all possible
     # first reveals once instead of repeating the full model forward 500 times.
@@ -1877,7 +1984,19 @@ def _path_sampling_random_probability_from_partially_masked(
     del logits
     forward_calls, forward_rows, max_forward_batch = 1, 1, 1
     sample_logs = []
-    for batch_start in range(0, num_samples, batch_size):
+    effective_state_batch, oom_retries = state_batch_size, 0
+    if state_batch_size:
+        (sample_logs, calls, rows, max_batch, projected,
+         effective_state_batch, oom_retries) = _random_remasking_pooled_paths(
+            model, initial_x, attention_mask, masked_pos_t, masked_target_row, schedule,
+            num_samples, rng, initial_scores, projection_layer, tau,
+            decoding_scheme, k, state_batch_size, normalization_batch_size,
+        )
+        forward_calls += calls
+        forward_rows += rows
+        max_forward_batch = max(max_forward_batch, max_batch)
+        projection_rows += projected
+    for batch_start in range(0, num_samples if not state_batch_size else 0, batch_size):
         bsz = min(batch_size, num_samples - batch_start)
         permutations = torch.argsort(torch.rand(
             (bsz, masked_len), generator=rng, device="cpu", dtype=torch.float64,
@@ -1943,9 +2062,13 @@ def _path_sampling_random_probability_from_partially_masked(
         "decoding_scheme": decoding_scheme,
         "temperature": tau,
         "model_forward_calls": forward_calls,
-        "model_forward_batch_size": batch_size,
+        "model_forward_batch_size": state_batch_size or batch_size,
         "model_forward_max_batch_size": max_forward_batch,
         "model_forward_rows": forward_rows,
+        "states_pooled_across_steps": bool(state_batch_size),
+        "state_batch_size": state_batch_size,
+        "effective_state_batch_size": effective_state_batch,
+        "cuda_oom_retries": oom_retries,
         "normalization_batch_size": normalization_batch_size,
         "initial_state_reused": True,
         "selected_position_logits": projection_layer is not None,
