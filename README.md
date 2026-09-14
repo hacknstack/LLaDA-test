@@ -107,23 +107,20 @@ projection. All transformer layers still process the complete 100-token context;
 only the expensive output projection omits unused positions. The scoped hook is
 removed even on failure, and supports both separate and tied output weights.
 
-On the A100 80GB, native BF16/FP16 LLaDA with full sampling now pools states
-**across trajectories and decoding steps**, up to **2,048 states per forward**.
-Random permutations fix every successful-path conditioning state in advance,
-so this batching retains the original reveal schedule and all 500 samples.
-With 500 samples and 50 one-token steps, a pool of 2,048 needs **13 model calls**
-(one shared initial state plus 12 pooled batches), instead of 50.
-The automatic pool size respects available VRAM and reserves workspace;
-CUDA out-of-memory errors retry the same states with smaller batches.
+Random remasking defaults to **512 trajectories per batch** for recognized
+LLaDA models, giving 50 model calls for 500 samples with 50 one-token steps.
+Larger batches did not improve measured throughput on an A100 80GB.
+Explicit `state_batch_size=2048` pools predetermined states across trajectories
+and decoding steps, reducing this workload to 13 calls, with smaller retries
+on CUDA out-of-memory errors. It retains the schedule and all samples, but
+fewer calls do not imply less transformer computation.
 Only **24,550 position rows** are projected to vocabulary logits, instead of
 2,450,100. This reduces output-head computation and memory, but does not remove
-the transformer work for those trajectory states. Other devices/dtypes and
-top-k sampling retain stepwise execution with 512 trajectories for recognized
-LLaDA. Other architectures use full logits with 128 trajectories (up to 197 calls).
+the transformer work for those trajectory states. Other architectures use
+full logits with 128 trajectories (up to 197 calls).
 `use_selected_logits=False` disables the LLaDA optimization for comparison.
-`state_batch_size` explicitly sets the pool size; `state_batch_size=0` selects
-stepwise execution for comparison. Explicit `batch_size` also selects stepwise
-execution unless a positive `state_batch_size` is supplied.
+`state_batch_size` explicitly sets the pool size; zero/None uses stepwise
+execution, whose trajectory batch size is controlled by `batch_size`.
 `normalization_batch_size` (default 128) independently bounds how many selected
 vocabulary rows are promoted to FP64 at once. The full model output stays in
 native dtype; normalization uses stable FP64 `log_softmax`. Validation flags
@@ -143,10 +140,33 @@ even below the ordinary floating-point probability range. Results include
 Seeded reveal permutations are independent of
 batch size, but model logits and scores can differ slightly across batch shapes.
 This trades singleton numerical identity for batched throughput; it does not
-revert token normalization to FP32. Real A100 speed and batch-dependent model
-roundoff still require measurement on the actual model. Fewer forward calls
+revert token normalization to FP32. Batch-dependent model roundoff remains
+possible. Fewer forward calls
 do not imply proportionally less runtime: the transformer still processes
 24,501 sequence rows of 100 tokens for this 500-sample configuration.
+
+Direct profiling on the user's A100-SXM4-80GB, with LLaDA-8B-Base in BF16,
+PyTorch 2.11.0+cu128 and 100-token inputs, measured the following selected-head
+forward times (one warmup per shape, mean of two timed forwards):
+
+| States per forward | Forward time | States/second | Projected 24,500-state forward time |
+| ---: | ---: | ---: | ---: |
+| 128 | 0.951 s | 134.6 | 182.0 s |
+| 500 | 3.720 s | 134.4 | 182.3 s |
+| 1,024 | 7.637 s | 134.1 | 182.7 s |
+| 2,048 | 15.399 s | 133.0 | 184.2 s |
+
+These are synthetic-input forward measurements, not end-to-end window timings.
+The live workload sustained 99-100% GPU utilization near its 400 W power limit.
+Matrix multiplication accounted for about 70% of forward CUDA time; FP64
+target scoring for 500 states took 3.93 ms separately.
+
+The known LLaDA random forward now temporarily disables deterministic filling
+of unused tensor memory, restoring the caller's setting even on exceptions.
+All tensors read by this implementation are initialized. Alternating A100
+measurements at batch 500 reduced mean forward time from 3.715 s to 3.627 s
+(about 2.4%), with bit-for-bit identical logits. Deterministic algorithm
+selection, native model dtype, FP64 scoring and STS/MC/DP/DUEL remain unchanged.
 
 DUEL constructs and scores its path in 50 singleton forwards, without logits
 caching. Its FP64 confidence calculation and smallest-index tie rule are

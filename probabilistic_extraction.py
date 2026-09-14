@@ -1736,10 +1736,18 @@ def _random_remasking_forward_logits(model, x, attention_mask, positions, projec
               projection_layer.register_forward_hook(select_hidden_positions))
     autocast = (torch.autocast(device_type=x.device.type, enabled=False)
                 if x.device.type in {"cpu", "cuda"} else nullcontext())
+    # Standard LLaDA initializes every tensor it reads. Deterministic debug
+    # filling of empty workspaces therefore adds GPU writes without changing
+    # its outputs (verified bit-for-bit on the A100). Scope this to the known
+    # model's random forward; other estimators retain their execution policy.
+    previous_fill = torch.utils.deterministic.fill_uninitialized_memory
     try:
+        if projection_layer is not None:
+            torch.utils.deterministic.fill_uninitialized_memory = False
         with autocast:
             outputs = model(x, attention_mask=attention_mask)
     finally:
+        torch.utils.deterministic.fill_uninitialized_memory = previous_fill
         if handle is not None:
             handle.remove()
     logits = outputs.logits
@@ -1903,9 +1911,9 @@ def _path_sampling_random_probability_from_partially_masked(
     run in native dtype, in temporary deterministic eval mode without autocast.
     Standard LLaDA uses selected-position vocabulary projection and defaults to
     512 trajectories per model batch on the A100 80GB; other models default to
-    128. On CUDA devices with at least 70 GiB VRAM, full sampling with native
-    BF16/FP16 LLaDA instead pools states across steps, up to 2048 per forward.
-    state_batch_size overrides that pool size; zero selects stepwise execution.
+    128. Larger pools did not improve measured A100 throughput. Explicit
+    state_batch_size enables pooling across steps; zero/None selects stepwise
+    execution. The known model skips deterministic filling of unused memory.
     The common initial state is evaluated once.
 
     Only selected token positions are normalized, using stable FP64 log_softmax
@@ -1930,7 +1938,6 @@ def _path_sampling_random_probability_from_partially_masked(
     if not 1 <= steps <= masked_len:
         raise ValueError(f"steps must be in [1, {masked_len}], got {steps}")
     projection_layer = (_random_remasking_projection_layer(model) if use_selected_logits else None)
-    auto_model_batch = batch_size is None
     if batch_size is None:
         batch_size = 512 if projection_layer is not None else 128
     if num_samples <= 0 or batch_size <= 0 or normalization_batch_size <= 0:
@@ -1953,16 +1960,6 @@ def _path_sampling_random_probability_from_partially_masked(
     schedule = [base + (step < rem) for step in range(steps)]
     if state_batch_size is None:
         state_batch_size = 0
-        if (auto_model_batch and device.type == "cuda" and projection_layer is not None
-                and decoding_scheme == "full"):
-            native_dtype = next(model.parameters()).dtype
-            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-            if total_bytes >= 70 * 1024**3 and native_dtype in {torch.bfloat16, torch.float16}:
-                # Conservative workspace budget, including FP32 norm/rotary
-                # intermediates and the selected vocabulary head. Retry smaller
-                # batches on CUDA OOM for other allocations/model variants.
-                per_state_bytes = (24 + 0.5 * max(schedule)) * 1024**2
-                state_batch_size = max(1, min(2048, int((free_bytes - 8 * 1024**3) / per_state_bytes)))
     if state_batch_size < 0:
         raise ValueError("state_batch_size must be nonnegative (zero disables state pooling).")
     rng = None if seed is None else torch.Generator(device="cpu").manual_seed(int(seed))

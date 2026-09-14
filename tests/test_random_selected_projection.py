@@ -3,6 +3,7 @@ import copy
 import math
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -171,6 +172,37 @@ class RandomSelectedProjectionTests(unittest.TestCase):
         result = pe._path_sampling_random_probability_from_partially_masked(**args)
         self.assertFalse(result['selected_position_logits'])
         self.assertEqual(model.model.projected_shapes, [(1, 100, 8)])
+
+    def test_workspace_fill_is_scoped_to_known_forward_and_restored_on_failure(self):
+        original_fill = torch.utils.deterministic.fill_uninitialized_memory
+        try:
+            for caller_fill in (True, False):
+                for selected in (True, False):
+                    for fail in (True, False):
+                        model = TinyLLaDA()
+                        layer = pe._random_remasking_projection_layer(model) if selected else None
+                        tokens = torch.zeros((2, 100), dtype=torch.long)
+                        positions = torch.zeros((2, 1), dtype=torch.long)
+                        forward = model.forward
+
+                        def observe(*args, **kwargs):
+                            self.assertEqual(torch.utils.deterministic.fill_uninitialized_memory,
+                                             False if selected else caller_fill)
+                            if fail:
+                                raise RuntimeError('injected forward failure')
+                            return forward(*args, **kwargs)
+
+                        torch.utils.deterministic.fill_uninitialized_memory = caller_fill
+                        with patch.object(model, 'forward', side_effect=observe):
+                            if fail:
+                                with self.assertRaisesRegex(RuntimeError, 'injected forward failure'):
+                                    pe._random_remasking_forward_logits(model, tokens, None, positions, layer)
+                            else:
+                                pe._random_remasking_forward_logits(model, tokens, None, positions, layer)
+                        self.assertEqual(torch.utils.deterministic.fill_uninitialized_memory, caller_fill)
+                        self.assertEqual(len(model.model.transformer.ln_f._forward_hooks), 0)
+        finally:
+            torch.utils.deterministic.fill_uninitialized_memory = original_fill
 
     def test_pooling_500_paths_across_steps_uses_13_calls(self):
         model = TinyLLaDA(constant_p=0.01)
