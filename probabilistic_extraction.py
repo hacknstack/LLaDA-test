@@ -1713,7 +1713,9 @@ def _random_remasking_projection_layer(model):
     return norm
 
 
-def _random_remasking_forward_logits(model, x, attention_mask, positions, projection_layer=None):
+def _random_remasking_forward_logits(
+    model, x, attention_mask, positions, projection_layer=None, rotary_context=None,
+):
     """Project only requested positions when the known LLaDA layout permits it.
 
     Every transformer layer still sees the complete sequence. The scoped hook
@@ -1744,7 +1746,7 @@ def _random_remasking_forward_logits(model, x, attention_mask, positions, projec
     try:
         if projection_layer is not None:
             torch.utils.deterministic.fill_uninitialized_memory = False
-        with autocast:
+        with autocast, (rotary_context() if rotary_context is not None else nullcontext()):
             outputs = model(x, attention_mask=attention_mask)
     finally:
         torch.utils.deterministic.fill_uninitialized_memory = previous_fill
@@ -1807,7 +1809,7 @@ def _random_remasking_target_log_probs(
 def _random_remasking_pooled_paths(
     model, initial_x, attention_mask, masked_pos, target_row, schedule,
     num_samples, rng, initial_scores, projection_layer, temperature,
-    decoding_scheme, k, state_batch_size, normalization_batch_size,
+    decoding_scheme, k, state_batch_size, normalization_batch_size, rotary_context=None,
 ):
     """Batch predetermined states across BOTH trajectories and reveal steps.
 
@@ -1841,7 +1843,7 @@ def _random_remasking_pooled_paths(
         revealed = ranks[trajectory_ids] < starts[:, None]
         x[:, masked_pos] = torch.where(revealed, target_row[None, :], initial_x[:, masked_pos])
         attn = None if attention_mask is None else attention_mask.expand(x.shape[0], -1)
-        logits = _random_remasking_forward_logits(model, x, attn, positions, projection_layer)
+        logits = _random_remasking_forward_logits(model, x, attn, positions, projection_layer, rotary_context)
         score_positions = (positions if projection_layer is None else
                            torch.arange(width, device=device)[None, :].expand(x.shape[0], -1))
         scores = _random_remasking_target_log_probs(
@@ -1903,6 +1905,7 @@ def _path_sampling_random_probability_from_partially_masked(
     normalization_batch_size: int = 128,
     use_selected_logits: bool = True,
     state_batch_size: Optional[int] = None,
+    use_fused_rope: bool = True,
 ) -> Dict[str, object]:
     """Fast random reveal-order sampling with FP64 log-probability scoring.
 
@@ -1914,6 +1917,9 @@ def _path_sampling_random_probability_from_partially_masked(
     128. Larger pools did not improve measured A100 throughput. Explicit
     state_batch_size enables pooling across steps; zero/None selects stepwise
     execution. The known model skips deterministic filling of unused memory.
+    Supported CUDA LLaDA models also fuse full-precision rotary embeddings,
+    preserving the eager FP32 rounding before converting back to native dtype.
+    use_fused_rope=False retains the native rotary implementation for comparison.
     The common initial state is evaluated once.
 
     Only selected token positions are normalized, using stable FP64 log_softmax
@@ -1938,6 +1944,10 @@ def _path_sampling_random_probability_from_partially_masked(
     if not 1 <= steps <= masked_len:
         raise ValueError(f"steps must be in [1, {masked_len}], got {steps}")
     projection_layer = (_random_remasking_projection_layer(model) if use_selected_logits else None)
+    rotary_context = None
+    if use_fused_rope and device.type == 'cuda':
+        from random_remasking_kernels import get_rotary_context
+        rotary_context = get_rotary_context(model, device)
     if batch_size is None:
         batch_size = 512 if projection_layer is not None else 128
     if num_samples <= 0 or batch_size <= 0 or normalization_batch_size <= 0:
@@ -1969,7 +1979,7 @@ def _path_sampling_random_probability_from_partially_masked(
     initial_x[:, masked_pos_t] = mask_id
     initial_positions = masked_pos_t[None, :]
     logits = _random_remasking_forward_logits(
-        model, initial_x, attention_mask, initial_positions, projection_layer,
+        model, initial_x, attention_mask, initial_positions, projection_layer, rotary_context,
     )
     projection_rows = logits.shape[0] * logits.shape[1]
     initial_score_positions = (initial_positions if projection_layer is None else
@@ -1987,7 +1997,7 @@ def _path_sampling_random_probability_from_partially_masked(
          effective_state_batch, oom_retries) = _random_remasking_pooled_paths(
             model, initial_x, attention_mask, masked_pos_t, masked_target_row, schedule,
             num_samples, rng, initial_scores, projection_layer, tau,
-            decoding_scheme, k, state_batch_size, normalization_batch_size,
+            decoding_scheme, k, state_batch_size, normalization_batch_size, rotary_context,
         )
         forward_calls += calls
         forward_rows += rows
@@ -2022,7 +2032,7 @@ def _path_sampling_random_probability_from_partially_masked(
                 active_attn = (None if attention_mask is None else
                                attention_mask.expand(active_count, -1))
                 logits = _random_remasking_forward_logits(
-                    model, active_x, active_attn, positions, projection_layer,
+                    model, active_x, active_attn, positions, projection_layer, rotary_context,
                 )
                 projection_rows += logits.shape[0] * logits.shape[1]
                 forward_calls += 1
@@ -2069,6 +2079,7 @@ def _path_sampling_random_probability_from_partially_masked(
         "normalization_batch_size": normalization_batch_size,
         "initial_state_reused": True,
         "selected_position_logits": projection_layer is not None,
+        "fused_rotary_embeddings": rotary_context is not None,
         "vocabulary_projection_rows": projection_rows,
         "model_forward_dtype": "native",
         "model_eval_mode": True,
