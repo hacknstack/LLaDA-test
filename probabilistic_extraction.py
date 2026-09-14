@@ -1695,6 +1695,46 @@ def _target_probability_state(
     return target_log_probs, highest_log_confidence
 
 
+def _random_remasking_target_log_probs(
+    logits, positions, target_ids, temperature, decoding_scheme, k, context,
+    normalization_batch_size=128,
+):
+    """Score only requested positions, in bounded FP64 vocabulary chunks.
+
+    Centered log_softmax avoids subtracting a large raw-logit normalizer from
+    the target, retains tiny probabilities as finite log values, and never
+    requires materializing probabilities or the full output in double precision.
+    """
+    batch_size, step_size = positions.shape
+    row_ids = torch.arange(batch_size, device=logits.device)[:, None].expand_as(positions).reshape(-1)
+    flat_positions, flat_targets = positions.reshape(-1), target_ids.reshape(-1)
+    result = torch.empty(flat_targets.numel(), dtype=torch.float64, device=logits.device)
+    vocab_size = logits.shape[-1]
+    for start in range(0, flat_targets.numel(), normalization_batch_size):
+        end = min(start + normalization_batch_size, flat_targets.numel())
+        selected = logits[row_ids[start:end], flat_positions[start:end], :].to(torch.float64)
+        if bool((torch.isnan(selected) | torch.isposinf(selected)).any().item()):
+            raise FloatingPointError(f"Invalid model logits ({context}): NaN or +inf.")
+        targets = flat_targets[start:end]
+        if decoding_scheme == "top_k" and k < vocab_size:
+            selected, token_ids = torch.topk(selected, k=int(k), dim=-1)
+            target_matches = token_ids == targets[:, None]
+            target_columns = target_matches.to(torch.int64).argmax(dim=-1)
+        else:
+            target_matches = None
+            target_columns = targets
+        if temperature != 1.0:
+            selected.div_(temperature)
+        log_probs = torch.log_softmax(selected, dim=-1)
+        _check_low_confidence_log_mass(log_probs, "token probabilities", context)
+        target_logs = log_probs.gather(-1, target_columns[:, None]).squeeze(-1)
+        if target_matches is not None:
+            target_logs = target_logs.masked_fill(~target_matches.any(dim=-1), -math.inf)
+        result[start:end] = target_logs
+        del selected, log_probs
+    return result.view(batch_size, step_size)
+
+
 @torch.inference_mode()
 @_low_confidence_eval_mode
 def _path_sampling_random_probability_from_partially_masked(
@@ -1709,24 +1749,22 @@ def _path_sampling_random_probability_from_partially_masked(
     decoding_scheme: str,
     k: int,
     temperature: float,
-    batch_size: int = 512,
+    batch_size: int = 128,
+    normalization_batch_size: int = 128,
 ) -> Dict[str, object]:
-    """Random reveal-order estimator with STS-aligned token probabilities.
+    """Fast random reveal-order sampling with FP64 log-probability scoring.
 
-    A uniform random permutation and a fixed transfer schedule select reveal
-    blocks. All targets in a block are scored at the same pre-reveal state.
-    Their probability product is averaged over sampled permutations in log space.
-    Random remasking has a different reveal policy from low-confidence STS.
+    A uniform permutation and fixed schedule select reveal blocks; all tokens
+    in each block are scored before any of them are revealed. Model forwards
+    run in native dtype, in temporary deterministic eval mode without autocast.
+    Real model batches default to 128 for the A100 80GB. The common initial
+    state is evaluated once across all samples, and exactly zero paths stop.
 
-    The 512-trajectory default groups a usual 500-sample run together. Each
-    distinct state uses a singleton native-dtype model forward in temporary
-    deterministic eval mode, followed by STS-shaped FP64 normalization. Only
-    compact target scores are cached (bounded to 64 MiB of tensor data); no
-    vocabulary logits, sorted distributions, or CDFs are retained. Exactly zero
-    paths stop, but arbitrarily small positive path weights remain in log space.
-
-    Inputs: one 100-token sequence, 50 unique masked positions, 1..50 steps,
-    positive finite temperature, and either full or top-k token sampling.
+    Only selected token positions are normalized, using stable FP64 log_softmax
+    in bounded chunks. Path products and the arithmetic mean stay in log space.
+    There is no probability floor or small-weight pruning. Numerical identity
+    to singleton STS logits is not promised across different model batch shapes.
+    STS and DUEL retain their separate execution policies.
     """
     device = _model_device(model)
     sequence_tokens = sequence_tokens.to(device)
@@ -1743,8 +1781,8 @@ def _path_sampling_random_probability_from_partially_masked(
     masked_len = len(masked_pos)
     if not 1 <= steps <= masked_len:
         raise ValueError(f"steps must be in [1, {masked_len}], got {steps}")
-    if num_samples <= 0 or batch_size <= 0:
-        raise ValueError("num_samples and batch_size must be positive.")
+    if num_samples <= 0 or batch_size <= 0 or normalization_batch_size <= 0:
+        raise ValueError("num_samples, batch_size, and normalization_batch_size must be positive.")
     if not math.isfinite(float(temperature)) or float(temperature) <= 0:
         raise ValueError("temperature must be finite and strictly positive.")
     if decoding_scheme not in {"full", "top_k"}:
@@ -1762,70 +1800,69 @@ def _path_sampling_random_probability_from_partially_masked(
     base, rem = divmod(masked_len, steps)
     schedule = [base + (step < rem) for step in range(steps)]
     rng = None if seed is None else torch.Generator(device="cpu").manual_seed(int(seed))
-    # CPU metadata and compact cached scores avoid per-trajectory GPU indexing
-    # and device synchronization to discover which states are identical.
-    score_cache = OrderedDict()
-    cache_max_bytes = 64 * 1024 * 1024
-    entry_bytes = masked_len * 8
-    cache_capacity = max(1, cache_max_bytes // entry_bytes)
-    cache_hits = 0
-    forward_calls = 0
+    # All trajectories start at exactly the same state. Score all possible
+    # first reveals once instead of repeating the full model forward 500 times.
+    initial_x = sequence_tokens.clone()
+    initial_x[:, masked_pos_t] = mask_id
+    autocast = (torch.autocast(device_type=device.type, enabled=False)
+                if device.type in {"cpu", "cuda"} else nullcontext())
+    with autocast:
+        outputs = model(initial_x, attention_mask=attention_mask)
+    initial_scores = _random_remasking_target_log_probs(
+        outputs.logits, masked_pos_t[None, :], masked_target_row[None, :], tau,
+        decoding_scheme, k, "step=0, revealed_indices=[]", normalization_batch_size,
+    )[0]
+    del outputs
+    forward_calls, forward_rows, max_forward_batch = 1, 1, 1
     sample_logs = []
     for batch_start in range(0, num_samples, batch_size):
         bsz = min(batch_size, num_samples - batch_start)
         permutations = torch.argsort(torch.rand(
             (bsz, masked_len), generator=rng, device="cpu", dtype=torch.float64,
-        ), dim=-1).tolist()
-        states = [0] * bsz
-        weights = [0.0] * bsz
+        ), dim=-1).to(device)
+        x = initial_x.expand(bsz, -1).clone()
+        log_weights = torch.zeros(bsz, dtype=torch.float64, device=device)
         start = 0
-        for step_size in schedule:
-            groups = {}
-            for row, state in enumerate(states):
-                if weights[row] != -math.inf:
-                    groups.setdefault(state, []).append(row)
-            if not groups:
-                break
-            for state, rows in groups.items():
-                scores = score_cache.get(state)
-                if scores is None:
-                    active_slots = [i for i in range(masked_len) if not state & (1 << i)]
-                    active_slots_t = torch.tensor(active_slots, dtype=torch.long, device=device)
-                    active_positions = masked_pos_t[active_slots_t]
-                    x_row = sequence_tokens[0].clone()
-                    x_row[active_positions] = mask_id
-                    revealed_positions = [masked_pos[i] + 1 for i in range(masked_len) if state & (1 << i)]
-                    context = f"step={len(revealed_positions)}, revealed_indices={revealed_positions}"
-                    target_logs, _ = _target_probability_state(
-                        model, x_row, active_positions, masked_target_row[active_slots_t],
-                        attention_mask, tau, context, decoding_scheme, k,
-                    )
-                    forward_calls += 1
-                    scores = torch.full((masked_len,), -math.inf, dtype=torch.float64)
-                    scores[active_slots] = target_logs.detach().cpu()
-                    if len(score_cache) >= cache_capacity:
-                        score_cache.popitem(last=False)
-                    score_cache[state] = scores
-                    del target_logs, x_row
-                else:
-                    score_cache.move_to_end(state)
-                    cache_hits += 1
-                # Convert once for all trajectories sharing this state.
-                state_scores = scores.tolist()
-                for row in rows:
-                    slots = permutations[row][start:start + step_size]
-                    token_logs = [state_scores[slot] for slot in slots]
-                    if -math.inf in token_logs:
-                        weights[row] = -math.inf
-                    else:
-                        weights[row] += math.fsum(token_logs)
-                        for slot in slots:
-                            states[row] |= 1 << slot
+        for step, step_size in enumerate(schedule):
+            slots = permutations[:, start:start + step_size]
+            if step == 0:
+                # Every target in a simultaneous reveal block is scored before
+                # any of the targets in that block are revealed.
+                log_weights += initial_scores[slots].sum(dim=-1)
+                x.scatter_(1, masked_pos_t[slots], masked_target_row[slots])
+            else:
+                # Only -inf paths are dropped. Never exp() a weight to decide
+                # whether to retain it: arbitrarily small finite logs live.
+                active_rows = torch.nonzero(~torch.isneginf(log_weights), as_tuple=False).flatten()
+                active_count = active_rows.numel()
+                if active_count == 0:
+                    break
+                active_slots = slots[active_rows]
+                positions = masked_pos_t[active_slots]
+                targets = masked_target_row[active_slots]
+                active_x = x.index_select(0, active_rows)
+                active_attn = (None if attention_mask is None else
+                               attention_mask.expand(active_count, -1))
+                autocast = (torch.autocast(device_type=device.type, enabled=False)
+                            if device.type in {"cpu", "cuda"} else nullcontext())
+                with autocast:
+                    outputs = model(active_x, attention_mask=active_attn)
+                forward_calls += 1
+                forward_rows += active_count
+                max_forward_batch = max(max_forward_batch, active_count)
+                token_logs = _random_remasking_target_log_probs(
+                    outputs.logits, positions, targets, tau, decoding_scheme, k,
+                    f"step={step}, trajectory_batch_start={batch_start}",
+                    normalization_batch_size,
+                )
+                del outputs, active_x
+                log_weights[active_rows] += token_logs.sum(dim=-1)
+                x[active_rows[:, None], positions] = targets
             start += step_size
-        sample_logs.extend(weights)
+        sample_logs.extend(log_weights.detach().cpu().tolist())
 
-    # Aggregate once in sample order so changing trajectory batch size does not
-    # change the arithmetic mean or the seeded per-sample path scores.
+    # Aggregate once in sample order. Model batch shapes may change logits
+    # slightly, but seeded reveal permutations are independent of batch size.
     log_values = torch.tensor(sample_logs, dtype=torch.float64)
     _check_low_confidence_log_mass(log_values, "random path probabilities", "completed paths")
     log_probability = float((torch.logsumexp(log_values, dim=0) - math.log(num_samples)).item())
@@ -1842,14 +1879,15 @@ def _path_sampling_random_probability_from_partially_masked(
         "decoding_scheme": decoding_scheme,
         "temperature": tau,
         "model_forward_calls": forward_calls,
-        "model_forward_batch_size": 1,
+        "model_forward_batch_size": batch_size,
+        "model_forward_max_batch_size": max_forward_batch,
+        "model_forward_rows": forward_rows,
+        "normalization_batch_size": normalization_batch_size,
+        "initial_state_reused": True,
         "model_forward_dtype": "native",
         "model_eval_mode": True,
         "estimator_dtype_after_logits": "float64",
         "trajectory_batch_size": batch_size,
-        "state_cache_entries": len(score_cache),
-        "state_cache_bytes": len(score_cache) * entry_bytes,
-        "state_cache_hits": cache_hits,
     }
 
 

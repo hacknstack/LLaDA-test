@@ -97,21 +97,29 @@ probability floors or approximate pruning. `log_probability` is the natural-log 
 when displaying or exporting it). Invalid transition masses, total success
 masses, and final results raise errors; `-inf` represents genuine zero probability.
 
-Partially masked random remasking and DUEL also use deterministic singleton
-forwards and STS-shaped FP64 token normalization. They skip vocabulary sorting
-and CDF construction because neither estimator needs sampled-confidence
-competition probabilities. They retain their own reveal policies, so numerical
-alignment does not imply their final estimates equal low-confidence STS.
+Random remasking and DUEL skip vocabulary sorting and CDF construction because
+neither needs sampled-confidence competition probabilities. Their reveal policies
+differ from low-confidence STS, so their final estimates need not match STS.
 
-Random remasking defaults to 512 trajectories per batch, covering a 500-sample
-run. It groups identical states, caches only compact target log probabilities
-(up to 64 MiB of tensor data), and stops paths with exactly zero weight. Full and
-top-k sampling and simultaneous reveal blocks remain supported. Results include
-`log_probability`, `sample_log_probabilities`, and `model_forward_calls`; seeded
-path scores are unchanged by trajectory batch size. Uniform random paths can
-still visit close to 25,000 states with 500 samples and 50 one-token steps, so
-singleton alignment can cost substantially more than the former batched FP32
-implementation on an A100. State reuse does not eliminate that cost.
+Random remasking defaults to **128 trajectories per actual model batch** for the
+A100 80GB. It evaluates the common initial state once, then scores only the
+positions being revealed in each batched forward. With 500 samples and 50
+one-token steps, this requires at most **197 model calls**, rather than tens of
+thousands of singleton calls. `batch_size` controls model batching;
+`normalization_batch_size` (default 128) independently bounds how many selected
+vocabulary rows are promoted to FP64 at once. The full model output stays in
+native dtype; normalization uses stable FP64 `log_softmax`. Full/top-k sampling
+and simultaneous reveal blocks remain supported.
+
+Path products and arithmetic averaging stay in log space, without probability
+floors. Only exactly zero paths are dropped, so finite log weights remain valid
+even below the ordinary floating-point probability range. Results include
+`log_probability`, `sample_log_probabilities`, `model_forward_calls`, and
+`model_forward_max_batch_size`. Seeded reveal permutations are independent of
+batch size, but model logits and scores can differ slightly across batch shapes.
+This trades singleton numerical identity for batched throughput; it does not
+revert token normalization to FP32. Real A100 speed and batch-dependent model
+roundoff still require measurement on the actual model.
 
 DUEL constructs and scores its path in 50 singleton forwards, without logits
 caching. Exact confidence ties still select the smallest sequence index. Both

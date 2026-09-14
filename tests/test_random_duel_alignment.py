@@ -22,6 +22,8 @@ class StateModel(torch.nn.Module):
         self.bad_value = bad_value
         self.constant_p = constant_p
         self.calls = []
+        self.batch_sizes = []
+        self.allow_batched = False
         self.last_logits = None
 
     @property
@@ -29,6 +31,15 @@ class StateModel(torch.nn.Module):
         return self.anchor.device
 
     def forward(self, tokens, attention_mask=None):
+        assert self.allow_batched or tokens.shape[0] == 1
+        self.batch_sizes.append(tokens.shape[0])
+        rows = [self._forward_single(
+            tokens[i:i + 1], None if attention_mask is None else attention_mask[i:i + 1],
+        ).logits for i in range(tokens.shape[0])]
+        self.last_logits = torch.cat(rows, dim=0)
+        return SimpleNamespace(logits=self.last_logits)
+
+    def _forward_single(self, tokens, attention_mask=None):
         assert tokens.shape == (1, 100)
         assert not self.training and not self.dropout.training
         assert torch.are_deterministic_algorithms_enabled()
@@ -82,13 +93,14 @@ class RandomDuelAlignmentTests(unittest.TestCase):
         )
 
     def random_args(self, model, temperature=1.0):
+        model.allow_batched = True
         return dict(self.args(model, temperature), num_samples=8, seed=51,
                     decoding_scheme='full', k=1)
 
-    def test_full_target_and_confidence_values_equal_sts_distribution(self):
+    def test_duel_target_and_confidence_values_equal_sts_distribution(self):
         original = pe._target_probability_state
         for temperature in (0.5, 1.0, 2.0):
-            for estimator in (RANDOM, DUEL):
+            for estimator in (DUEL,):
                 with self.subTest(temperature=temperature, estimator=estimator.__name__):
                     model = StateModel()
 
@@ -112,20 +124,21 @@ class RandomDuelAlignmentTests(unittest.TestCase):
                     with patch.object(pe, '_target_probability_state', side_effect=observe):
                         estimator(**args)
 
-    def test_random_seed_and_path_scores_invariant_to_trajectory_batch_size(self):
+    def test_random_scores_match_across_batches_for_a_batch_independent_model(self):
         results = []
         for batch_size in (1, 3, 512):
             model = StateModel()
             args = self.random_args(model)
             args.update(steps=7, num_samples=13, batch_size=batch_size)
             result = RANDOM(**args)
-            self.assertEqual(len(model.calls), len(set(model.calls)))
-            self.assertEqual(result['model_forward_calls'], len(model.calls))
-            self.assertLessEqual(result['state_cache_bytes'], 64 * 1024 * 1024)
+            self.assertEqual(result['model_forward_calls'], len(model.batch_sizes))
+            self.assertEqual(result['model_forward_rows'], len(model.calls))
+            self.assertLessEqual(max(model.batch_sizes), batch_size)
             results.append(result)
         for result in results[1:]:
-            self.assertEqual(result['sample_log_probabilities'], results[0]['sample_log_probabilities'])
-            self.assertEqual(result['log_probability'], results[0]['log_probability'])
+            for actual, reference in zip(result['sample_log_probabilities'], results[0]['sample_log_probabilities']):
+                self.assertAlmostEqual(actual, reference, places=11)
+            self.assertAlmostEqual(result['log_probability'], results[0]['log_probability'], places=11)
 
     def test_native_bfloat16_and_float16_logits_match_sts_after_widening(self):
         class NativeModel(StateModel):
@@ -198,9 +211,9 @@ class RandomDuelAlignmentTests(unittest.TestCase):
         args.update(num_samples=500, steps=1)
         with patch.object(torch, 'sort', side_effect=AssertionError('Unused vocabulary sort')):
             result = RANDOM(**args)
-        self.assertEqual(result['trajectory_batch_size'], 512)
+        self.assertEqual(result['trajectory_batch_size'], 128)
         self.assertEqual(result['model_forward_calls'], 1)
-        self.assertEqual(result['state_cache_bytes'], 400)
+        self.assertTrue(result['initial_state_reused'])
         self.assertAlmostEqual(result['log_probability'], math.log(1e-100), places=11)
         self.assertLess(abs(result['probability'] / 1e-100 - 1), 1e-11)
 
@@ -300,6 +313,68 @@ class RandomDuelAlignmentTests(unittest.TestCase):
         self.assertEqual(len(result['sample_log_probabilities']), 500)
         self.assertAlmostEqual(result['log_probability'], math.log(1e-100), places=11)
 
+    def test_random_500_paths_use_197_real_model_calls_and_preserve_tiny_weights(self):
+        # A cheap vectorized model makes this a full 500 x 50-step regression.
+        class ConstantBatchModel(torch.nn.Module):
+            def __init__(self, probability):
+                super().__init__()
+                self.register_buffer('row', torch.tensor(
+                    [math.log(probability), math.log1p(-probability)], dtype=torch.float64,
+                ))
+                self.batch_sizes = []
+
+            @property
+            def device(self):
+                return self.row.device
+
+            def forward(self, tokens, attention_mask=None):
+                assert not self.training and not torch.is_autocast_enabled('cpu')
+                self.batch_sizes.append(tokens.shape[0])
+                return SimpleNamespace(logits=self.row.expand(tokens.shape[0], 100, 2))
+
+        for probability in (0.01, 1e-10):
+            model = ConstantBatchModel(probability)
+            result = RANDOM(**dict(self.random_args(model), num_samples=500))
+            self.assertEqual(result['model_forward_calls'], 197)
+            self.assertEqual(len(model.batch_sizes), 197)
+            self.assertEqual(max(model.batch_sizes), 128)
+            self.assertEqual(result['model_forward_rows'], 24501)
+            expected_log = 50 * math.log(probability)
+            for log_weight in result['sample_log_probabilities']:
+                self.assertAlmostEqual(log_weight, expected_log, places=10)
+            self.assertAlmostEqual(result['log_probability'], expected_log, places=10)
+            if probability == 0.01:
+                self.assertLess(abs(result['probability'] / 1e-100 - 1), 1e-11)
+            else:
+                self.assertEqual(result['probability'], 0.0)
+                self.assertTrue(math.isfinite(result['log_probability']))
+
+    def test_selected_position_normalization_is_fp64_and_chunk_bounded(self):
+        generator = torch.Generator().manual_seed(17)
+        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+            logits = torch.randn((5, 100, 31), generator=generator).to(dtype)
+            positions = torch.tensor([[2, 8, 13, 27]]).expand(5, -1)
+            targets = torch.tensor([[0, 3, 9, 21]]).expand(5, -1)
+            for temperature in (0.5, 1.0, 2.0):
+                original = torch.log_softmax
+                shapes = []
+
+                def observe(values, *args, **kwargs):
+                    self.assertEqual(values.dtype, torch.float64)
+                    shapes.append(values.shape[0])
+                    return original(values, *args, **kwargs)
+
+                with patch.object(torch, 'log_softmax', side_effect=observe):
+                    actual = pe._random_remasking_target_log_probs(
+                        logits, positions, targets, temperature, 'full', 1, 'chunk test',
+                        normalization_batch_size=3,
+                    )
+                self.assertEqual(sum(shapes), 20)
+                self.assertLessEqual(max(shapes), 3)
+                selected = logits[torch.arange(5)[:, None], positions].double() / temperature
+                expected = selected.gather(-1, targets[..., None])[..., 0] - torch.logsumexp(selected, -1)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=2e-14)
+
     def test_nonfinite_normalizers_and_cancellation_are_rejected(self):
         # Also validate non-target logits and the distribution itself, rather
         # than silently treating malformed model output as zero probability.
@@ -314,8 +389,14 @@ class RandomDuelAlignmentTests(unittest.TestCase):
                 model = MalformedModel(constant_p=0.01)
                 model.fill_value = value
                 args = self.random_args(model) if estimator is RANDOM else self.args(model)
-                with self.assertRaises(FloatingPointError):
-                    estimator(**args)
+                if estimator is RANDOM and value == 1e16:
+                    # Stable log_softmax correctly removes a common large
+                    # offset rather than losing the normalization in subtraction.
+                    result = estimator(**args)
+                    self.assertAlmostEqual(result['log_probability'], -50 * math.log(3), places=11)
+                else:
+                    with self.assertRaises(FloatingPointError):
+                        estimator(**args)
 
 
 if __name__ == '__main__':
