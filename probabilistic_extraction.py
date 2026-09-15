@@ -14,6 +14,7 @@ from get_log_likelihood import get_log_likelihood, get_log_likelihood_from_parti
 AUTOREGRESSIVE_MODEL_FAMILIES = {'llama', 'llama2', 'olmo', 'mistral'}
 MAX_EXACT_LOW_CONFIDENCE_MASKED = 12
 DEFAULT_RANDOM_PATH_SAMPLE_BUDGET = 128
+DEFAULT_RANDOM_PATH_STEP_BUDGET = 25
 
 
 @dataclass
@@ -1798,14 +1799,17 @@ def _path_sampling_random_probability_from_partially_masked(
     use_selected_logits: bool = True,
     max_path_samples: Optional[int] = DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
     stratified_paths: bool = True,
+    max_path_steps: Optional[int] = DEFAULT_RANDOM_PATH_STEP_BUDGET,
 ) -> Dict[str, object]:
     """Average target-sequence probabilities over uniform shuffled reveal paths.
 
     All paths are shuffled before model evaluation. For each path, tokens are
     scored from the current partially revealed sequence and then replaced by
-    their target values. ``max_path_samples`` optionally caps the number of
-    expensive model paths. Scrambled Sobol points can stratify that smaller
-    sample while each individual path remains a uniform permutation.
+    their target values. ``max_path_samples`` caps the number of expensive
+    model paths. ``max_path_steps`` can score consecutive shuffled tokens from
+    the same state, trading within-block conditioning accuracy for speed.
+    Scrambled Sobol points can stratify the smaller path sample while each
+    individual path remains a uniform permutation.
     Vocabulary normalization is FP32; path accumulation and the final mean are
     FP64.
     """
@@ -1831,6 +1835,8 @@ def _path_sampling_random_probability_from_partially_masked(
         raise ValueError("num_samples and batch_size must be positive.")
     if max_path_samples is not None and max_path_samples <= 0:
         raise ValueError("max_path_samples must be positive when provided.")
+    if max_path_steps is not None and max_path_steps <= 0:
+        raise ValueError("max_path_steps must be positive when provided.")
     if not math.isfinite(float(temperature)) or float(temperature) <= 0:
         raise ValueError("temperature must be finite and strictly positive.")
     if decoding_scheme not in {"full", "top_k"}:
@@ -1845,8 +1851,9 @@ def _path_sampling_random_probability_from_partially_masked(
     tau = float(temperature)
     masked_pos_t = torch.tensor(masked_pos, dtype=torch.long, device=device)
     masked_target_row = sequence_tokens[0, masked_pos_t]
-    base, rem = divmod(masked_len, steps)
-    schedule = [base + (step < rem) for step in range(steps)]
+    evaluated_steps = min(steps, max_path_steps or steps)
+    base, rem = divmod(masked_len, evaluated_steps)
+    schedule = [base + (step < rem) for step in range(evaluated_steps)]
     rng = None
     if seed is not None:
         rng = torch.Generator(device="cpu").manual_seed(int(seed))
@@ -1941,6 +1948,8 @@ def _path_sampling_random_probability_from_partially_masked(
         "sample_log_probabilities": sample_logs,
         "num_samples": evaluated_samples,
         "requested_num_samples": num_samples,
+        "steps": evaluated_steps,
+        "requested_steps": steps,
         "stratified_paths": bool(stratified_paths),
         "estimation_method": "path_sampling",
         "decoding_scheme": decoding_scheme,
@@ -3917,6 +3926,7 @@ def compute_diffusion_probabilistic_extraction(
     verbose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
     random_path_sample_budget: Optional[int] = DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
     stratified_random_paths: bool = True,
+    random_path_step_budget: Optional[int] = DEFAULT_RANDOM_PATH_STEP_BUDGET,
 ):
     """
     Compute probabilistic extraction under LLaDA Algorithm-5 style low-confidence remasking.
@@ -3944,6 +3954,9 @@ def compute_diffusion_probabilistic_extraction(
         remasking. ``None`` evaluates all ``num_samples`` paths.
     stratified_random_paths:
         Use randomized QMC stratification for partially masked random paths.
+    random_path_step_budget:
+        Maximum model steps per partially masked random path. ``None`` preserves
+        one-token-at-a-time conditioning for all requested ``steps``.
     """
     if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
         raise ValueError('prompt_tokens must have shape (1, a).')
@@ -4105,6 +4118,7 @@ def compute_diffusion_probabilistic_extraction(
                 temperature=temperature,
                 max_path_samples=random_path_sample_budget,
                 stratified_paths=stratified_random_paths,
+                max_path_steps=random_path_step_budget,
             )
         return {
             **path_sampling_result,
@@ -6075,6 +6089,7 @@ def compute_probabilistic_extraction(
     masked_indexes: Optional[Sequence[int]] = None,
     random_path_sample_budget: Optional[int] = DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
     stratified_random_paths: bool = True,
+    random_path_step_budget: Optional[int] = DEFAULT_RANDOM_PATH_STEP_BUDGET,
 ):
     model_family = model_family.lower()
     if model_family in AUTOREGRESSIVE_MODEL_FAMILIES:
@@ -6112,5 +6127,6 @@ def compute_probabilistic_extraction(
             masked_indexes=masked_indexes,
             random_path_sample_budget=random_path_sample_budget,
             stratified_random_paths=stratified_random_paths,
+            random_path_step_budget=random_path_step_budget,
         )
     raise ValueError("model_family must be one of {'llada', 'llama', 'llama2', 'olmo', 'mistral'}")

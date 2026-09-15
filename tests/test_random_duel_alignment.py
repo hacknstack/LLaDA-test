@@ -93,7 +93,7 @@ class RandomDuelAlignmentTests(unittest.TestCase):
         model.allow_batched = True
         return dict(self.args(model, temperature), num_samples=8, seed=51,
                     decoding_scheme='full', k=1, max_path_samples=None,
-                    stratified_paths=False)
+                    stratified_paths=False, max_path_steps=None)
 
     def test_duel_confidence_ranking_matches_sts_and_target_scores_remain_fp64(self):
         original = pe._duel_state_scores
@@ -236,6 +236,16 @@ class RandomDuelAlignmentTests(unittest.TestCase):
         self.assertTrue(result['stratified_paths'])
         self.assertAlmostEqual(result['log_probability'], math.log(1e-100), places=4)
         self.assertLess(abs(result['probability'] / 1e-100 - 1), 1e-4)
+
+    def test_default_step_budget_scores_two_tokens_per_state(self):
+        args = self.random_args(StateModel(constant_p=0.01))
+        args.pop('max_path_steps')
+        result = RANDOM(**args)
+        self.assertEqual(result['steps'], 25)
+        self.assertEqual(result['requested_steps'], 50)
+        self.assertEqual(result['model_forward_calls'], 25)
+        self.assertEqual(result['model_forward_rows'], 1 + 8 * 24)
+        self.assertAlmostEqual(result['log_probability'], math.log(1e-100), places=4)
 
     def test_duel_path_and_score_match_independent_greedy_confidence_oracle(self):
         for temperature in (0.5, 1.0, 2.0):

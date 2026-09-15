@@ -18,6 +18,7 @@ from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from probabilistic_extraction import (
     DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
+    DEFAULT_RANDOM_PATH_STEP_BUDGET,
     MAX_EXACT_LOW_CONFIDENCE_MASKED,
     _duel_low_confidence_probability_fast_from_partially_masked,
     compute_autoregressive_probabilistic_extraction,
@@ -73,6 +74,16 @@ def parse_args() -> argparse.Namespace:
             'Maximum exact paths evaluated for partially masked random remasking '
             f'(default: {DEFAULT_RANDOM_PATH_SAMPLE_BUDGET}; set equal to '
             '--num-samples to evaluate every requested path).'
+        ),
+    )
+    parser.add_argument(
+        '--random-path-step-budget',
+        type=int,
+        default=DEFAULT_RANDOM_PATH_STEP_BUDGET,
+        help=(
+            'Maximum model steps per partially masked random path '
+            f'(default: {DEFAULT_RANDOM_PATH_STEP_BUDGET}; use 50 for exact '
+            'one-token-at-a-time conditioning).'
         ),
     )
     parser.add_argument('--seed', type=int, default=None, help='Optional sampling seed')
@@ -344,6 +355,7 @@ def _compute_probability(
         temperature=args.temperature,
         masked_indexes=args.masked_indexes,
         random_path_sample_budget=args.random_path_sample_budget,
+        random_path_step_budget=args.random_path_step_budget,
         verbose=args.verbose,
         verbose_compact=args.compact,
         verbose_callback=verbose_callback,
@@ -407,6 +419,8 @@ def main() -> None:
         raise ValueError('--stride-words must be > 0.')
     if args.random_path_sample_budget <= 0:
         raise ValueError('--random-path-sample-budget must be > 0.')
+    if args.random_path_step_budget <= 0:
+        raise ValueError('--random-path-step-budget must be > 0.')
     if args.compact and not args.verbose:
         raise ValueError('--compact requires --verbose.')
     if args.windows is not None:
@@ -542,6 +556,13 @@ def main() -> None:
                 '--verbosish requires partially masked LLaDA low-confidence '
                 'path sampling at temperature 1 with full decoding.'
             )
+
+    if args.model_family == 'llada' and args.remasking == 'random' and args.masked_indexes is not None:
+        print(
+            'Random path sampling: '
+            f'{min(args.num_samples, args.random_path_sample_budget)} paths x '
+            f'{min(len(args.masked_indexes), args.random_path_step_budget)} model steps'
+        )
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -708,6 +729,8 @@ def main() -> None:
             'k': args.k,
             'temperature': args.temperature,
             'num_samples': args.num_samples,
+            'random_path_sample_budget': args.random_path_sample_budget,
+            'random_path_step_budget': args.random_path_step_budget,
             'seed': args.seed,
             'masked_indexes': args.masked_indexes,
             'verbose': args.verbose,

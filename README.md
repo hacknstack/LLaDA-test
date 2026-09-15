@@ -104,18 +104,18 @@ differ from low-confidence STS, so their final estimates need not match STS.
 Random remasking first draws one uniform permutation of the 50 masked positions
 for every sample. It then follows each shuffled path, scoring the target tokens
 from the current state before revealing them. For a requested 500-sample run,
-the partially masked implementation evaluates 128 exact paths by default using
-randomized Sobol stratification (`--random-path-sample-budget 128`). Every path
-is still a uniform permutation; stratification spreads the finite sample more
-evenly over permutation space. Set the budget to 500 to evaluate every requested
-path.
+the partially masked implementation evaluates 128 paths using randomized Sobol
+stratification (`--random-path-sample-budget 128`). Every path is still a
+uniform permutation; stratification spreads the finite sample more evenly over
+permutation space. The fast default uses 25 model steps and scores two
+consecutive shuffled tokens from each state (`--random-path-step-budget 25`).
 
-On an A100 80GB, the 128-path default took about 46 seconds for a 50-mask,
-50-step window in a measured 8B-model run, versus roughly 3 minutes for all 500
-paths. On a difficult held-out window its estimate was within 0.139 log units
-of the 500-path result. This is a sampling approximation rather than a model
-kernel shortcut: every token probability along each evaluated path is still
-computed exactly.
+On an A100 80GB, the 128-path/25-step default took 22.7 seconds for a 50-mask
+window, versus roughly 3 minutes for all 500 paths at 50 steps. On a difficult
+held-out window its log probability was 0.416 below the 500-path/50-step result
+(about 34% lower probability). Set `--random-path-step-budget 50` for exact
+one-token-at-a-time path conditioning (about 46 seconds with 128 paths), and set
+`--random-path-sample-budget 500` as well to restore the full reference run.
 
 The standard GSAI LLaDA output head projects only the positions being scored;
 the transformer still sees all 100 tokens. Token distributions are normalized
@@ -123,7 +123,7 @@ in FP32 for speed, while path sums and the final arithmetic mean remain in FP64
 and log space. `use_selected_logits=False` retains the generic full-output path
 for comparison. `batch_size` can be reduced if a different model runs out of
 memory. Seeded permutations do not depend on that batch size. Results report
-both `requested_num_samples` and the actually evaluated `num_samples`.
+both requested and evaluated sample/step counts.
 
 DUEL constructs and scores its path in 50 singleton forwards, without logits
 caching. Its FP64 confidence calculation and smallest-index tie rule are
