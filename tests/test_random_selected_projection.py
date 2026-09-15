@@ -107,15 +107,16 @@ class RandomSelectedProjectionTests(unittest.TestCase):
         model = TinyLLaDA(constant_p=0.01)
         result = pe._path_sampling_random_probability_from_partially_masked(**self.args(model))
         self.assertTrue(result['selected_position_logits'])
-        self.assertEqual(result['model_forward_batch_size'], 512)
+        self.assertEqual(result['model_forward_batch_size'], 500)
         self.assertEqual(result['model_forward_max_batch_size'], 500)
         self.assertEqual(result['model_forward_calls'], 50)
         self.assertEqual(result['vocabulary_projection_rows'], 24550)
         self.assertEqual(model.model.projected_shapes[0], (1, 50, 8))
         self.assertEqual(model.model.projected_shapes[1:], [(500, 1, 8)] * 49)
         self.assertTrue(all(shape[1] == 100 for shape in model.model.context_shapes))
-        self.assertAlmostEqual(result['log_probability'], math.log(1e-100), places=11)
-        self.assertLess(abs(result['probability'] / 1e-100 - 1), 1e-11)
+        self.assertAlmostEqual(result['log_probability'], math.log(1e-100), places=4)
+        self.assertLess(abs(result['probability'] / 1e-100 - 1), 1e-4)
+        self.assertEqual(result['token_probability_dtype'], 'float32')
         self.assertTrue(model.training)  # Caller mode restored.
 
     def test_full_and_selected_heads_agree_for_multitoken_blocks_and_topk(self):
@@ -131,7 +132,7 @@ class RandomSelectedProjectionTests(unittest.TestCase):
                 torch.testing.assert_close(
                     torch.tensor(actual['sample_log_probabilities'], dtype=torch.float64),
                     torch.tensor(reference['sample_log_probabilities'], dtype=torch.float64),
-                    rtol=0, atol=2e-12,
+                    rtol=0, atol=2e-6,
                 )
                 self.assertLess(actual['vocabulary_projection_rows'], reference['vocabulary_projection_rows'])
                 self.assertEqual(len(args['model'].model.transformer.ln_f._forward_hooks), 0)
@@ -173,7 +174,7 @@ class RandomSelectedProjectionTests(unittest.TestCase):
         self.assertFalse(result['selected_position_logits'])
         self.assertEqual(model.model.projected_shapes, [(1, 100, 8)])
 
-    def test_workspace_fill_is_scoped_to_known_forward_and_restored_on_failure(self):
+    def test_forward_does_not_mutate_workspace_fill_setting(self):
         original_fill = torch.utils.deterministic.fill_uninitialized_memory
         try:
             for caller_fill in (True, False):
@@ -186,8 +187,7 @@ class RandomSelectedProjectionTests(unittest.TestCase):
                         forward = model.forward
 
                         def observe(*args, **kwargs):
-                            self.assertEqual(torch.utils.deterministic.fill_uninitialized_memory,
-                                             False if selected else caller_fill)
+                            self.assertEqual(torch.utils.deterministic.fill_uninitialized_memory, caller_fill)
                             if fail:
                                 raise RuntimeError('injected forward failure')
                             return forward(*args, **kwargs)
@@ -203,80 +203,6 @@ class RandomSelectedProjectionTests(unittest.TestCase):
                         self.assertEqual(len(model.model.transformer.ln_f._forward_hooks), 0)
         finally:
             torch.utils.deterministic.fill_uninitialized_memory = original_fill
-
-    def test_pooling_500_paths_across_steps_uses_13_calls(self):
-        model = TinyLLaDA(constant_p=0.01)
-        result = pe._path_sampling_random_probability_from_partially_masked(
-            **self.args(model), state_batch_size=2048,
-        )
-        self.assertTrue(result['states_pooled_across_steps'])
-        self.assertEqual(result['model_forward_calls'], 13)
-        self.assertEqual(result['model_forward_max_batch_size'], 2048)
-        self.assertEqual(result['model_forward_rows'], 24501)
-        self.assertEqual(result['vocabulary_projection_rows'], 24550)
-        self.assertEqual(result['cuda_oom_retries'], 0)
-        self.assertTrue(all(shape[1] == 100 for shape in model.model.context_shapes))
-        self.assertLess(abs(result['probability'] / 1e-100 - 1), 1e-11)
-
-    def test_pooled_states_preserve_paths_context_temperature_and_simultaneous_blocks(self):
-        for steps in (1, 7, 50):
-            for scheme in ('full', 'top_k'):
-                args = self.args(TinyLLaDA(tied=True, scaled=True))
-                args.update(num_samples=13, steps=steps, temperature=0.7,
-                            sequence_tokens=(torch.arange(100) % 11)[None, :],
-                            masked_indexes=list(range(99, 0, -2)),
-                            decoding_scheme=scheme, k=9, batch_size=4)
-                attention = torch.ones((1, 100), dtype=torch.long)
-                attention[:, -3:] = 0
-                args['attention_mask'] = attention
-                reference = pe._path_sampling_random_probability_from_partially_masked(
-                    **dict(args, model=copy.deepcopy(args['model'])), state_batch_size=0,
-                )
-                for pool_size in (1, 17, 128):
-                    actual = pe._path_sampling_random_probability_from_partially_masked(
-                        **args, state_batch_size=pool_size,
-                    )
-                    torch.testing.assert_close(
-                        torch.tensor(actual['sample_log_probabilities'], dtype=torch.float64),
-                        torch.tensor(reference['sample_log_probabilities'], dtype=torch.float64),
-                        rtol=0, atol=2e-12,
-                    )
-                    self.assertLessEqual(actual['model_forward_max_batch_size'], pool_size)
-
-    def test_pooled_log_weights_survive_underflow_and_exact_zero(self):
-        for p in (1e-10, 0.0):
-            model = TinyLLaDA(constant_p=p if p else 0.01)
-            if not p:
-                with torch.no_grad():
-                    model.model.transformer.ff_out.bias[0] = -math.inf
-            args = self.args(model)
-            args['num_samples'] = 7
-            result = pe._path_sampling_random_probability_from_partially_masked(
-                **args, state_batch_size=64,
-            )
-            self.assertEqual(result['probability'], 0.0)
-            expected = 50 * math.log(p) if p else -math.inf
-            for value in result['sample_log_probabilities']:
-                if p:
-                    self.assertAlmostEqual(value, expected, places=10)
-                else:
-                    self.assertEqual(value, expected)
-
-    def test_pooled_execution_can_use_generic_full_logits(self):
-        args = dict(self.args(TinyLLaDA()), num_samples=9, steps=7,
-                    use_selected_logits=False, temperature=2.0)
-        expected = pe._path_sampling_random_probability_from_partially_masked(
-            **args, state_batch_size=0,
-        )
-        actual = pe._path_sampling_random_probability_from_partially_masked(
-            **args, state_batch_size=32,
-        )
-        self.assertFalse(actual['selected_position_logits'])
-        torch.testing.assert_close(
-            torch.tensor(actual['sample_log_probabilities'], dtype=torch.float64),
-            torch.tensor(expected['sample_log_probabilities'], dtype=torch.float64),
-            rtol=0, atol=2e-12,
-        )
 
 
 if __name__ == '__main__':

@@ -101,72 +101,18 @@ Random remasking and DUEL skip vocabulary sorting and CDF construction because
 neither needs sampled-confidence competition probabilities. Their reveal policies
 differ from low-confidence STS, so their final estimates need not match STS.
 
-Random remasking recognizes the standard GSAI LLaDA model and gathers the
-requested hidden positions after its final layer norm, before vocabulary
-projection. All transformer layers still process the complete 100-token context;
-only the expensive output projection omits unused positions. The scoped hook is
-removed even on failure, and supports both separate and tied output weights.
+Random remasking first draws one uniform permutation of the 50 masked positions
+for every sample. It then follows each shuffled path, scoring the target tokens
+from the current state before revealing them. All 500 paths run together by
+default on recognized LLaDA models, which gives 50 model calls for the usual
+50-step workload on an A100 80GB.
 
-Random remasking defaults to **512 trajectories per batch** for recognized
-LLaDA models, giving 50 model calls for 500 samples with 50 one-token steps.
-Larger batches did not improve measured throughput on an A100 80GB.
-Explicit `state_batch_size=2048` pools predetermined states across trajectories
-and decoding steps, reducing this workload to 13 calls, with smaller retries
-on CUDA out-of-memory errors. It retains the schedule and all samples, but
-fewer calls do not imply less transformer computation.
-Only **24,550 position rows** are projected to vocabulary logits, instead of
-2,450,100. This reduces output-head computation and memory, but does not remove
-the transformer work for those trajectory states. Other architectures use
-full logits with 128 trajectories (up to 197 calls).
-`use_selected_logits=False` disables the LLaDA optimization for comparison.
-`state_batch_size` explicitly sets the pool size; zero/None uses stepwise
-execution, whose trajectory batch size is controlled by `batch_size`.
-`normalization_batch_size` (default 128) independently bounds how many selected
-vocabulary rows are promoted to FP64 at once. The full model output stays in
-native dtype; normalization uses stable FP64 `log_softmax`. Validation flags
-remain on device until all vocabulary chunks have been scored, avoiding a
-CPU/GPU synchronization for every chunk. Full/top-k sampling
-and simultaneous reveal blocks remain supported.
-
-Path products and arithmetic averaging stay in log space, without probability
-floors. Stepwise execution drops only exactly zero paths; pooled execution
-scores all predetermined states, including those on zero-weight paths.
-Finite log weights remain valid
-even below the ordinary floating-point probability range. Results include
-`log_probability`, `sample_log_probabilities`, `model_forward_calls`, and
-`model_forward_max_batch_size`, `selected_position_logits`, and
-`vocabulary_projection_rows`. Pool diagnostics include `states_pooled_across_steps`,
-`state_batch_size`, `effective_state_batch_size`, and `cuda_oom_retries`.
-Seeded reveal permutations are independent of
-batch size, but model logits and scores can differ slightly across batch shapes.
-This trades singleton numerical identity for batched throughput; it does not
-revert token normalization to FP32. Batch-dependent model roundoff remains
-possible. Fewer forward calls
-do not imply proportionally less runtime: the transformer still processes
-24,501 sequence rows of 100 tokens for this 500-sample configuration.
-
-Direct profiling on the user's A100-SXM4-80GB, with LLaDA-8B-Base in BF16,
-PyTorch 2.11.0+cu128 and 100-token inputs, measured the following selected-head
-forward times (one warmup per shape, mean of two timed forwards):
-
-| States per forward | Forward time | States/second | Projected 24,500-state forward time |
-| ---: | ---: | ---: | ---: |
-| 128 | 0.951 s | 134.6 | 182.0 s |
-| 500 | 3.720 s | 134.4 | 182.3 s |
-| 1,024 | 7.637 s | 134.1 | 182.7 s |
-| 2,048 | 15.399 s | 133.0 | 184.2 s |
-
-These are synthetic-input forward measurements, not end-to-end window timings.
-The live workload sustained 99-100% GPU utilization near its 400 W power limit.
-Matrix multiplication accounted for about 70% of forward CUDA time; FP64
-target scoring for 500 states took 3.93 ms separately.
-
-The known LLaDA random forward now temporarily disables deterministic filling
-of unused tensor memory, restoring the caller's setting even on exceptions.
-All tensors read by this implementation are initialized. Alternating A100
-measurements at batch 500 reduced mean forward time from 3.715 s to 3.627 s
-(about 2.4%), with bit-for-bit identical logits. Deterministic algorithm
-selection, native model dtype, FP64 scoring and STS/MC/DP/DUEL remain unchanged.
+The standard GSAI LLaDA output head projects only the positions being scored;
+the transformer still sees all 100 tokens. Token distributions are normalized
+in FP32 for speed, while path sums and the final arithmetic mean remain in FP64
+and log space. `use_selected_logits=False` retains the generic full-output path
+for comparison. `batch_size` can be reduced if a different model runs out of
+memory. Seeded permutations do not depend on that batch size.
 
 DUEL constructs and scores its path in 50 singleton forwards, without logits
 caching. Its FP64 confidence calculation and smallest-index tie rule are
