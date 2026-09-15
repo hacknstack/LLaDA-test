@@ -92,7 +92,8 @@ class RandomDuelAlignmentTests(unittest.TestCase):
     def random_args(self, model, temperature=1.0):
         model.allow_batched = True
         return dict(self.args(model, temperature), num_samples=8, seed=51,
-                    decoding_scheme='full', k=1)
+                    decoding_scheme='full', k=1, max_path_samples=None,
+                    stratified_paths=False)
 
     def test_duel_confidence_ranking_matches_sts_and_target_scores_remain_fp64(self):
         original = pe._duel_state_scores
@@ -206,14 +207,33 @@ class RandomDuelAlignmentTests(unittest.TestCase):
                     else:
                         self.assertAlmostEqual(actual, expected, places=5)
 
-    def test_default_500_samples_are_batched_and_do_not_sort_vocab(self):
+    def test_uniform_path_permutations_are_valid_and_seeded(self):
+        expected = torch.arange(50).expand(128, -1)
+        for stratified in (False, True):
+            def draw():
+                rng = torch.Generator().manual_seed(73)
+                return pe._uniform_path_permutations(
+                    128, 50, rng, stratified=stratified, seed=73,
+                )
+
+            first = draw()
+            second = draw()
+            self.assertTrue(torch.equal(first, second))
+            self.assertTrue(torch.equal(first.sort(dim=-1).values, expected))
+
+    def test_default_500_request_uses_stratified_128_path_budget(self):
         args = self.random_args(StateModel(constant_p=0.01))
         args.update(num_samples=500, steps=1)
+        args.pop('max_path_samples')
+        args.pop('stratified_paths')
         with patch.object(torch, 'sort', side_effect=AssertionError('Unused vocabulary sort')):
             result = RANDOM(**args)
         self.assertEqual(result['trajectory_batch_size'], 128)
         self.assertEqual(result['model_forward_calls'], 1)
         self.assertTrue(result['initial_state_reused'])
+        self.assertEqual(result['num_samples'], 128)
+        self.assertEqual(result['requested_num_samples'], 500)
+        self.assertTrue(result['stratified_paths'])
         self.assertAlmostEqual(result['log_probability'], math.log(1e-100), places=4)
         self.assertLess(abs(result['probability'] / 1e-100 - 1), 1e-4)
 
@@ -349,8 +369,22 @@ class RandomDuelAlignmentTests(unittest.TestCase):
             num_samples=500, seed=51, temperature=1.0, masked_indexes=list(range(1, 51)),
         )
         self.assertEqual(result['model_forward_calls'], 1)
-        self.assertEqual(len(result['sample_log_probabilities']), 500)
+        self.assertEqual(len(result['sample_log_probabilities']), 128)
+        self.assertEqual(result['num_samples'], 128)
+        self.assertEqual(result['requested_num_samples'], 500)
+        self.assertTrue(result['stratified_paths'])
         self.assertAlmostEqual(result['log_probability'], math.log(1e-100), places=4)
+
+        all_paths = pe.compute_diffusion_probabilistic_extraction(
+            model=StateModel(constant_p=0.01),
+            prompt_tokens=torch.zeros((1, 50), dtype=torch.long),
+            target_tokens=torch.zeros((1, 50), dtype=torch.long),
+            steps=1, mask_id=MASK_ID, remasking='random', estimation_method='path_sampling',
+            num_samples=500, seed=51, temperature=1.0, masked_indexes=list(range(1, 51)),
+            random_path_sample_budget=500,
+        )
+        self.assertEqual(all_paths['num_samples'], 500)
+        self.assertEqual(all_paths['requested_num_samples'], 500)
 
     def test_random_500_paths_use_simple_batches_and_preserve_tiny_weights(self):
         # A cheap vectorized model makes this a full 500 x 50-step regression.

@@ -13,6 +13,7 @@ from get_log_likelihood import get_log_likelihood, get_log_likelihood_from_parti
 
 AUTOREGRESSIVE_MODEL_FAMILIES = {'llama', 'llama2', 'olmo', 'mistral'}
 MAX_EXACT_LOW_CONFIDENCE_MASKED = 12
+DEFAULT_RANDOM_PATH_SAMPLE_BUDGET = 128
 
 
 @dataclass
@@ -1765,6 +1766,21 @@ def _random_path_target_log_probs(logits, target_ids, temperature, decoding_sche
     ).squeeze(-1)
 
 
+def _uniform_path_permutations(num_paths, path_length, rng, stratified, seed=None):
+    """Draw uniform permutations, optionally with randomized QMC stratification."""
+    if num_paths <= 0 or path_length <= 0:
+        raise ValueError("num_paths and path_length must be positive.")
+    if not stratified:
+        return torch.stack([
+            torch.randperm(path_length, generator=rng) for _ in range(num_paths)
+        ])
+    sobol_seed = int(seed) if seed is not None else secrets.randbits(31)
+    scores = torch.quasirandom.SobolEngine(
+        dimension=path_length, scramble=True, seed=sobol_seed,
+    ).draw(num_paths, dtype=torch.float64)
+    return scores.argsort(dim=-1)
+
+
 @torch.inference_mode()
 def _path_sampling_random_probability_from_partially_masked(
     model,
@@ -1780,14 +1796,18 @@ def _path_sampling_random_probability_from_partially_masked(
     temperature: float,
     batch_size: Optional[int] = None,
     use_selected_logits: bool = True,
+    max_path_samples: Optional[int] = DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
+    stratified_paths: bool = True,
 ) -> Dict[str, object]:
-    """Average target-sequence probabilities over uniform random reveal paths.
+    """Average target-sequence probabilities over uniform shuffled reveal paths.
 
     All paths are shuffled before model evaluation. For each path, tokens are
     scored from the current partially revealed sequence and then replaced by
-    their target values. The 500-path default fits the intended A100 80GB
-    workload in one batch. Vocabulary normalization is FP32; path accumulation
-    and the final Monte Carlo mean are FP64.
+    their target values. ``max_path_samples`` optionally caps the number of
+    expensive model paths. Scrambled Sobol points can stratify that smaller
+    sample while each individual path remains a uniform permutation.
+    Vocabulary normalization is FP32; path accumulation and the final mean are
+    FP64.
     """
     device = _model_device(model)
     sequence_tokens = sequence_tokens.to(device)
@@ -1809,6 +1829,8 @@ def _path_sampling_random_probability_from_partially_masked(
         batch_size = 500 if projection_layer is not None else 128
     if num_samples <= 0 or batch_size <= 0:
         raise ValueError("num_samples and batch_size must be positive.")
+    if max_path_samples is not None and max_path_samples <= 0:
+        raise ValueError("max_path_samples must be positive when provided.")
     if not math.isfinite(float(temperature)) or float(temperature) <= 0:
         raise ValueError("temperature must be finite and strictly positive.")
     if decoding_scheme not in {"full", "top_k"}:
@@ -1829,11 +1851,11 @@ def _path_sampling_random_probability_from_partially_masked(
     if seed is not None:
         rng = torch.Generator(device="cpu").manual_seed(int(seed))
 
-    # Sample every path first. randperm is an exact uniform shuffle, and doing
-    # this before batching makes a seed independent of trajectory batch size.
-    permutations = torch.stack([
-        torch.randperm(masked_len, generator=rng) for _ in range(num_samples)
-    ]).to(device)
+    evaluated_samples = min(num_samples, max_path_samples or num_samples)
+    # Sample every path first. Each row is an exact uniform shuffle.
+    permutations = _uniform_path_permutations(
+        evaluated_samples, masked_len, rng, stratified_paths, seed,
+    ).to(device)
 
     sample_logs = []
     forward_calls = forward_rows = projection_rows = 0
@@ -1861,7 +1883,7 @@ def _path_sampling_random_probability_from_partially_masked(
         invalid |= torch.isnan(initial_scores).any() | torch.isposinf(initial_scores).any()
         initial_scores.clamp_max_(0.0)
 
-        for batch_start in range(0, num_samples, batch_size):
+        for batch_start in range(0, evaluated_samples, batch_size):
             batch_permutations = permutations[batch_start:batch_start + batch_size]
             bsz = batch_permutations.shape[0]
             x = initial_x.expand(bsz, -1).clone()
@@ -1908,7 +1930,7 @@ def _path_sampling_random_probability_from_partially_masked(
 
     log_values = torch.tensor(sample_logs, dtype=torch.float64)
     _check_low_confidence_log_mass(log_values, "random path probabilities", "completed paths")
-    log_probability = float((torch.logsumexp(log_values, dim=0) - math.log(num_samples)).item())
+    log_probability = float((torch.logsumexp(log_values, dim=0) - math.log(evaluated_samples)).item())
     _check_low_confidence_log_mass(
         torch.tensor(log_probability, dtype=torch.float64), "random mean probability", "completed paths",
     )
@@ -1917,7 +1939,9 @@ def _path_sampling_random_probability_from_partially_masked(
         "log_probability": log_probability,
         "sample_probabilities": torch.exp(log_values).tolist(),
         "sample_log_probabilities": sample_logs,
-        "num_samples": num_samples,
+        "num_samples": evaluated_samples,
+        "requested_num_samples": num_samples,
+        "stratified_paths": bool(stratified_paths),
         "estimation_method": "path_sampling",
         "decoding_scheme": decoding_scheme,
         "temperature": tau,
@@ -3891,6 +3915,8 @@ def compute_diffusion_probabilistic_extraction(
     verbose: bool = False,
     verbose_compact: bool = False,
     verbose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
+    random_path_sample_budget: Optional[int] = DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
+    stratified_random_paths: bool = True,
 ):
     """
     Compute probabilistic extraction under LLaDA Algorithm-5 style low-confidence remasking.
@@ -3910,9 +3936,14 @@ def compute_diffusion_probabilistic_extraction(
     estimation_method:
         'exact' (branching over tie-breaks) or 'monte-carlo'.
     num_samples:
-        Number of Monte Carlo samples when estimation_method='monte-carlo'.
+        Requested number of Monte Carlo or sampled-path trajectories.
     seed:
-        RNG seed for Monte Carlo.
+        RNG seed for Monte Carlo or path sampling.
+    random_path_sample_budget:
+        Maximum exact shuffled paths evaluated for partially masked random
+        remasking. ``None`` evaluates all ``num_samples`` paths.
+    stratified_random_paths:
+        Use randomized QMC stratification for partially masked random paths.
     """
     if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
         raise ValueError('prompt_tokens must have shape (1, a).')
@@ -4072,6 +4103,8 @@ def compute_diffusion_probabilistic_extraction(
                 decoding_scheme=normalized_decoding_scheme,
                 k=k,
                 temperature=temperature,
+                max_path_samples=random_path_sample_budget,
+                stratified_paths=stratified_random_paths,
             )
         return {
             **path_sampling_result,
@@ -6040,6 +6073,8 @@ def compute_probabilistic_extraction(
     temperature: float = 0.0,
     return_token_details: bool = False,
     masked_indexes: Optional[Sequence[int]] = None,
+    random_path_sample_budget: Optional[int] = DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
+    stratified_random_paths: bool = True,
 ):
     model_family = model_family.lower()
     if model_family in AUTOREGRESSIVE_MODEL_FAMILIES:
@@ -6075,5 +6110,7 @@ def compute_probabilistic_extraction(
             k=k,
             temperature=temperature,
             masked_indexes=masked_indexes,
+            random_path_sample_budget=random_path_sample_budget,
+            stratified_random_paths=stratified_random_paths,
         )
     raise ValueError("model_family must be one of {'llada', 'llama', 'llama2', 'olmo', 'mistral'}")

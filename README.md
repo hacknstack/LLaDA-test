@@ -103,16 +103,27 @@ differ from low-confidence STS, so their final estimates need not match STS.
 
 Random remasking first draws one uniform permutation of the 50 masked positions
 for every sample. It then follows each shuffled path, scoring the target tokens
-from the current state before revealing them. All 500 paths run together by
-default on recognized LLaDA models, which gives 50 model calls for the usual
-50-step workload on an A100 80GB.
+from the current state before revealing them. For a requested 500-sample run,
+the partially masked implementation evaluates 128 exact paths by default using
+randomized Sobol stratification (`--random-path-sample-budget 128`). Every path
+is still a uniform permutation; stratification spreads the finite sample more
+evenly over permutation space. Set the budget to 500 to evaluate every requested
+path.
+
+On an A100 80GB, the 128-path default took about 46 seconds for a 50-mask,
+50-step window in a measured 8B-model run, versus roughly 3 minutes for all 500
+paths. On a difficult held-out window its estimate was within 0.139 log units
+of the 500-path result. This is a sampling approximation rather than a model
+kernel shortcut: every token probability along each evaluated path is still
+computed exactly.
 
 The standard GSAI LLaDA output head projects only the positions being scored;
 the transformer still sees all 100 tokens. Token distributions are normalized
 in FP32 for speed, while path sums and the final arithmetic mean remain in FP64
 and log space. `use_selected_logits=False` retains the generic full-output path
 for comparison. `batch_size` can be reduced if a different model runs out of
-memory. Seeded permutations do not depend on that batch size.
+memory. Seeded permutations do not depend on that batch size. Results report
+both `requested_num_samples` and the actually evaluated `num_samples`.
 
 DUEL constructs and scores its path in 50 singleton forwards, without logits
 caching. Its FP64 confidence calculation and smallest-index tie rule are

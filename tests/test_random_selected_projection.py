@@ -82,7 +82,7 @@ class RandomSelectedProjectionTests(unittest.TestCase):
         return dict(model=model, sequence_tokens=torch.zeros((1, 100), dtype=torch.long),
                     masked_indexes=list(range(1, 51)), steps=50, attention_mask=None,
                     mask_id=7, num_samples=500, seed=51, decoding_scheme='full', k=2,
-                    temperature=1.0)
+                    temperature=1.0, max_path_samples=None, stratified_paths=False)
 
     def test_selected_logits_match_full_context_projection_for_tied_and_scaled_heads(self):
         generator = torch.Generator().manual_seed(7)

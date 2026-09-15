@@ -17,6 +17,7 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from probabilistic_extraction import (
+    DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
     MAX_EXACT_LOW_CONFIDENCE_MASKED,
     _duel_low_confidence_probability_fast_from_partially_masked,
     compute_autoregressive_probabilistic_extraction,
@@ -64,6 +65,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--model-family', type=str.lower, choices=['llada', 'llama', 'llama2', 'olmo', 'mistral'], default='llada')
     parser.add_argument('--model-name', type=str, default=None)
     parser.add_argument('--num-samples', type=int, default=20, help='Samples for Monte Carlo or path sampling')
+    parser.add_argument(
+        '--random-path-sample-budget',
+        type=int,
+        default=DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
+        help=(
+            'Maximum exact paths evaluated for partially masked random remasking '
+            f'(default: {DEFAULT_RANDOM_PATH_SAMPLE_BUDGET}; set equal to '
+            '--num-samples to evaluate every requested path).'
+        ),
+    )
     parser.add_argument('--seed', type=int, default=None, help='Optional sampling seed')
     diagnostics_group = parser.add_mutually_exclusive_group()
     diagnostics_group.add_argument(
@@ -332,6 +343,7 @@ def _compute_probability(
         k=args.k,
         temperature=args.temperature,
         masked_indexes=args.masked_indexes,
+        random_path_sample_budget=args.random_path_sample_budget,
         verbose=args.verbose,
         verbose_compact=args.compact,
         verbose_callback=verbose_callback,
@@ -393,6 +405,8 @@ def main() -> None:
 
     if args.stride_words <= 0:
         raise ValueError('--stride-words must be > 0.')
+    if args.random_path_sample_budget <= 0:
+        raise ValueError('--random-path-sample-budget must be > 0.')
     if args.compact and not args.verbose:
         raise ValueError('--compact requires --verbose.')
     if args.windows is not None:
