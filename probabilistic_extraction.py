@@ -15,6 +15,7 @@ AUTOREGRESSIVE_MODEL_FAMILIES = {'llama', 'llama2', 'olmo', 'mistral'}
 MAX_EXACT_LOW_CONFIDENCE_MASKED = 12
 DEFAULT_RANDOM_PATH_SAMPLE_BUDGET = 128
 DEFAULT_RANDOM_PATH_STEP_BUDGET = 25
+DEFAULT_DUEL_STEP_BUDGET = 25
 
 
 @dataclass
@@ -5106,58 +5107,75 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
 
 def _duel_state_scores(
     model, x_row, active_abs_positions, active_target_ids, attention_mask,
-    temperature, context, full_diagnostics=False,
+    temperature, context, full_diagnostics=False, projection_layer=None,
+    num_reveals=1,
 ):
-    """Rank as before in FP64, score the chosen target, and validate once.
+    """Rank in FP64, score the selected targets, and validate once.
 
     The full untempered normalizer is needed for ranking, but a second full
-    vocabulary normalization under temperature is unnecessary for a single
-    chosen position. Large logit offsets retain the original cancellation check.
+    vocabulary normalization under temperature is only needed for selected
+    positions. Large logit offsets retain the original cancellation check.
     """
+    if not 1 <= num_reveals <= active_abs_positions.numel():
+        raise ValueError("num_reveals must be within the number of active positions.")
     device = x_row.device
     autocast = (torch.autocast(device_type=device.type, enabled=False)
                 if device.type in {"cpu", "cuda"} else nullcontext())
     with autocast:
-        outputs = model(x_row.unsqueeze(0).contiguous(), attention_mask=attention_mask)
-    logits = outputs.logits[0, active_abs_positions, :].contiguous().to(torch.float64)
-    del outputs
+        all_logits = _random_remasking_forward_logits(
+            model, x_row.unsqueeze(0).contiguous(), attention_mask,
+            active_abs_positions.unsqueeze(0), projection_layer,
+        )
+    if projection_layer is None:
+        logits = all_logits[0, active_abs_positions, :]
+    else:
+        logits = all_logits[0]
+    logits = logits.contiguous().to(torch.float64)
+    del all_logits
     if logits.ndim != 2 or logits.shape[-1] == 0:
         raise ValueError(f"Expected nonempty [remaining, vocabulary] logits ({context}).")
     # Preserve the actual confidence calculation and exact-tie behavior. A
     # different algebraic normalization could flip a nearly tied reveal order.
     log_Z_conf = torch.logsumexp(logits, dim=-1)
     highest = logits.max(dim=-1).values - log_Z_conf
-    chosen = highest.argmax()
+    if num_reveals == 1:
+        chosen = highest.argmax().reshape(1)
+    else:
+        # Active positions are in sequence order, so stable sorting preserves
+        # the smallest-index tie rule for every reveal in this model step.
+        chosen = torch.argsort(highest, descending=True, stable=True)[:num_reveals]
+    selected_targets = active_target_ids.index_select(0, chosen)
     target_logs = None
     if temperature == 1.0:
         # Ranking already paid for this normalizer; reuse it for target scoring.
-        chosen_log = logits[chosen, active_target_ids[chosen]] - log_Z_conf[chosen]
+        chosen_logs = logits[chosen, selected_targets] - log_Z_conf[chosen]
         if full_diagnostics:
             target_logs = logits.gather(-1, active_target_ids[:, None])[:, 0] - log_Z_conf
     else:
         # Centered FP64 log_softmax keeps small target probabilities accurate.
         # Only detailed diagnostics need target scores for the losing positions.
-        selected_logits = logits.index_select(0, chosen.reshape(1))
+        selected_logits = logits.index_select(0, chosen)
         sample_logs = torch.log_softmax(selected_logits / temperature, dim=-1)
-        chosen_log = sample_logs[0, active_target_ids[chosen]]
+        chosen_logs = sample_logs.gather(-1, selected_targets[:, None])[:, 0]
         if full_diagnostics:
             diagnostic_logs = torch.log_softmax(logits / temperature, dim=-1)
             target_logs = diagnostic_logs.gather(-1, active_target_ids[:, None])[:, 0]
             # Diagnostics must not change the chosen probability's arithmetic.
-            target_logs[chosen] = chosen_log
+            target_logs[chosen] = chosen_logs
 
     # Nonfinite raw rows propagate to their normalizers. The maximum log
     # confidence bounds all confidence masses, so no full-vocabulary validity
     # tensor is needed. Combine small flags into a single host synchronization.
-    masses = torch.cat((highest, chosen_log.reshape(1),
+    masses = torch.cat((highest, chosen_logs,
                         target_logs if target_logs is not None else highest[:0]))
-    flags = torch.stack((
+    flags_and_choices = torch.cat((torch.stack((
         (~torch.isfinite(log_Z_conf)).any().to(torch.int64),
         (torch.isnan(masses) | torch.isposinf(masses) |
          (masses > _LOW_CONFIDENCE_LOG_TOL)).any().to(torch.int64),
         (log_Z_conf.abs() > 1e4).any().to(torch.int64),
-        chosen,
-    )).detach().cpu().tolist()
+    )), chosen.to(torch.int64))).detach().cpu().tolist()
+    flags = flags_and_choices[:3]
+    chosen_py = flags_and_choices[3:]
     if flags[0]:
         raise FloatingPointError(f"Invalid model logits or nonfinite normalizer ({context}).")
     if flags[1]:
@@ -5170,7 +5188,9 @@ def _duel_state_scores(
         total = torch.logsumexp(confidence_logs, dim=-1)
         if not bool((torch.isfinite(total) & (total.abs() <= _LOW_CONFIDENCE_LOG_TOL)).all().item()):
             raise FloatingPointError(f"Confidence distribution is not normalized ({context}).")
-    return int(flags[3]), chosen_log, highest, target_logs
+    if num_reveals == 1:
+        return int(chosen_py[0]), chosen_logs[0], highest, target_logs
+    return [int(value) for value in chosen_py], chosen_logs, highest, target_logs
 
 
 @torch.inference_mode()
@@ -5185,6 +5205,8 @@ def _duel_low_confidence_probability_fast_from_partially_masked(
     temperature: float,
     verbose: bool = False,
     verbose_compact: bool = False,
+    max_steps: Optional[int] = DEFAULT_DUEL_STEP_BUDGET,
+    use_selected_logits: bool = True,
 ) -> Dict[str, object]:
     """
     Deterministic DUEL estimator for low-confidence remasking.
@@ -5230,7 +5252,13 @@ def _duel_low_confidence_probability_fast_from_partially_masked(
     the same model forward that determines pi_k also supplies
     p_{pi_k}(z_{pi_k} | S_{k-1}).  For a deterministic model this is
     mathematically identical to first constructing the complete path and then
-    replaying that path to score it, while requiring half as many model forwards.
+    replaying that path, while requiring half as many model forwards.
+
+    ``max_steps`` optionally coarsens this deterministic path. With 25 steps and
+    50 masked positions, the two highest-confidence positions are selected and
+    scored from each state, then revealed together. This preserves DUEL's
+    confidence policy but approximates the within-pair conditioning. Set
+    ``max_steps=None`` or 50 for the exact singleton chain.
 
     NUMERICAL STRATEGY
     ------------------
@@ -5255,12 +5283,12 @@ def _duel_low_confidence_probability_fast_from_partially_masked(
     Notes
     -----
     DUEL itself uses no random sampling and therefore has no num_samples or seed
-    argument. Path construction and scoring use one singleton forward per step,
-    without unused vocabulary sorting/CDF work or logits caching. Confidence
-    arithmetic is unchanged; at temperature 1 its normalizer is reused for
-    target scoring. Other temperatures normalize only the chosen row unless
-    detailed diagnostics require all target scores. Validation and diagnostics
-    use compact host transfers. Custom models
+    argument. Path construction and scoring use one singleton-state forward per
+    model step, without unused vocabulary sorting/CDF work or logits caching.
+    Confidence arithmetic is unchanged; at temperature 1 its normalizer is
+    reused for target scoring. Other temperatures normalize only selected rows
+    unless detailed diagnostics require all target scores. Validation and
+    diagnostics use compact host transfers. Custom models
     with stochastic or mutable evaluation behavior remain unsupported.
     """
 
@@ -5318,6 +5346,9 @@ def _duel_low_confidence_probability_fast_from_partially_masked(
             f"len(masked_indexes)={masked_len}."
         )
 
+    if max_steps is not None and max_steps <= 0:
+        raise ValueError("max_steps must be positive when provided.")
+
     if (
         not math.isfinite(float(temperature))
         or float(temperature) <= 0.0
@@ -5336,6 +5367,11 @@ def _duel_low_confidence_probability_fast_from_partially_masked(
             )
 
     tau = float(temperature)
+    evaluated_steps = min(steps, max_steps or steps)
+    base, rem = divmod(masked_len, evaluated_steps)
+    reveal_schedule = [base + (step < rem) for step in range(evaluated_steps)]
+    projection_layer = (_random_remasking_projection_layer(model)
+                        if use_selected_logits else None)
 
     masked_pos_t = torch.tensor(
         masked_pos,
@@ -5372,49 +5408,63 @@ def _duel_low_confidence_probability_fast_from_partially_masked(
     # Deterministic DUEL path construction + chain-rule scoring
     # ==================================================================
 
-    for step in range(masked_len):
+    projection_rows = 0
+    for model_step, reveal_count in enumerate(reveal_schedule):
         active_slots = torch.tensor(active_slots_py, dtype=torch.long, device=device)
         active_abs_positions = masked_pos_t[active_slots]
         active_target_ids = masked_target_row[active_slots]
-        context = f"step={step}, revealed_indices={sorted(reveal_path_indices)}"
+        context = f"step={model_step}, revealed_indices={sorted(reveal_path_indices)}"
         chosen_local, chosen_log, highest, target_logs = _duel_state_scores(
             model, x[0], active_abs_positions, active_target_ids, attention_mask,
             tau, context, full_diagnostics=verbose and not verbose_compact,
+            projection_layer=projection_layer, num_reveals=reveal_count,
         )
-        chosen_slot = active_slots_py[chosen_local]
-        chosen_position = masked_pos[chosen_slot]
-        chosen_target_id = masked_target_row[chosen_slot]
-        log_probability = log_probability + chosen_log
-        x[0, chosen_position] = chosen_target_id
-        reveal_path_indices.append(chosen_position + 1)
+        projection_rows += len(active_slots_py) if projection_layer is not None else seq_len
+        if reveal_count == 1:
+            chosen_locals = [chosen_local]
+            chosen_logs = chosen_log.reshape(1)
+        else:
+            chosen_locals = chosen_local
+            chosen_logs = chosen_log
 
-        if verbose:
-            # One small transfer for all numeric diagnostics at this step.
-            parts = [chosen_log.reshape(1), highest[chosen_local].reshape(1),
-                     chosen_target_id.to(torch.float64).reshape(1)]
-            if not verbose_compact:
-                parts.extend([highest, target_logs])
-            values = torch.cat(parts).detach().cpu().tolist()
-            step_record = {
-                "step": step + 1,
-                "revealed_index": chosen_position + 1,
-                "target_log_probability": values[0],
-                "highest_log_confidence": values[1],
-            }
-            if not verbose_compact:
-                count = len(active_slots_py)
-                step_record.update({
-                    "revealed_masked_slot": chosen_slot,
-                    "target_token_id": int(values[2]),
-                    "target_probability": math.exp(values[0]),
-                    "highest_confidence": math.exp(values[1]),
-                    "active_indices": [masked_pos[slot] + 1 for slot in active_slots_py],
-                    "active_highest_log_confidences": values[3:3 + count],
-                    "active_target_log_probabilities": values[3 + count:],
-                    "chosen_local_index": chosen_local,
-                })
-            verbose_steps.append(step_record)
-        active_slots_py.pop(chosen_local)
+        for block_offset, local_index in enumerate(chosen_locals):
+            selected_log = chosen_logs[block_offset]
+            chosen_slot = active_slots_py[local_index]
+            chosen_position = masked_pos[chosen_slot]
+            chosen_target_id = masked_target_row[chosen_slot]
+            log_probability = log_probability + selected_log
+            x[0, chosen_position] = chosen_target_id
+            reveal_path_indices.append(chosen_position + 1)
+
+            if verbose:
+                # One compact transfer for the diagnostics of this reveal.
+                parts = [selected_log.reshape(1), highest[local_index].reshape(1),
+                         chosen_target_id.to(torch.float64).reshape(1)]
+                if not verbose_compact:
+                    parts.extend([highest, target_logs])
+                values = torch.cat(parts).detach().cpu().tolist()
+                step_record = {
+                    "step": len(reveal_path_indices),
+                    "model_step": model_step + 1,
+                    "revealed_index": chosen_position + 1,
+                    "target_log_probability": values[0],
+                    "highest_log_confidence": values[1],
+                }
+                if not verbose_compact:
+                    count = len(active_slots_py)
+                    step_record.update({
+                        "revealed_masked_slot": chosen_slot,
+                        "target_token_id": int(values[2]),
+                        "target_probability": math.exp(values[0]),
+                        "highest_confidence": math.exp(values[1]),
+                        "active_indices": [masked_pos[slot] + 1 for slot in active_slots_py],
+                        "active_highest_log_confidences": values[3:3 + count],
+                        "active_target_log_probabilities": values[3 + count:],
+                        "chosen_local_index": local_index,
+                    })
+                verbose_steps.append(step_record)
+        for local_index in sorted(chosen_locals, reverse=True):
+            active_slots_py.pop(local_index)
         del chosen_log, highest, target_logs
 
     # ==================================================================
@@ -5444,13 +5494,19 @@ def _duel_low_confidence_probability_fast_from_partially_masked(
             int(i) for i in masked_indexes
         ],
         "num_masked": masked_len,
+        "steps": evaluated_steps,
+        "requested_steps": steps,
+        "max_reveals_per_step": max(reveal_schedule),
         "reveal_path_indices": reveal_path_indices,
         "tie_breaking": "smallest_index_among_max_confidence",
         "path_construction": "max_possible_untempered_confidence",
-        "path_probability": "target_token_chain_rule_only",
+        "path_probability": ("target_token_chain_rule_only" if evaluated_steps == masked_len
+                             else "blockwise_target_probability_approximation"),
         "model_forward_dtype": "native",
-        "model_forward_calls": masked_len,
+        "model_forward_calls": evaluated_steps,
         "model_forward_batch_size": 1,
+        "selected_position_logits": projection_layer is not None,
+        "vocabulary_projection_rows": projection_rows,
         "model_eval_mode": True,
         "estimator_dtype_after_logits": "float64",
     }

@@ -86,14 +86,16 @@ class RandomDuelAlignmentTests(unittest.TestCase):
             model=model, sequence_tokens=torch.zeros((1, 100), dtype=torch.long),
             masked_indexes=list(range(50, 0, -1)), steps=50,
             attention_mask=torch.ones((1, 100), dtype=torch.long),
-            mask_id=MASK_ID, temperature=temperature,
+            mask_id=MASK_ID, temperature=temperature, max_steps=None,
         )
 
     def random_args(self, model, temperature=1.0):
         model.allow_batched = True
-        return dict(self.args(model, temperature), num_samples=8, seed=51,
-                    decoding_scheme='full', k=1, max_path_samples=None,
-                    stratified_paths=False, max_path_steps=None)
+        args = self.args(model, temperature)
+        args.pop('max_steps')
+        return dict(args, num_samples=8, seed=51, decoding_scheme='full', k=1,
+                    max_path_samples=None, stratified_paths=False,
+                    max_path_steps=None)
 
     def test_duel_confidence_ranking_matches_sts_and_target_scores_remain_fp64(self):
         original = pe._duel_state_scores
@@ -279,6 +281,45 @@ class RandomDuelAlignmentTests(unittest.TestCase):
         self.assertEqual(result['reveal_path_indices'], list(range(1, 51)))
         self.assertAlmostEqual(result['log_probability'], math.log(1e-100), places=11)
         self.assertLess(abs(result['probability'] / 1e-100 - 1), 1e-11)
+
+    def test_duel_fast_default_reveals_two_positions_per_model_step(self):
+        args = self.args(StateModel(constant_p=0.01))
+        args.pop('max_steps')
+        result = DUEL(**args)
+        self.assertEqual(result['steps'], 25)
+        self.assertEqual(result['requested_steps'], 50)
+        self.assertEqual(result['max_reveals_per_step'], 2)
+        self.assertEqual(result['model_forward_calls'], 25)
+        self.assertEqual(result['reveal_path_indices'], list(range(1, 51)))
+        self.assertEqual(
+            result['path_probability'], 'blockwise_target_probability_approximation',
+        )
+        self.assertAlmostEqual(result['log_probability'], math.log(1e-100), places=11)
+
+    def test_duel_fast_blocks_preserve_tempering_and_verbose_records(self):
+        temperature = 0.5
+        probability = 0.01
+        args = self.args(StateModel(constant_p=probability), temperature)
+        args.pop('max_steps')
+        quiet = DUEL(**args)
+
+        logits = [math.log(probability) / temperature,
+                  math.log1p(-probability) / temperature]
+        largest = max(logits)
+        expected = 50 * (logits[0] - largest - math.log(
+            math.fsum(math.exp(value - largest) for value in logits)
+        ))
+        self.assertAlmostEqual(quiet['log_probability'], expected, places=10)
+
+        verbose_args = self.args(StateModel(constant_p=probability), temperature)
+        verbose_args.pop('max_steps')
+        verbose = DUEL(**verbose_args, verbose=True)
+        self.assertEqual(verbose['log_probability'], quiet['log_probability'])
+        self.assertEqual(len(verbose['verbose_steps']), 50)
+        self.assertEqual(
+            [record['model_step'] for record in verbose['verbose_steps'][:4]],
+            [1, 1, 2, 2],
+        )
 
     def test_duel_normalizes_only_chosen_tempered_rows_and_diagnostics_do_not_change_scores(self):
         for temperature in (0.5, 1.0, 2.0):

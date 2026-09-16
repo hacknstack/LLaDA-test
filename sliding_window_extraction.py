@@ -17,6 +17,7 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from probabilistic_extraction import (
+    DEFAULT_DUEL_STEP_BUDGET,
     DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
     DEFAULT_RANDOM_PATH_STEP_BUDGET,
     MAX_EXACT_LOW_CONFIDENCE_MASKED,
@@ -84,6 +85,16 @@ def parse_args() -> argparse.Namespace:
             'Maximum model steps per partially masked random path '
             f'(default: {DEFAULT_RANDOM_PATH_STEP_BUDGET}; use 50 for exact '
             'one-token-at-a-time conditioning).'
+        ),
+    )
+    parser.add_argument(
+        '--duel-step-budget',
+        type=int,
+        default=DEFAULT_DUEL_STEP_BUDGET,
+        help=(
+            'Maximum model steps for DUEL '
+            f'(default: {DEFAULT_DUEL_STEP_BUDGET}; use 50 for the exact '
+            'one-token-at-a-time DUEL chain).'
         ),
     )
     parser.add_argument('--seed', type=int, default=None, help='Optional sampling seed')
@@ -336,6 +347,7 @@ def _compute_probability(
             temperature=args.temperature,
             verbose=args.verbose,
             verbose_compact=args.compact,
+            max_steps=args.duel_step_budget,
         )
         return float(result['probability']), result.get('verbose_steps')
 
@@ -421,6 +433,8 @@ def main() -> None:
         raise ValueError('--random-path-sample-budget must be > 0.')
     if args.random_path_step_budget <= 0:
         raise ValueError('--random-path-step-budget must be > 0.')
+    if args.duel_step_budget <= 0:
+        raise ValueError('--duel-step-budget must be > 0.')
     if args.compact and not args.verbose:
         raise ValueError('--compact requires --verbose.')
     if args.windows is not None:
@@ -562,6 +576,12 @@ def main() -> None:
             'Random path sampling: '
             f'{min(args.num_samples, args.random_path_sample_budget)} paths x '
             f'{min(len(args.masked_indexes), args.random_path_step_budget)} model steps'
+        )
+    if args.model_family == 'llada' and args.mode == 'duel' and args.masked_indexes is not None:
+        effective_steps = min(len(args.masked_indexes), args.duel_step_budget)
+        print(
+            f'DUEL: {effective_steps} model steps, up to '
+            f'{math.ceil(len(args.masked_indexes) / effective_steps)} reveals per step'
         )
 
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -731,6 +751,7 @@ def main() -> None:
             'num_samples': args.num_samples,
             'random_path_sample_budget': args.random_path_sample_budget,
             'random_path_step_budget': args.random_path_step_budget,
+            'duel_step_budget': args.duel_step_budget,
             'seed': args.seed,
             'masked_indexes': args.masked_indexes,
             'verbose': args.verbose,

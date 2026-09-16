@@ -125,18 +125,21 @@ for comparison. `batch_size` can be reduced if a different model runs out of
 memory. Seeded permutations do not depend on that batch size. Results report
 both requested and evaluated sample/step counts.
 
-DUEL constructs and scores its path in 50 singleton forwards, without logits
-caching. Its FP64 confidence calculation and smallest-index tie rule are
-unchanged. At temperature 1 it reuses the ranking normalizer to score the chosen
-target; other temperatures normalize only that position with stable FP64
-`log_softmax`, unless full diagnostics also require scores for the other
-positions. Compact diagnostics avoid that additional work and never change the
-chosen score. Validation flags and diagnostic values use compact host transfers;
-very large logit offsets retain a normalization-cancellation check. DUEL's 50
-dependent reveals cannot be batched together within a single window, so its
-speedup is limited when model inference dominates. Both estimators validate
-numerical results, preserve legitimate zero probabilities, and restore the
-caller's model modes and backend settings even on failure.
+DUEL uses 25 model steps by default, choosing and scoring the two highest-
+confidence remaining positions from each state before revealing them together.
+This keeps the deterministic DUEL confidence policy but approximates conditioning
+within each pair. `--duel-step-budget 50` restores the exact singleton chain.
+On recognized LLaDA models the output head also projects only active positions;
+all 100 tokens still pass through the transformer for context.
+
+Its FP64 confidence calculation and smallest-index tie rule are unchanged. At
+temperature 1 it reuses the ranking normalizer to score selected targets; other
+temperatures normalize only selected rows with stable FP64 `log_softmax`, unless
+full diagnostics require every target score. Validation flags and diagnostic
+values use compact host transfers, and very large logit offsets retain a
+normalization-cancellation check. Both estimators validate numerical results,
+preserve legitimate zero probabilities, and restore the caller's model modes
+and backend settings even on failure.
 
 Run the CPU regression tests with `python -B -m unittest discover -s tests -v`.
 They require PyTorch and use tiny models without downloading model weights.
@@ -150,9 +153,9 @@ suffix:
 python sliding_window_extraction.py texts/book.txt --mode duel --model-family llada --temperature 1.0 --masked_indexes 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100
 ```
 
-With DUEL, `--verbose` writes one JSONL record per reveal step (50 records per
-window), rather than one record per sampled trajectory. `--num-samples` and
-`--seed` are not used by DUEL.
+With DUEL, `--verbose` writes one JSONL record per revealed token (50 records per
+window); paired records share a `model_step`. `--num-samples` and `--seed` are
+not used by DUEL.
 
 ### `results/`
 Contains experiment outputs, organized by model and result type.

@@ -104,6 +104,33 @@ class RandomSelectedProjectionTests(unittest.TestCase):
                 self.assertEqual(len(layer._forward_hooks), 0)
                 self.assertEqual(model(tokens).logits.shape, (3, 100, 11))
 
+    def test_duel_fast_mode_projects_only_active_positions(self):
+        model = TinyLLaDA(constant_p=0.01)
+        reference_model = copy.deepcopy(model)
+        args = dict(
+            sequence_tokens=torch.zeros((1, 100), dtype=torch.long),
+            masked_indexes=list(range(1, 51)), steps=50, attention_mask=None,
+            mask_id=7, temperature=1.0,
+        )
+        actual = pe._duel_low_confidence_probability_fast_from_partially_masked(
+            model=model, **args,
+        )
+        reference = pe._duel_low_confidence_probability_fast_from_partially_masked(
+            model=reference_model, use_selected_logits=False, **args,
+        )
+        self.assertEqual(actual['reveal_path_indices'], reference['reveal_path_indices'])
+        self.assertAlmostEqual(actual['log_probability'], reference['log_probability'], places=12)
+        self.assertTrue(actual['selected_position_logits'])
+        self.assertFalse(reference['selected_position_logits'])
+        self.assertEqual(actual['model_forward_calls'], 25)
+        self.assertEqual(actual['vocabulary_projection_rows'], sum(range(2, 51, 2)))
+        self.assertEqual(reference['vocabulary_projection_rows'], 25 * 100)
+        self.assertEqual(
+            model.model.projected_shapes,
+            [(1, active, 8) for active in range(50, 0, -2)],
+        )
+        self.assertTrue(all(shape == (1, 100, 8) for shape in model.model.context_shapes))
+
     def test_500_samples_use_50_calls_and_keep_1e_minus_100_accuracy(self):
         model = TinyLLaDA(constant_p=0.01)
         result = pe._path_sampling_random_probability_from_partially_masked(**self.args(model))
