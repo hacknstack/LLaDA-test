@@ -66,7 +66,10 @@ def _unsupported_partially_masked_configuration(
 
 
 def _validate_common_args(remasking: str, estimation_method: str) -> None:
-    allowed_remasking = {'low-confidence', 'target-token-confidence', 'random', 'highest-index'}
+    allowed_remasking = {
+        'low-confidence', 'fast-dllm', 'target-token-confidence', 'random',
+        'highest-index',
+    }
     if remasking not in allowed_remasking:
         raise NotImplementedError(
             f"Unsupported remasking strategy: {remasking!r}. Supported strategies: {sorted(allowed_remasking)}"
@@ -3928,6 +3931,7 @@ def compute_diffusion_probabilistic_extraction(
     random_path_sample_budget: Optional[int] = DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
     stratified_random_paths: bool = True,
     random_path_step_budget: Optional[int] = DEFAULT_RANDOM_PATH_STEP_BUDGET,
+    confidence_threshold: float = 0.9,
 ):
     """
     Compute probabilistic extraction under LLaDA Algorithm-5 style low-confidence remasking.
@@ -3958,6 +3962,10 @@ def compute_diffusion_probabilistic_extraction(
     random_path_step_budget:
         Maximum model steps per partially masked random path. ``None`` preserves
         one-token-at-a-time conditioning for all requested ``steps``.
+    confidence_threshold:
+        Untempered candidate-confidence cutoff used by ``remasking='fast-dllm'``.
+        Every candidate meeting the cutoff is revealed; if none does, the
+        smallest-index maximum-confidence candidate is revealed.
     """
     if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
         raise ValueError('prompt_tokens must have shape (1, a).')
@@ -3966,8 +3974,16 @@ def compute_diffusion_probabilistic_extraction(
 
     use_variable_count_low_confidence_masks = (
         model_family.lower() == 'llada'
-        and estimation_method in {'exact', 'path_sampling'}
-        and remasking == 'low-confidence'
+        and (
+            (
+                estimation_method in {'exact', 'path_sampling'}
+                and remasking == 'low-confidence'
+            )
+            or (
+                estimation_method in {'path_sampling', 'monte-carlo'}
+                and remasking == 'fast-dllm'
+            )
+        )
         and masked_indexes is not None
     )
     normalized_masked_indexes = validate_masked_indexes(
@@ -3994,14 +4010,17 @@ def compute_diffusion_probabilistic_extraction(
     if verbose:
         valid_path_verbose = (
             normalized_masked_indexes is not None
-            and remasking == 'low-confidence'
+            and remasking in {'low-confidence', 'fast-dllm'}
             and estimation_method == 'path_sampling'
             and normalized_decoding_scheme == 'full'
-            and math.isclose(float(temperature), 1.0, rel_tol=0.0, abs_tol=1e-9)
+            and (
+                remasking == 'fast-dllm'
+                or math.isclose(float(temperature), 1.0, rel_tol=0.0, abs_tol=1e-9)
+            )
         )
         valid_mc_verbose = (
             normalized_masked_indexes is not None
-            and remasking == 'low-confidence'
+            and remasking in {'low-confidence', 'fast-dllm'}
             and estimation_method == 'monte-carlo'
             and normalized_decoding_scheme == 'full'
             and math.isfinite(float(temperature))
@@ -4049,6 +4068,79 @@ def compute_diffusion_probabilistic_extraction(
         raise ValueError('steps must be > 0.')
     if normalized_masked_indexes is None and target_tokens.shape[1] < steps:
         raise ValueError('steps must be <= target suffix length for this scheduler.')
+
+    if remasking == 'fast-dllm':
+        if normalized_masked_indexes is None:
+            raise ValueError(
+                'remasking="fast-dllm" requires --masked_indexes for a '
+                '100-token partially masked sequence.'
+            )
+        if normalized_decoding_scheme != 'full':
+            raise ValueError(
+                'remasking="fast-dllm" only supports decoding_scheme="full".'
+            )
+        if estimation_method not in {'path_sampling', 'monte-carlo'}:
+            raise ValueError(
+                'remasking="fast-dllm" supports estimation_method '
+                '"path_sampling" or "monte-carlo".'
+            )
+        if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+            raise ValueError('fast-dLLM requires finite temperature > 0.')
+        if (
+            not math.isfinite(float(confidence_threshold))
+            or not 0.0 <= float(confidence_threshold) <= 1.0
+        ):
+            raise ValueError('confidence_threshold must be finite and in [0, 1].')
+        if num_samples <= 0:
+            raise ValueError('num_samples must be > 0.')
+
+        common = dict(
+            model=model,
+            sequence_tokens=sequence_tokens,
+            masked_indexes=normalized_masked_indexes,
+            steps=steps,
+            attention_mask=attention_mask,
+            mask_id=mask_id,
+            num_samples=num_samples,
+            seed=seed,
+            temperature=temperature,
+            confidence_threshold=confidence_threshold,
+            verbose=verbose,
+            verbose_compact=verbose_compact,
+        )
+        if estimation_method == 'path_sampling':
+            result = _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
+                **common,
+            )
+            return {
+                **result,
+                'method': 'path_sampling',
+                'remasking': 'fast-dllm',
+                'decoding_scheme': 'full',
+                'k': None,
+            }
+
+        mc = _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
+            **common,
+            decoding_scheme='full',
+            k=k,
+            verbose_callback=verbose_callback,
+        )
+        return {
+            'method': 'monte-carlo',
+            'estimate': mc.estimate,
+            'standard_error': mc.standard_error,
+            'wald_ci': mc.wald_ci,
+            'wilson_ci': mc.wilson_ci,
+            'hits': mc.hits,
+            'num_samples': mc.num_samples,
+            'verbose_samples': mc.verbose_samples,
+            'remasking': 'fast-dllm',
+            'decoding_scheme': 'full',
+            'k': None,
+            'temperature': temperature,
+            'confidence_threshold': confidence_threshold,
+        }
 
     if remasking == 'target-token-confidence':
         if normalized_masked_indexes is not None:
@@ -5104,6 +5196,667 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
             else None
         ),
     )
+
+@dataclass
+class _FastDLLMSuccessMasses:
+    active_slots: torch.Tensor
+    log_ell: torch.Tensor
+    log_r: torch.Tensor
+    log_alpha_fallback: torch.Tensor
+    log_first_threshold: torch.Tensor
+    threshold_bernoulli: torch.Tensor
+    log_A_threshold: torch.Tensor
+    log_A_fallback: torch.Tensor
+    log_A: torch.Tensor
+
+
+def _prepare_fast_dllm_inputs(
+    model,
+    sequence_tokens,
+    masked_indexes,
+    steps,
+    attention_mask,
+    temperature,
+    confidence_threshold,
+    num_samples,
+):
+    """Validate and canonicalize the shared fast-dLLM estimator inputs."""
+    device = _model_device(model)
+    sequence_tokens = sequence_tokens.to(device)
+    if sequence_tokens.ndim != 2 or sequence_tokens.shape[0] != 1:
+        raise ValueError(
+            f"sequence_tokens must have shape [1, L], got {tuple(sequence_tokens.shape)}"
+        )
+    seq_len = int(sequence_tokens.shape[1])
+    raw_positions = [int(index) - 1 for index in masked_indexes]
+    if not raw_positions:
+        raise ValueError("masked_indexes must contain at least one position.")
+    if len(raw_positions) != len(set(raw_positions)):
+        raise ValueError("masked_indexes must not contain duplicate positions.")
+    masked_pos = sorted(raw_positions)
+    if any(position < 0 or position >= seq_len for position in masked_pos):
+        raise ValueError(
+            f"masked_indexes must be 1-indexed positions in [1, {seq_len}]"
+        )
+    if int(steps) != len(masked_pos):
+        raise ValueError(
+            "fast-dLLM can take fewer decoding iterations because a threshold "
+            "step may reveal several tokens, but steps must specify the safe "
+            f"maximum len(masked_indexes)={len(masked_pos)}."
+        )
+    if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+        raise ValueError("temperature must be finite and > 0.")
+    threshold = float(confidence_threshold)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("confidence_threshold must be finite and in [0, 1].")
+    if int(num_samples) <= 0:
+        raise ValueError("num_samples must be positive.")
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+        if attention_mask.shape != (1, seq_len):
+            raise ValueError(
+                f"attention_mask must have shape [1, {seq_len}], "
+                f"got {tuple(attention_mask.shape)}"
+            )
+    masked_pos_t = torch.tensor(masked_pos, dtype=torch.long, device=device)
+    target_row = sequence_tokens[0]
+    masked_target_row = target_row[masked_pos_t]
+    return (
+        device,
+        sequence_tokens,
+        attention_mask,
+        masked_pos_t,
+        masked_target_row,
+        float(temperature),
+        threshold,
+    )
+
+
+def _fast_dllm_success_masses(
+    distribution: _LowConfidenceDistribution,
+    active_slots: torch.Tensor,
+    active_target_ids: torch.Tensor,
+    temperature: float,
+    confidence_threshold: float,
+    context: str,
+) -> _FastDLLMSuccessMasses:
+    """Exact FP64 successful threshold/fallback masses for one state.
+
+    The nonempty threshold mass is accumulated by partitioning on the first
+    selected position.  This avoids subtracting two nearly equal products.
+    """
+    logits = distribution.logits
+    m, vocab_size = logits.shape
+    target_logits = logits.gather(-1, active_target_ids.unsqueeze(-1)).squeeze(-1)
+    target_sample_logs = target_logits / temperature - distribution.log_Z_sample
+    target_confidence_logs = target_logits - distribution.log_Z_conf
+    _check_low_confidence_log_mass(
+        target_sample_logs, "fast-dLLM target probabilities", context,
+    )
+
+    log_threshold = (
+        -math.inf if confidence_threshold == 0.0
+        else math.log(confidence_threshold)
+    )
+    sorted_log_confidence = (
+        distribution.sorted_logits - distribution.log_Z_conf.unsqueeze(-1)
+    )
+
+    threshold_values = torch.full(
+        (m, 1), log_threshold, dtype=torch.float64, device=logits.device,
+    )
+    below_idx = torch.searchsorted(
+        sorted_log_confidence, threshold_values, right=False,
+    ).squeeze(-1)
+    below_gather = (below_idx - 1).clamp(min=0, max=vocab_size - 1)
+    log_ell = distribution.log_cdf.gather(
+        -1, below_gather.unsqueeze(-1),
+    ).squeeze(-1)
+    log_ell.masked_fill_(below_idx == 0, -math.inf)
+    log_ell.masked_fill_(below_idx == vocab_size, 0.0)
+
+    target_qualifies = target_confidence_logs >= log_threshold
+    log_r = target_sample_logs.masked_fill(~target_qualifies, -math.inf)
+    log_good = torch.logaddexp(log_ell, log_r)
+
+    # Partition nonempty threshold selections by their first selected index:
+    # prod_{j<i} ell_j * r_i * prod_{j>i}(ell_j+r_j).
+    prefix_low = torch.zeros(m, dtype=torch.float64, device=logits.device)
+    suffix_good = torch.zeros(m, dtype=torch.float64, device=logits.device)
+    if m > 1:
+        prefix_low[1:] = torch.cumsum(log_ell, dim=0)[:-1]
+        suffix_good[:-1] = torch.flip(
+            torch.cumsum(torch.flip(log_good, dims=[0]), dim=0), dims=[0],
+        )[1:]
+    log_first_threshold = prefix_low + log_r + suffix_good
+    log_A_threshold = torch.logsumexp(log_first_threshold, dim=0)
+
+    # Fallback: no token qualifies, so the smallest-index maximum is revealed.
+    target_values = target_confidence_logs.unsqueeze(0).expand(m, -1).contiguous()
+    left_idx = torch.searchsorted(
+        sorted_log_confidence, target_values, right=False,
+    )
+    right_idx = torch.searchsorted(
+        sorted_log_confidence, target_values, right=True,
+    )
+    left_gather = (left_idx - 1).clamp(min=0, max=vocab_size - 1)
+    right_gather = (right_idx - 1).clamp(min=0, max=vocab_size - 1)
+    log_less = distribution.log_cdf.unsqueeze(1).expand(-1, m, -1).gather(
+        -1, left_gather.unsqueeze(-1),
+    ).squeeze(-1)
+    log_less_equal = distribution.log_cdf.unsqueeze(1).expand(-1, m, -1).gather(
+        -1, right_gather.unsqueeze(-1),
+    ).squeeze(-1)
+    log_less.masked_fill_(left_idx == 0, -math.inf)
+    log_less.masked_fill_(left_idx == vocab_size, 0.0)
+    log_less_equal.masked_fill_(right_idx == 0, -math.inf)
+    log_less_equal.masked_fill_(right_idx == vocab_size, 0.0)
+
+    competitor = torch.arange(m, device=logits.device).unsqueeze(1)
+    proposed = torch.arange(m, device=logits.device).unsqueeze(0)
+    factors = torch.where(
+        competitor < proposed,
+        log_less,
+        torch.where(
+            competitor > proposed,
+            log_less_equal,
+            torch.zeros((), dtype=torch.float64, device=logits.device),
+        ),
+    )
+    log_win = factors.sum(dim=0)
+    log_alpha_fallback = target_sample_logs + log_win
+    log_alpha_fallback.masked_fill_(target_qualifies, -math.inf)
+    log_A_fallback = torch.logsumexp(log_alpha_fallback, dim=0)
+    log_A = torch.logaddexp(log_A_threshold, log_A_fallback)
+
+    _check_low_confidence_log_mass(log_ell, "fast-dLLM below-threshold masses", context)
+    _check_low_confidence_log_mass(log_r, "fast-dLLM selected-target masses", context)
+    _check_low_confidence_log_mass(
+        log_alpha_fallback, "fast-dLLM fallback transition masses", context,
+    )
+    _check_low_confidence_log_mass(log_A, "fast-dLLM A(S)", context)
+
+    threshold_bernoulli = torch.zeros_like(log_r)
+    finite_good = torch.isfinite(log_good)
+    threshold_bernoulli[finite_good] = torch.exp(
+        log_r[finite_good] - log_good[finite_good]
+    )
+    threshold_bernoulli.clamp_(0.0, 1.0)
+    return _FastDLLMSuccessMasses(
+        active_slots=active_slots,
+        log_ell=log_ell,
+        log_r=log_r,
+        log_alpha_fallback=log_alpha_fallback,
+        log_first_threshold=log_first_threshold,
+        threshold_bernoulli=threshold_bernoulli,
+        log_A_threshold=log_A_threshold,
+        log_A_fallback=log_A_fallback,
+        log_A=log_A,
+    )
+
+
+def _draw_uniform(shape, device, rng_device, rng, sample_on_device):
+    if sample_on_device:
+        return torch.rand(shape, dtype=torch.float64, device=device, generator=rng)
+    return torch.rand(
+        shape, dtype=torch.float64, device="cpu", generator=rng,
+    ).to(device)
+
+
+def _draw_from_log_weights(log_weights, count, device, rng, sample_on_device):
+    probabilities = torch.softmax(log_weights, dim=0)
+    if sample_on_device:
+        return torch.multinomial(
+            probabilities, count, replacement=True, generator=rng,
+        )
+    return torch.multinomial(
+        probabilities.detach().cpu(), count, replacement=True, generator=rng,
+    ).to(device)
+
+
+def _sample_fast_dllm_successful_subsets(
+    masses: _FastDLLMSuccessMasses,
+    count: int,
+    device,
+    rng_device,
+    rng,
+    sample_on_device: bool,
+):
+    """Sample B from alpha_B(S)/A(S), without empty-subset rejection."""
+    m = int(masses.active_slots.numel())
+    selected = torch.zeros((count, m), dtype=torch.bool, device=device)
+    branch_threshold = torch.zeros(count, dtype=torch.bool, device=device)
+    if torch.isfinite(masses.log_A_threshold):
+        threshold_probability = torch.exp(
+            masses.log_A_threshold - masses.log_A
+        ).clamp(0.0, 1.0)
+        branch_threshold = _draw_uniform(
+            (count,), device, rng_device, rng, sample_on_device,
+        ) < threshold_probability
+
+    threshold_rows = torch.nonzero(branch_threshold, as_tuple=False).squeeze(-1)
+    if threshold_rows.numel() > 0:
+        number = int(threshold_rows.numel())
+        first = _draw_from_log_weights(
+            masses.log_first_threshold, number, device, rng, sample_on_device,
+        )
+        uniforms = _draw_uniform(
+            (number, m), device, rng_device, rng, sample_on_device,
+        )
+        local = uniforms < masses.threshold_bernoulli.unsqueeze(0)
+        positions = torch.arange(m, device=device).unsqueeze(0)
+        local &= positions > first.unsqueeze(1)
+        local.scatter_(1, first.unsqueeze(1), True)
+        selected[threshold_rows] = local
+
+    fallback_rows = torch.nonzero(~branch_threshold, as_tuple=False).squeeze(-1)
+    if fallback_rows.numel() > 0:
+        if not torch.isfinite(masses.log_A_fallback):
+            raise RuntimeError("Selected a zero-mass fast-dLLM fallback branch.")
+        winners = _draw_from_log_weights(
+            masses.log_alpha_fallback,
+            int(fallback_rows.numel()),
+            device,
+            rng,
+            sample_on_device,
+        )
+        selected[fallback_rows, winners] = True
+    if not bool(selected.any(dim=1).all().item()):
+        raise RuntimeError("fast-dLLM successful proposal produced an empty subset.")
+    return selected, branch_threshold
+
+
+@torch.inference_mode()
+@_low_confidence_eval_mode
+def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
+    model,
+    sequence_tokens: torch.Tensor,
+    masked_indexes: list[int],
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    num_samples: int,
+    seed: Optional[int],
+    temperature: float,
+    confidence_threshold: float,
+    batch_size: int = 1024,
+    return_samples: bool = True,
+    verbose: bool = False,
+    verbose_compact: bool = False,
+    use_state_cache: bool = True,
+) -> Dict[str, object]:
+    """Successful-trajectory estimator for fast-dLLM threshold remasking."""
+    (
+        device, sequence_tokens, attention_mask, masked_pos_t,
+        masked_target_row, tau, threshold,
+    ) = _prepare_fast_dllm_inputs(
+        model, sequence_tokens, masked_indexes, steps, attention_mask,
+        temperature, confidence_threshold, num_samples,
+    )
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    masked_len = int(masked_pos_t.numel())
+    rng_device = device if device.type in {"cpu", "cuda"} else torch.device("cpu")
+    sample_on_device = device.type in {"cpu", "cuda"}
+    rng = None if seed is None else torch.Generator(device=rng_device)
+    if rng is not None:
+        rng.manual_seed(int(seed))
+
+    evaluator = _LowConfidenceStateEvaluator(
+        model, attention_mask, masked_pos_t, use_cache=False,
+    )
+    state_cache: Dict[Tuple[bool, ...], _FastDLLMSuccessMasses] = {}
+    cache_requests = cache_hits = cache_misses = 0
+    running_log_sum = torch.tensor(-math.inf, dtype=torch.float64, device=device)
+    sample_logs: List[float] = []
+    sample_probs: List[float] = []
+    verbose_samples: List[Dict[str, object]] = []
+
+    for batch_start in range(0, num_samples, batch_size):
+        bsz = min(batch_size, num_samples - batch_start)
+        # With variable-size reveals, the same state can be reached after a
+        # different number of model steps within this very batch.  Retain it
+        # even in the final batch (unlike the singleton-reveal estimator).
+        retain_states = bool(use_state_cache)
+        x = sequence_tokens.expand(bsz, -1).clone()
+        x[:, masked_pos_t] = mask_id
+        revealed = torch.zeros((bsz, masked_len), dtype=torch.bool, device=device)
+        alive = torch.ones(bsz, dtype=torch.bool, device=device)
+        log_weight = torch.zeros(bsz, dtype=torch.float64, device=device)
+        batch_verbose = [
+            {
+                "sample_index": batch_start + row,
+                "sample_log_estimate": None,
+                "reveal_path_indices": [],
+                "steps": [],
+            }
+            for row in range(bsz)
+        ] if verbose else []
+
+        for model_step in range(masked_len):
+            unfinished = alive & ~revealed.all(dim=1)
+            rows_live_t = torch.nonzero(unfinished, as_tuple=False).squeeze(-1)
+            if rows_live_t.numel() == 0:
+                break
+            rows_live = rows_live_t.detach().cpu().tolist()
+            states = revealed[rows_live_t].detach().cpu().tolist()
+            rows_by_state: Dict[Tuple[bool, ...], List[int]] = {}
+            for row, bits in zip(rows_live, states):
+                rows_by_state.setdefault(tuple(bool(bit) for bit in bits), []).append(row)
+
+            for key, rows in rows_by_state.items():
+                cache_requests += len(rows)
+                masses = state_cache.get(key) if use_state_cache else None
+                representative = rows[0]
+                if masses is None:
+                    active_slots = torch.nonzero(
+                        ~revealed[representative], as_tuple=False,
+                    ).squeeze(-1)
+                    distribution = evaluator.distribution(
+                        x[representative], revealed[representative], tau,
+                    )
+                    masses = _fast_dllm_success_masses(
+                        distribution,
+                        active_slots,
+                        masked_target_row[active_slots],
+                        tau,
+                        threshold,
+                        evaluator.context(revealed[representative]),
+                    )
+                    cache_misses += 1
+                    cache_hits += len(rows) - 1
+                    if retain_states:
+                        state_cache[key] = masses
+                else:
+                    cache_hits += len(rows)
+
+                rows_t = torch.tensor(rows, dtype=torch.long, device=device)
+                if torch.isneginf(masses.log_A):
+                    alive[rows_t] = False
+                    continue
+                log_weight[rows_t] += masses.log_A
+                selected, threshold_branch = _sample_fast_dllm_successful_subsets(
+                    masses,
+                    len(rows),
+                    device,
+                    rng_device,
+                    rng,
+                    sample_on_device,
+                )
+                active_slots = masses.active_slots
+                active_abs = masked_pos_t[active_slots]
+                active_targets = masked_target_row[active_slots]
+                row_grid = rows_t.unsqueeze(1).expand(-1, active_slots.numel())
+                slot_grid = active_slots.unsqueeze(0).expand(len(rows), -1)
+                abs_grid = active_abs.unsqueeze(0).expand(len(rows), -1)
+                target_grid = active_targets.unsqueeze(0).expand(len(rows), -1)
+                revealed[row_grid[selected], slot_grid[selected]] = True
+                x[row_grid[selected], abs_grid[selected]] = target_grid[selected]
+
+                if verbose:
+                    selected_cpu = selected.detach().cpu().tolist()
+                    branch_cpu = threshold_branch.detach().cpu().tolist()
+                    sequence_indices = (active_abs + 1).detach().cpu().tolist()
+                    for local_row, trajectory_row in enumerate(rows):
+                        chosen = [
+                            int(index) for index, flag in zip(
+                                sequence_indices, selected_cpu[local_row],
+                            ) if flag
+                        ]
+                        batch_verbose[trajectory_row]["reveal_path_indices"].extend(chosen)
+                        record = {
+                            "model_step": model_step,
+                            "branch": "threshold" if branch_cpu[local_row] else "fallback",
+                            "revealed_indices": chosen,
+                            "log_A": float(masses.log_A.item()),
+                        }
+                        if verbose_compact:
+                            record.update({
+                                "sequence_indices": sequence_indices,
+                                "log_ell": masses.log_ell.detach().cpu().tolist(),
+                                "log_r": masses.log_r.detach().cpu().tolist(),
+                                "log_alpha_fallback": masses.log_alpha_fallback.detach().cpu().tolist(),
+                            })
+                        batch_verbose[trajectory_row]["steps"].append(record)
+
+        completed = alive & revealed.all(dim=1)
+        batch_logs = torch.where(
+            completed, log_weight, torch.full_like(log_weight, -math.inf),
+        )
+        running_log_sum = torch.logaddexp(
+            running_log_sum, torch.logsumexp(batch_logs, dim=0),
+        )
+        if return_samples:
+            cpu_logs = batch_logs.detach().cpu().tolist()
+            sample_logs.extend(cpu_logs)
+            sample_probs.extend(
+                [0.0 if value == -math.inf else math.exp(value) for value in cpu_logs]
+            )
+        if verbose:
+            cpu_logs = batch_logs.detach().cpu().tolist()
+            for row, value in enumerate(cpu_logs):
+                batch_verbose[row]["sample_log_estimate"] = float(value)
+            verbose_samples.extend(batch_verbose)
+
+    log_probability = float((running_log_sum - math.log(num_samples)).item())
+    return {
+        "probability": 0.0 if log_probability == -math.inf else math.exp(log_probability),
+        "log_probability": log_probability,
+        "sample_probabilities": sample_probs if return_samples else None,
+        "sample_log_probabilities": sample_logs if return_samples else None,
+        "verbose_samples": verbose_samples if verbose else None,
+        "num_samples": num_samples,
+        "estimation_method": "path_sampling_fast_dllm_threshold",
+        "decoding_scheme": "full",
+        "temperature": tau,
+        "confidence_threshold": threshold,
+        "masked_indexes": [int(index) for index in masked_indexes],
+        "num_masked": masked_len,
+        "tie_breaking": "smallest_index_among_max_confidence",
+        "model_forward_dtype": "native",
+        "model_forward_batch_size": 1,
+        "model_eval_mode": True,
+        "estimator_dtype_after_logits": "float64",
+        "state_cache_enabled": bool(use_state_cache),
+        "state_cache_entries": len(state_cache),
+        "state_cache_requests": cache_requests,
+        "state_cache_hits": cache_hits,
+        "state_cache_misses": cache_misses,
+        "model_forward_rows": evaluator.forward_rows,
+    }
+
+
+@torch.inference_mode()
+@_low_confidence_eval_mode
+def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
+    model,
+    sequence_tokens: torch.Tensor,
+    masked_indexes: list[int],
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    num_samples: int,
+    seed: Optional[int],
+    temperature: float,
+    confidence_threshold: float,
+    decoding_scheme: str = "full",
+    k: int = 1,
+    mc_batch_size: int = 16384,
+    model_batch_size: int = 64,
+    verbose: bool = False,
+    verbose_compact: bool = False,
+    verbose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
+    use_state_cache: bool = True,
+) -> MonteCarloResult:
+    """Direct decoder Monte Carlo for fast-dLLM threshold remasking."""
+    (
+        device, sequence_tokens, attention_mask, masked_pos_t,
+        masked_target_row, tau, threshold,
+    ) = _prepare_fast_dllm_inputs(
+        model, sequence_tokens, masked_indexes, steps, attention_mask,
+        temperature, confidence_threshold, num_samples,
+    )
+    if str(decoding_scheme).lower() != "full":
+        raise ValueError('fast-dLLM Monte Carlo requires decoding_scheme="full".')
+    _ = k
+    if mc_batch_size <= 0 or model_batch_size <= 0:
+        raise ValueError("mc_batch_size and model_batch_size must be positive.")
+    if verbose_compact and not verbose:
+        raise ValueError("verbose_compact requires verbose=True.")
+    if verbose_callback is not None and not verbose:
+        raise ValueError("verbose_callback requires verbose=True.")
+
+    masked_len = int(masked_pos_t.numel())
+    rng_device = device if device.type in {"cpu", "cuda"} else torch.device("cpu")
+    sample_on_device = device.type in {"cpu", "cuda"}
+    rng = None if seed is None else torch.Generator(device=rng_device)
+    if rng is not None:
+        rng.manual_seed(int(seed))
+    log_threshold = -math.inf if threshold == 0.0 else math.log(threshold)
+    evaluator = _LowConfidenceStateEvaluator(
+        model, attention_mask, masked_pos_t, use_cache=use_state_cache,
+    )
+    hits = 0
+    verbose_samples: List[Dict[str, object]] = []
+
+    for batch_start in range(0, num_samples, mc_batch_size):
+        bsz = min(mc_batch_size, num_samples - batch_start)
+        # Variable-size transitions can revisit a state at a later model step
+        # in the same trajectory batch, including the final batch.
+        evaluator.cache_writes_enabled = bool(use_state_cache)
+        x = sequence_tokens.expand(bsz, -1).clone()
+        x[:, masked_pos_t] = mask_id
+        revealed = torch.zeros((bsz, masked_len), dtype=torch.bool, device=device)
+        alive = torch.ones(bsz, dtype=torch.bool, device=device)
+        batch_verbose = [
+            {
+                "sample_index": batch_start + row,
+                "is_hit": False,
+                "reveal_path_indices": [],
+                "steps": [],
+            }
+            for row in range(bsz)
+        ] if verbose else []
+
+        for model_step in range(masked_len):
+            unfinished = alive & ~revealed.all(dim=1)
+            rows_live_t = torch.nonzero(unfinished, as_tuple=False).squeeze(-1)
+            if rows_live_t.numel() == 0:
+                break
+            rows_live = rows_live_t.detach().cpu().tolist()
+            states = revealed[rows_live_t].detach().cpu().tolist()
+            rows_by_state: Dict[Tuple[bool, ...], List[int]] = {}
+            for row, bits in zip(rows_live, states):
+                rows_by_state.setdefault(tuple(bool(bit) for bit in bits), []).append(row)
+
+            for rows in rows_by_state.values():
+                representative = rows[0]
+                rows_t = torch.tensor(rows, dtype=torch.long, device=device)
+                active_slots = torch.nonzero(
+                    ~revealed[representative], as_tuple=False,
+                ).squeeze(-1)
+                distribution = evaluator.distribution(
+                    x[representative], revealed[representative], tau,
+                )
+                m = int(active_slots.numel())
+                count = len(rows)
+                uniforms = _draw_uniform(
+                    (m, count), device, rng_device, rng, sample_on_device,
+                )
+                sampled_sorted = torch.searchsorted(
+                    distribution.log_cdf, uniforms.log(), right=False,
+                ).clamp_max(distribution.sorted_logits.shape[-1] - 1)
+                sampled_tokens = distribution.sorted_token_ids.gather(-1, sampled_sorted)
+                sampled_logits = distribution.sorted_logits.gather(-1, sampled_sorted)
+                sampled_confidence = (
+                    sampled_logits - distribution.log_Z_conf.unsqueeze(-1)
+                )
+                qualifies = sampled_confidence >= log_threshold
+                has_qualifying = qualifies.any(dim=0)
+
+                maxima = sampled_confidence.max(dim=0, keepdim=True).values
+                fallback_winners = (
+                    sampled_confidence == maxima
+                ).to(torch.int64).argmax(dim=0)
+                selected = qualifies.transpose(0, 1).contiguous()
+                fallback_columns = torch.nonzero(
+                    ~has_qualifying, as_tuple=False,
+                ).squeeze(-1)
+                if fallback_columns.numel() > 0:
+                    selected[fallback_columns] = False
+                    selected[
+                        fallback_columns, fallback_winners[fallback_columns]
+                    ] = True
+
+                active_targets = masked_target_row[active_slots]
+                correct = sampled_tokens.transpose(0, 1) == active_targets.unsqueeze(0)
+                successful = (~selected | correct).all(dim=1)
+                failed_rows = rows_t[~successful]
+                if failed_rows.numel() > 0:
+                    alive[failed_rows] = False
+
+                successful_selected = selected & successful.unsqueeze(1)
+                row_grid = rows_t.unsqueeze(1).expand(-1, m)
+                slot_grid = active_slots.unsqueeze(0).expand(count, -1)
+                abs_grid = masked_pos_t[active_slots].unsqueeze(0).expand(count, -1)
+                target_grid = active_targets.unsqueeze(0).expand(count, -1)
+                revealed[
+                    row_grid[successful_selected], slot_grid[successful_selected]
+                ] = True
+                x[
+                    row_grid[successful_selected], abs_grid[successful_selected]
+                ] = target_grid[successful_selected]
+
+                if verbose:
+                    selected_cpu = selected.detach().cpu().tolist()
+                    confidence_cpu = sampled_confidence.transpose(0, 1).detach().cpu().tolist()
+                    branch_cpu = has_qualifying.detach().cpu().tolist()
+                    sequence_indices = (
+                        masked_pos_t[active_slots] + 1
+                    ).detach().cpu().tolist()
+                    for local_row, trajectory_row in enumerate(rows):
+                        chosen = [
+                            int(index) for index, flag in zip(
+                                sequence_indices, selected_cpu[local_row],
+                            ) if flag
+                        ]
+                        batch_verbose[trajectory_row]["reveal_path_indices"].extend(chosen)
+                        record = {
+                            "model_step": model_step,
+                            "branch": "threshold" if branch_cpu[local_row] else "fallback",
+                            "revealed_indices": chosen,
+                        }
+                        if verbose_compact:
+                            record.update({
+                                "sequence_indices": sequence_indices,
+                                "sampled_log_confidence": confidence_cpu[local_row],
+                            })
+                        batch_verbose[trajectory_row]["steps"].append(record)
+
+        completed = alive & revealed.all(dim=1)
+        hits += int(completed.sum().item())
+        if verbose:
+            flags = completed.detach().cpu().tolist()
+            for row, flag in enumerate(flags):
+                batch_verbose[row]["is_hit"] = bool(flag)
+            if verbose_callback is None:
+                verbose_samples.extend(batch_verbose)
+            else:
+                verbose_callback(batch_verbose)
+
+    estimate, se, wald, wilson = _safe_wald_and_wilson(hits, num_samples)
+    return MonteCarloResult(
+        estimate=estimate,
+        standard_error=se,
+        wald_ci=wald,
+        wilson_ci=wilson,
+        hits=hits,
+        num_samples=num_samples,
+        verbose_samples=(
+            verbose_samples if verbose and verbose_callback is None else None
+        ),
+    )
+
 
 def _duel_state_scores(
     model, x_row, active_abs_positions, active_target_ids, attention_mask,

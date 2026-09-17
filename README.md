@@ -83,6 +83,26 @@ or mutable evaluation behavior are unsupported. CUDA operations that require a
 deterministic cuBLAS workspace need `CUBLAS_WORKSPACE_CONFIG=:4096:8` set before
 starting Python; unsupported deterministic operations raise a PyTorch error.
 
+The same two estimators are available for fast-dLLM threshold remasking with
+`--remasking fast-dllm --confidence-threshold VALUE`. A threshold step reveals
+every sampled candidate whose untempered confidence is at least the threshold;
+when none qualifies, the smallest-index maximum-confidence candidate is the
+fallback. Both estimators support variable-size masked sets and positive sampling
+temperatures with full-vocabulary decoding. For example, in PowerShell:
+
+```powershell
+$mask = 51..100
+python .\sliding_window_extraction.py .\texts\book.txt --model-family llada --mode path_sampling --remasking fast-dllm --decoding-scheme full --temperature 1 --confidence-threshold 0.9 --masked_indexes $mask --num-samples 1000
+python .\sliding_window_extraction.py .\texts\book.txt --model-family llada --mode monte-carlo --remasking fast-dllm --decoding-scheme full --temperature 1 --confidence-threshold 0.9 --masked_indexes $mask --num-samples 100000
+```
+
+Threshold STS computes the threshold and fallback success masses in FP64 log
+space. It samples a nonempty successful threshold subset by first sampling its
+lowest selected index and then sampling later indicators independently, avoiding
+empty-subset rejection. Direct MC samples candidates from the same shared CDF,
+applies the same threshold comparison and fallback tie rule, and terminates a
+trajectory as soon as any revealed candidate is incorrect.
+
 Exact low-confidence subset DP uses this same state evaluator and FP64
 distribution calculation. Its `state_batch_size` only chunks state scheduling;
 model forward batch size is always one. With 10 masked positions, it evaluates
