@@ -1,0 +1,108 @@
+{
+  "configuration": {
+    "model": "GSAI-ML/LLaDA-8B-Base",
+    "text": "texts/MITLicense.txt",
+    "window_kind": "mit-suffix",
+    "window_token_offset": 0,
+    "visible_positions": [
+      1,
+      50
+    ],
+    "masked_positions": [
+      51,
+      100
+    ],
+    "temperature": 1.0,
+    "confidence_threshold": 0.9,
+    "seed": 1729,
+    "device": "NVIDIA A100-SXM4-80GB",
+    "torch": "2.11.0+cu128",
+    "model_load_seconds": 9.996745430999908
+  },
+  "runs": {
+    "sts_baseline": {
+      "estimate": 0.9998112692372443,
+      "log_estimate": -0.00018874857464723505,
+      "standard_error": 1.2949556473231443e-05,
+      "ci95": [
+        0.9997858881065568,
+        0.9998366503679318
+      ],
+      "relative_standard_error": 1.2952000914243201e-05,
+      "samples": 500,
+      "seconds": 11.37945085199999,
+      "samples_per_second": 43.938851400032426,
+      "model_forward_calls": 152,
+      "state_cache_hits": 2944,
+      "state_cache_misses": 152,
+      "peak_incremental_memory_gib": 0.3533935546875
+    },
+    "mc_baseline": {
+      "samples": 5000,
+      "estimate": 1.0,
+      "standard_error": 0.0,
+      "ci95_wald": [
+        1.0,
+        1.0
+      ],
+      "ci95_wilson": [
+        0.9992322698624194,
+        1.0
+      ],
+      "relative_standard_error": 0.0,
+      "hits": 5000,
+      "seconds": 34.44548350600007,
+      "samples_per_second": 145.15691147517344,
+      "model_forward_calls": 483,
+      "peak_incremental_memory_gib": 0.3729867935180664
+    },
+    "sts_large": {
+      "estimate": 0.9998009681531443,
+      "log_estimate": -0.00019905165632216892,
+      "standard_error": 5.160640882947838e-06,
+      "ci95": [
+        0.9997908532970138,
+        0.9998110830092749
+      ],
+      "relative_standard_error": 5.161668219306383e-06,
+      "samples": 5000,
+      "seconds": 43.337570443000004,
+      "samples_per_second": 115.37333424300468,
+      "model_forward_calls": 506,
+      "state_cache_hits": 30327,
+      "state_cache_misses": 506,
+      "peak_incremental_memory_gib": 0.36515188217163086
+    },
+    "mc_large": {
+      "samples": 50000,
+      "estimate": 0.99976,
+      "standard_error": 6.927371795999086e-05,
+      "ci95_wald": [
+        0.9996242235127984,
+        0.9998957764872015
+      ],
+      "ci95_wilson": [
+        0.9995805097331444,
+        0.9998627010460851
+      ],
+      "relative_standard_error": 6.929034764342527e-05,
+      "hits": 49988,
+      "seconds": 201.5346079630001,
+      "samples_per_second": 248.0963468526435,
+      "model_forward_calls": 2836,
+      "peak_incremental_memory_gib": 0.4057145118713379
+    }
+  },
+  "agreement_baseline": {
+    "absolute_difference": 0.00018873076275571776,
+    "combined_standard_error": 1.2949556473231443e-05,
+    "difference_in_combined_se": 14.574303231608807,
+    "ci_overlap": true
+  },
+  "agreement_large": {
+    "absolute_difference": 4.096815314436064e-05,
+    "combined_standard_error": 6.946567651958132e-05,
+    "difference_in_combined_se": 0.5897610906130359,
+    "ci_overlap": true
+  }
+}

@@ -3980,7 +3980,7 @@ def compute_diffusion_probabilistic_extraction(
                 and remasking == 'low-confidence'
             )
             or (
-                estimation_method in {'path_sampling', 'monte-carlo'}
+                estimation_method in {'exact', 'path_sampling', 'monte-carlo'}
                 and remasking == 'fast-dllm'
             )
         )
@@ -4079,10 +4079,10 @@ def compute_diffusion_probabilistic_extraction(
             raise ValueError(
                 'remasking="fast-dllm" only supports decoding_scheme="full".'
             )
-        if estimation_method not in {'path_sampling', 'monte-carlo'}:
+        if estimation_method not in {'exact', 'path_sampling', 'monte-carlo'}:
             raise ValueError(
                 'remasking="fast-dllm" supports estimation_method '
-                '"path_sampling" or "monte-carlo".'
+                '"exact", "path_sampling", or "monte-carlo".'
             )
         if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
             raise ValueError('fast-dLLM requires finite temperature > 0.')
@@ -4091,8 +4091,27 @@ def compute_diffusion_probabilistic_extraction(
             or not 0.0 <= float(confidence_threshold) <= 1.0
         ):
             raise ValueError('confidence_threshold must be finite and in [0, 1].')
-        if num_samples <= 0:
+        if estimation_method != 'exact' and num_samples <= 0:
             raise ValueError('num_samples must be > 0.')
+
+        if estimation_method == 'exact':
+            result = _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
+                model=model,
+                sequence_tokens=sequence_tokens,
+                masked_indexes=normalized_masked_indexes,
+                steps=steps,
+                attention_mask=attention_mask,
+                mask_id=mask_id,
+                temperature=temperature,
+                confidence_threshold=confidence_threshold,
+            )
+            return {
+                **result,
+                'method': 'exact',
+                'remasking': 'fast-dllm',
+                'decoding_scheme': 'full',
+                'k': None,
+            }
 
         common = dict(
             model=model,
@@ -5218,7 +5237,7 @@ def _prepare_fast_dllm_inputs(
     attention_mask,
     temperature,
     confidence_threshold,
-    num_samples,
+    num_samples: Optional[int],
 ):
     """Validate and canonicalize the shared fast-dLLM estimator inputs."""
     device = _model_device(model)
@@ -5249,7 +5268,7 @@ def _prepare_fast_dllm_inputs(
     threshold = float(confidence_threshold)
     if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
         raise ValueError("confidence_threshold must be finite and in [0, 1].")
-    if int(num_samples) <= 0:
+    if num_samples is not None and int(num_samples) <= 0:
         raise ValueError("num_samples must be positive.")
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
@@ -6843,6 +6862,229 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
         "probability_dtype_after_logits":
             "float64",
     }
+
+
+def _enumerate_fast_dllm_successful_transition_logs(
+    masses: _FastDLLMSuccessMasses,
+) -> List[Tuple[int, float]]:
+    """Return ``(global subset bits, log alpha_B)`` for every nonempty B.
+
+    Threshold transitions use
+
+        alpha_B = prod_{i in B} r_i prod_{j not in B} ell_j.
+
+    A singleton also receives the mutually exclusive no-token-qualified
+    fallback mass.  Direct summation from FP64 log factors avoids divisions,
+    ``inf - inf``, and assumptions that every factor is strictly positive.
+    """
+    active_slots = [int(slot) for slot in masses.active_slots.detach().cpu().tolist()]
+    log_ell, log_r, log_fallback = [
+        [float(value) for value in row]
+        for row in torch.stack((
+            masses.log_ell,
+            masses.log_r,
+            masses.log_alpha_fallback,
+        )).detach().cpu().tolist()
+    ]
+    m = len(active_slots)
+    transitions: List[Tuple[int, float]] = []
+    for local_subset in range(1, 1 << m):
+        factors = [
+            log_r[local_slot]
+            if local_subset & (1 << local_slot)
+            else log_ell[local_slot]
+            for local_slot in range(m)
+        ]
+        log_threshold = (
+            -math.inf if any(value == -math.inf for value in factors)
+            else math.fsum(factors)
+        )
+        if local_subset & (local_subset - 1) == 0:
+            local_slot = local_subset.bit_length() - 1
+            log_transition = _logaddexp_scalar(
+                log_threshold, log_fallback[local_slot],
+            )
+        else:
+            log_transition = log_threshold
+
+        global_subset = 0
+        remaining = local_subset
+        while remaining:
+            bit = remaining & -remaining
+            local_slot = bit.bit_length() - 1
+            global_subset |= 1 << active_slots[local_slot]
+            remaining ^= bit
+        transitions.append((global_subset, log_transition))
+    return transitions
+
+
+@torch.inference_mode()
+@_low_confidence_eval_mode
+def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
+    model,
+    sequence_tokens: torch.Tensor,
+    masked_indexes: list[int],
+    steps: int,
+    attention_mask: Optional[torch.Tensor],
+    mask_id: int,
+    temperature: float,
+    confidence_threshold: float,
+    state_batch_size: int = 64,
+    max_masked: int = MAX_EXACT_LOW_CONFIDENCE_MASKED,
+    evaluate_all_states: bool = False,
+) -> Dict[str, object]:
+    """Exact subset DP for fast-dLLM threshold remasking.
+
+    ``DP[S]`` is the probability of reaching the correctly revealed subset S.
+    From S, the recurrence considers every nonempty successful reveal subset B:
+
+        DP[S union B] += DP[S] * alpha_B(S).
+
+    ``alpha_B`` exactly combines the threshold branch and, for singleton B,
+    the mutually exclusive fallback branch.  Its factors come from the same
+    FP64 distribution and transition-mass routine used by fast-dLLM STS.
+
+    There are at most ``2**m - 1`` model evaluations and
+    ``3**m - 2**m`` subset transitions.  Exactly unreachable states are skipped
+    unless ``evaluate_all_states`` is enabled; no positive mass is pruned.
+    """
+    (
+        device, sequence_tokens, attention_mask, masked_pos_t,
+        masked_target_row, tau, threshold,
+    ) = _prepare_fast_dllm_inputs(
+        model, sequence_tokens, masked_indexes, steps, attention_mask,
+        temperature, confidence_threshold, None,
+    )
+    masked_len = int(masked_pos_t.numel())
+    if masked_len > max_masked:
+        raise ValueError(
+            f"masked_len={masked_len} exceeds max_masked={max_masked}; "
+            "exact fast-dLLM DP is exponential."
+        )
+    if state_batch_size <= 0:
+        raise ValueError("state_batch_size must be positive.")
+
+    num_states = 1 << masked_len
+    full_state = num_states - 1
+    bit_values = torch.bitwise_left_shift(
+        torch.ones(masked_len, dtype=torch.int64, device=device),
+        torch.arange(masked_len, dtype=torch.int64, device=device),
+    )
+    evaluator = _LowConfidenceStateEvaluator(
+        model, attention_mask, masked_pos_t, use_cache=False,
+    )
+    masked_positions_1based = [
+        int(position) + 1 for position in masked_pos_t.detach().cpu().tolist()
+    ]
+    log_dp = [-math.inf] * num_states
+    log_dp[0] = 0.0
+    num_transition_subsets = 0
+    num_finite_transition_subsets = 0
+
+    for batch_start in range(0, full_state, state_batch_size):
+        batch_stop = min(batch_start + state_batch_size, full_state)
+        for state in range(batch_start, batch_stop):
+            base = log_dp[state]
+            if base == -math.inf and not evaluate_all_states:
+                continue
+
+            revealed = torch.bitwise_and(state, bit_values) != 0
+            x_row = sequence_tokens[0].clone()
+            x_row[masked_pos_t] = torch.where(
+                revealed,
+                masked_target_row,
+                torch.full_like(masked_target_row, int(mask_id)),
+            )
+            active_slots = torch.nonzero(~revealed, as_tuple=False).squeeze(-1)
+            positions = [
+                masked_positions_1based[slot]
+                for slot in range(masked_len)
+                if state & (1 << slot)
+            ]
+            context = f"revealed_count={len(positions)}, revealed_indices={positions}"
+            distribution = evaluator.distribution(x_row, revealed, tau)
+            masses = _fast_dllm_success_masses(
+                distribution=distribution,
+                active_slots=active_slots,
+                active_target_ids=masked_target_row[active_slots],
+                temperature=tau,
+                confidence_threshold=threshold,
+                context=context,
+            )
+            transitions = _enumerate_fast_dllm_successful_transition_logs(masses)
+            num_transition_subsets += len(transitions)
+            finite_transitions = [
+                value for _, value in transitions if value != -math.inf
+            ]
+            num_finite_transition_subsets += len(finite_transitions)
+
+            enumerated_log_A = -math.inf
+            for log_transition in finite_transitions:
+                enumerated_log_A = _logaddexp_scalar(
+                    enumerated_log_A, log_transition,
+                )
+            analytic_log_A = float(masses.log_A.item())
+            if not (
+                (enumerated_log_A == analytic_log_A == -math.inf)
+                or (
+                    math.isfinite(enumerated_log_A)
+                    and math.isfinite(analytic_log_A)
+                    and math.isclose(
+                        enumerated_log_A, analytic_log_A,
+                        rel_tol=0.0, abs_tol=1e-10,
+                    )
+                )
+            ):
+                raise FloatingPointError(
+                    "Enumerated fast-dLLM transition mass disagrees with "
+                    f"analytic A(S) in {context}: enumerated={enumerated_log_A}, "
+                    f"analytic={analytic_log_A}."
+                )
+
+            del distribution, masses, x_row, revealed, active_slots
+            if base == -math.inf:
+                continue
+            for subset_bits, log_transition in transitions:
+                if log_transition == -math.inf:
+                    continue
+                next_state = state | subset_bits
+                log_dp[next_state] = _logaddexp_scalar(
+                    log_dp[next_state], base + log_transition,
+                )
+
+    log_probability = float(log_dp[full_state])
+    _check_low_confidence_log_mass(
+        torch.tensor(log_probability, dtype=torch.float64),
+        "final fast-dLLM DP probability", "full revealed subset",
+    )
+    probability = 0.0 if log_probability == -math.inf else math.exp(log_probability)
+    return {
+        "probability": float(probability),
+        "log_probability": log_probability,
+        "estimation_method": "exact_fast_dllm_threshold_subset_dp",
+        "decoding_scheme": "full",
+        "temperature": tau,
+        "confidence_threshold": threshold,
+        "masked_indexes": [int(index) for index in masked_indexes],
+        "num_masked": masked_len,
+        "num_dp_states": num_states,
+        "num_nonterminal_states": full_state,
+        "max_transition_subsets": 3 ** masked_len - 2 ** masked_len,
+        "num_transition_subsets_evaluated": num_transition_subsets,
+        "num_finite_transition_subsets": num_finite_transition_subsets,
+        "state_batch_size": state_batch_size,
+        "model_forward_calls": evaluator.forward_rows,
+        "num_evaluated_states": evaluator.forward_rows,
+        "num_skipped_unreachable_states": full_state - evaluator.forward_rows,
+        "evaluate_all_states": bool(evaluate_all_states),
+        "model_forward_batch_size": 1,
+        "model_eval_mode": True,
+        "tie_breaking": "smallest_index_among_max_confidence",
+        "model_forward_dtype": "native",
+        "probability_dtype_after_logits": "float64",
+    }
+
+
 @torch.no_grad()
 def compute_autoregressive_probabilistic_extraction(
     model,
@@ -6899,6 +7141,7 @@ def compute_probabilistic_extraction(
     random_path_sample_budget: Optional[int] = DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
     stratified_random_paths: bool = True,
     random_path_step_budget: Optional[int] = DEFAULT_RANDOM_PATH_STEP_BUDGET,
+    confidence_threshold: float = 0.9,
 ):
     model_family = model_family.lower()
     if model_family in AUTOREGRESSIVE_MODEL_FAMILIES:
@@ -6937,5 +7180,6 @@ def compute_probabilistic_extraction(
             random_path_sample_budget=random_path_sample_budget,
             stratified_random_paths=stratified_random_paths,
             random_path_step_budget=random_path_step_budget,
+            confidence_threshold=confidence_threshold,
         )
     raise ValueError("model_family must be one of {'llada', 'llama', 'llama2', 'olmo', 'mistral'}")

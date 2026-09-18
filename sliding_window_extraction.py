@@ -147,7 +147,9 @@ def parse_args() -> argparse.Namespace:
         help=(
             '1-indexed positions in the 100-token sequence to mask. Exact '
             f'low-confidence LLaDA supports 1-{MAX_EXACT_LOW_CONFIDENCE_MASKED}; '
-            'low-confidence path sampling and fast-dLLM support 1-100; other '
+            'exact low-confidence/fast-dLLM support '
+            f'1-{MAX_EXACT_LOW_CONFIDENCE_MASKED}; sampled low-confidence and '
+            'fast-dLLM support 1-100; other '
             'partially masked modes require exactly 50.'
         ),
     )
@@ -416,7 +418,7 @@ def main() -> None:
     use_partially_masked_fast_dllm = (
         args.model_family == 'llada'
         and args.remasking == 'fast-dllm'
-        and args.mode in {'path_sampling', 'monte-carlo'}
+        and args.mode in {'exact', 'path_sampling', 'monte-carlo'}
         and args.masked_indexes is not None
     )
     args.masked_indexes = validate_masked_indexes(
@@ -432,11 +434,13 @@ def main() -> None:
         ),
     )
     if (
-        use_exact_low_confidence_dp
+        (use_exact_low_confidence_dp or (
+            use_partially_masked_fast_dllm and args.mode == 'exact'
+        ))
         and len(args.masked_indexes) > MAX_EXACT_LOW_CONFIDENCE_MASKED
     ):
         raise ValueError(
-            'Exact low-confidence DP supports at most '
+            'Exact subset DP supports at most '
             f'{MAX_EXACT_LOW_CONFIDENCE_MASKED} masked positions; got '
             f'{len(args.masked_indexes)}.'
         )
@@ -514,9 +518,10 @@ def main() -> None:
         if decoding_scheme.lower() not in {'full', 'top_k'}:
             raise ValueError("--decoding-scheme must be one of {'full', 'top_k'} when --remasking random.")
     if args.model_family == 'llada' and args.remasking == 'fast-dllm':
-        if args.mode not in {'path_sampling', 'monte-carlo'}:
+        if args.mode not in {'exact', 'path_sampling', 'monte-carlo'}:
             raise ValueError(
-                "--remasking fast-dllm requires --mode path_sampling or monte-carlo."
+                "--remasking fast-dllm requires --mode exact, path_sampling, "
+                "or monte-carlo."
             )
         if args.masked_indexes is None:
             raise ValueError("--remasking fast-dllm requires --masked_indexes.")

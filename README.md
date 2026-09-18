@@ -96,6 +96,19 @@ python .\sliding_window_extraction.py .\texts\book.txt --model-family llada --mo
 python .\sliding_window_extraction.py .\texts\book.txt --model-family llada --mode monte-carlo --remasking fast-dllm --decoding-scheme full --temperature 1 --confidence-threshold 0.9 --masked_indexes $mask --num-samples 100000
 ```
 
+For a 90-visible/10-masked window, `--mode exact` uses the fast-dLLM subset DP
+without the sampled estimators' historical 50-index requirement:
+
+```powershell
+$mask = 91..100
+python .\sliding_window_extraction.py .\texts\book.txt --model-family llada --mode exact --remasking fast-dllm --decoding-scheme full --temperature 1 --confidence-threshold 0.9 --masked_indexes $mask
+```
+
+The exact recurrence evaluates at most `2^m - 1` model states and
+`3^m - 2^m` successful reveal-subset transitions. It shares the FP64
+threshold and fallback transition masses used by STS, accumulates the DP in
+log space, and skips only states with exactly zero incoming probability.
+
 Threshold STS computes the threshold and fallback success masses in FP64 log
 space. It samples a nonempty successful threshold subset by first sampling its
 lowest selected index and then sampling later indicators independently, avoiding
