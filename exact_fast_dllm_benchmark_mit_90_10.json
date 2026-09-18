@@ -1,0 +1,138 @@
+{
+  "configuration": {
+    "model": "GSAI-ML/LLaDA-8B-Base",
+    "text": "texts/MITLicense.txt",
+    "window_token_offset": 0,
+    "visible_positions": [
+      1,
+      90
+    ],
+    "masked_positions": [
+      91,
+      100
+    ],
+    "temperature": 1.0,
+    "confidence_threshold": 0.9,
+    "seed": 1729,
+    "device": "NVIDIA A100-SXM4-80GB",
+    "torch": "2.11.0+cu128",
+    "model_load_seconds": 9.934321009000087
+  },
+  "runs": {
+    "exact": {
+      "probability": 0.9999663704678624,
+      "log_probability": -3.363009762301448e-05,
+      "estimation_method": "exact_fast_dllm_threshold_subset_dp",
+      "decoding_scheme": "full",
+      "temperature": 1.0,
+      "confidence_threshold": 0.9,
+      "masked_indexes": [
+        91,
+        92,
+        93,
+        94,
+        95,
+        96,
+        97,
+        98,
+        99,
+        100
+      ],
+      "num_masked": 10,
+      "num_dp_states": 1024,
+      "num_nonterminal_states": 1023,
+      "max_transition_subsets": 58025,
+      "num_transition_subsets_evaluated": 58025,
+      "num_finite_transition_subsets": 58025,
+      "state_batch_size": 64,
+      "model_forward_calls": 1023,
+      "num_evaluated_states": 1023,
+      "num_skipped_unreachable_states": 0,
+      "evaluate_all_states": false,
+      "model_forward_batch_size": 1,
+      "model_eval_mode": true,
+      "tie_breaking": "smallest_index_among_max_confidence",
+      "model_forward_dtype": "native",
+      "probability_dtype_after_logits": "float64",
+      "seconds": 58.45352080599969,
+      "measured_model_forward_calls": 1023,
+      "peak_incremental_memory_gib": 0.05709648132324219
+    },
+    "sts_baseline": {
+      "estimate": 0.9999795174652704,
+      "log_estimate": -2.0482744499616956e-05,
+      "standard_error": 8.00858723855707e-06,
+      "ci95": [
+        0.9999638206342828,
+        0.9999952142962579
+      ],
+      "samples": 500,
+      "seconds": 0.3070343720000892,
+      "samples_per_second": 1628.482168764658,
+      "model_forward_calls": 5,
+      "state_cache_hits": 505,
+      "state_cache_misses": 5,
+      "peak_incremental_memory_gib": 0.062408447265625,
+      "absolute_error_vs_exact": 1.3146997407953442e-05,
+      "error_in_standard_errors": 1.641612561159061
+    },
+    "mc_baseline": {
+      "estimate": 1.0,
+      "standard_error": 0.0,
+      "ci95_wald": [
+        1.0,
+        1.0
+      ],
+      "ci95_wilson": [
+        0.9992322698624194,
+        1.0
+      ],
+      "hits": 5000,
+      "samples": 5000,
+      "seconds": 0.7341890190000413,
+      "samples_per_second": 6810.235335322713,
+      "model_forward_calls": 13,
+      "peak_incremental_memory_gib": 0.06796979904174805,
+      "absolute_error_vs_exact": 3.3629532137591234e-05,
+      "error_in_standard_errors": null
+    },
+    "sts_large": {
+      "estimate": 0.9999622474872804,
+      "log_estimate": -3.7753225363701404e-05,
+      "standard_error": 3.386577790853944e-06,
+      "ci95": [
+        0.9999556097948102,
+        0.9999688851797505
+      ],
+      "samples": 5000,
+      "seconds": 0.8590139400002954,
+      "samples_per_second": 5820.627311354552,
+      "model_forward_calls": 14,
+      "state_cache_hits": 5160,
+      "state_cache_misses": 14,
+      "peak_incremental_memory_gib": 0.06281709671020508,
+      "absolute_error_vs_exact": 4.122980582055291e-06,
+      "error_in_standard_errors": 1.217447475498757
+    },
+    "mc_large": {
+      "estimate": 0.99992,
+      "standard_error": 3.9998399967990964e-05,
+      "ci95_wald": [
+        0.9998416031360627,
+        0.9999983968639373
+      ],
+      "ci95_wilson": [
+        0.999794296555348,
+        0.9999688896395303
+      ],
+      "hits": 49996,
+      "samples": 50000,
+      "seconds": 1.284592070999679,
+      "samples_per_second": 38922.86207331922,
+      "model_forward_calls": 20,
+      "peak_incremental_memory_gib": 0.08151817321777344,
+      "absolute_error_vs_exact": 4.637046786237775e-05,
+      "error_in_standard_errors": 1.1593080698099445
+    }
+  }
+}
