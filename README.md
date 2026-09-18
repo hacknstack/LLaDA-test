@@ -108,6 +108,10 @@ The exact recurrence evaluates at most `2^m - 1` model states and
 `3^m - 2^m` successful reveal-subset transitions. It shares the FP64
 threshold and fallback transition masses used by STS, accumulates the DP in
 log space, and skips only states with exactly zero incoming probability.
+Independent states on the same revealed-count frontier are model-batched, and
+standard LLaDA models project only active positions through the vocabulary
+head. FP64 sorting, CDF construction, and transition-mass calculations are
+also vectorized across each state batch.
 
 Threshold STS computes the threshold and fallback success masses in FP64 log
 space. It samples a nonempty successful threshold subset by first sampling its

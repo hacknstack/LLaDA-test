@@ -1,0 +1,103 @@
+{
+  "configuration": {
+    "model": "GSAI-ML/LLaDA-8B-Base",
+    "text": "texts/MITLicense.txt",
+    "window_token_offset": 0,
+    "visible_positions": [
+      1,
+      90
+    ],
+    "masked_positions": [
+      91,
+      100
+    ],
+    "temperature": 1.0,
+    "confidence_threshold": 0.9,
+    "seed": 1729,
+    "device": "NVIDIA A100-SXM4-80GB",
+    "torch": "2.11.0+cu128",
+    "model_load_seconds": 9.580738329999804
+  },
+  "runs": {
+    "exact": {
+      "probability": 0.9999680967794569,
+      "log_probability": -3.1903729461667404e-05,
+      "estimation_method": "exact_fast_dllm_threshold_subset_dp",
+      "decoding_scheme": "full",
+      "temperature": 1.0,
+      "confidence_threshold": 0.9,
+      "masked_indexes": [
+        91,
+        92,
+        93,
+        94,
+        95,
+        96,
+        97,
+        98,
+        99,
+        100
+      ],
+      "num_masked": 10,
+      "num_dp_states": 1024,
+      "num_nonterminal_states": 1023,
+      "max_transition_subsets": 58025,
+      "num_transition_subsets_evaluated": 58025,
+      "num_finite_transition_subsets": 58025,
+      "state_batch_size": 64,
+      "model_forward_calls": 21,
+      "model_forward_rows": 1023,
+      "num_evaluated_states": 1023,
+      "num_skipped_unreachable_states": 0,
+      "evaluate_all_states": false,
+      "model_forward_batch_size": 64,
+      "maximum_model_batch": 64,
+      "selected_logits": true,
+      "model_eval_mode": true,
+      "tie_breaking": "smallest_index_among_max_confidence",
+      "model_forward_dtype": "native",
+      "probability_dtype_after_logits": "float64",
+      "seconds": 8.552360677999786,
+      "measured_model_forward_calls": 21,
+      "peak_incremental_memory_gib": 2.321723461151123
+    },
+    "sts_baseline": {
+      "estimate": 0.9999678499646563,
+      "log_estimate": -3.215055216720941e-05,
+      "standard_error": 9.839873575023968e-07,
+      "ci95": [
+        0.9999659213494355,
+        0.999969778579877
+      ],
+      "samples": 50000,
+      "seconds": 1.8986662280003657,
+      "samples_per_second": 26334.27574716959,
+      "model_forward_calls": 18,
+      "state_cache_hits": 51670,
+      "state_cache_misses": 18,
+      "peak_incremental_memory_gib": 0.06281709671020508,
+      "absolute_error_vs_exact": 2.468148005974058e-07,
+      "error_in_standard_errors": 0.25083127208451417
+    },
+    "mc_baseline": {
+      "estimate": 0.999966,
+      "standard_error": 8.246071064449845e-06,
+      "ci95_wald": [
+        0.9999498377007137,
+        0.9999821622992864
+      ],
+      "ci95_wilson": [
+        0.9999455462385439,
+        0.9999787711429408
+      ],
+      "hits": 499983,
+      "samples": 500000,
+      "seconds": 4.553016089999801,
+      "samples_per_second": 109817.31452656076,
+      "model_forward_calls": 39,
+      "peak_incremental_memory_gib": 0.08152055740356445,
+      "absolute_error_vs_exact": 2.0967794568393927e-06,
+      "error_in_standard_errors": 0.25427618079583986
+    }
+  }
+}

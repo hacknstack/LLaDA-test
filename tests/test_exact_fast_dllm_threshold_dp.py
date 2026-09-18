@@ -9,7 +9,7 @@ import torch
 
 from test_fast_dllm_threshold_alignment import (
     MASK_ID, MC, POSITIONS, STS, ToyModel, enumerate_successful_subsets,
-    exact_probability, pe,
+    exact_probability, pe, toy_logits,
 )
 
 
@@ -37,6 +37,48 @@ class ConstantLogitsModel(torch.nn.Module):
         assert not torch.is_autocast_enabled("cpu")
         self.calls += 1
         return SimpleNamespace(logits=self.row.expand(1, 100, -1).clone())
+
+
+class _ToyTransformer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ln_f = torch.nn.Identity()
+
+
+class LLaDAModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.transformer = _ToyTransformer()
+
+
+class BatchToyModel(torch.nn.Module):
+    """Batch-independent toy with the standard LLaDA projection structure."""
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("anchor", torch.zeros((), dtype=torch.float32))
+        self.config = SimpleNamespace(model_type="llada")
+        self.model = LLaDAModel()
+        self.calls = []
+
+    @property
+    def device(self):
+        return self.anchor.device
+
+    def forward(self, tokens, attention_mask=None):
+        assert not self.training
+        batch_size = tokens.shape[0]
+        hidden = torch.zeros((batch_size, 100, 3), dtype=torch.float32)
+        states = []
+        for row in range(batch_size):
+            state = tuple(
+                slot for slot, position in enumerate(POSITIONS)
+                if tokens[row, position] != MASK_ID
+            )
+            states.append(state)
+            for slot, position in enumerate(POSITIONS):
+                hidden[row, position] = torch.tensor(toy_logits(state, slot))
+        self.calls.append(tuple(states))
+        return SimpleNamespace(logits=self.model.transformer.ln_f(hidden))
 
 
 class ExactFastDLLMThresholdDPTests(unittest.TestCase):
@@ -77,12 +119,12 @@ class ExactFastDLLMThresholdDPTests(unittest.TestCase):
                 self.assertLessEqual(result["model_forward_calls"], 7)
 
     def test_every_dp_subset_transition_matches_exhaustive_enumeration(self):
-        original = pe._enumerate_fast_dllm_successful_transition_logs
+        original = pe._enumerate_fast_dllm_transition_logs_from_lists
         model = ToyModel()
         observed_states = set()
 
-        def observe(masses):
-            transitions = original(masses)
+        def observe(active_slots, log_ell, log_r, log_fallback):
+            transitions = original(active_slots, log_ell, log_r, log_fallback)
             state = model.calls[-1]
             expected = enumerate_successful_subsets(state, 1.0, 0.6)
             for subset_bits, log_mass in transitions:
@@ -98,7 +140,7 @@ class ExactFastDLLMThresholdDPTests(unittest.TestCase):
             return transitions
 
         with patch.object(
-            pe, "_enumerate_fast_dllm_successful_transition_logs", side_effect=observe,
+            pe, "_enumerate_fast_dllm_transition_logs_from_lists", side_effect=observe,
         ):
             result = DP(**self.args(model))
         self.assertEqual(len(observed_states), result["model_forward_calls"])
@@ -125,6 +167,27 @@ class ExactFastDLLMThresholdDPTests(unittest.TestCase):
         mc_se = math.sqrt(exact * (1.0 - exact) / 40000)
         self.assertLess(abs(sts["probability"] - exact), 6 * sts_se + 1e-12)
         self.assertLess(abs(mc.estimate - exact), 6 * mc_se + 1e-12)
+
+    def test_frontier_batching_matches_singleton_forwards_exactly(self):
+        singleton = DP(
+            **self.args(BatchToyModel()),
+            state_batch_size=1,
+            use_selected_logits=False,
+        )
+        batched_model = BatchToyModel()
+        batched = DP(
+            **self.args(batched_model),
+            state_batch_size=64,
+            use_selected_logits=True,
+        )
+        self.assertEqual(batched["log_probability"], singleton["log_probability"])
+        self.assertEqual(batched["probability"], singleton["probability"])
+        self.assertEqual(singleton["model_forward_calls"], 7)
+        self.assertEqual(batched["model_forward_calls"], 3)
+        self.assertEqual(batched["model_forward_rows"], 7)
+        self.assertEqual(batched["maximum_model_batch"], 3)
+        self.assertTrue(batched["selected_logits"])
+        self.assertEqual(len(batched_model.calls), 3)
 
     def test_log_space_preserves_tiny_probability_and_skips_unreachable_states(self):
         target_probability = 10 ** (-100 / 55)

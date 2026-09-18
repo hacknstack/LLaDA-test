@@ -1545,7 +1545,7 @@ class _LowConfidenceDistribution:
 
 
 def _low_confidence_distribution(logits_native, temperature, context):
-    """Canonical FP64 arithmetic for ONE state's [remaining, vocabulary] logits."""
+    """Canonical row-wise FP64 arithmetic for ``[rows, vocabulary]`` logits."""
     if logits_native.ndim != 2 or logits_native.shape[-1] == 0:
         raise ValueError(f"Expected nonempty [remaining, vocabulary] logits ({context}).")
     logits = logits_native.to(torch.float64)
@@ -5422,6 +5422,129 @@ def _draw_uniform(shape, device, rng_device, rng, sample_on_device):
     ).to(device)
 
 
+def _fast_dllm_success_masses_batched(
+    distribution: _LowConfidenceDistribution,
+    active_slots: torch.Tensor,
+    active_target_ids: torch.Tensor,
+    temperature: float,
+    confidence_threshold: float,
+    context: str,
+) -> _FastDLLMSuccessMasses:
+    """Vectorized equivalent of ``_fast_dllm_success_masses`` for exact DP.
+
+    The flattened distribution has ``batch * remaining`` independent rows;
+    returned per-position fields have shape ``[batch, remaining]`` and totals
+    have shape ``[batch]``.
+    """
+    batch_size, remaining = active_target_ids.shape
+    vocab_size = distribution.logits.shape[-1]
+    logits = distribution.logits.view(batch_size, remaining, vocab_size)
+    log_z_sample = distribution.log_Z_sample.view(batch_size, remaining)
+    log_z_conf = distribution.log_Z_conf.view(batch_size, remaining)
+    sorted_logits = distribution.sorted_logits.view(
+        batch_size, remaining, vocab_size,
+    )
+    log_cdf = distribution.log_cdf.view(batch_size, remaining, vocab_size)
+
+    target_logits = logits.gather(
+        -1, active_target_ids.unsqueeze(-1),
+    ).squeeze(-1)
+    target_sample_logs = target_logits / temperature - log_z_sample
+    target_confidence_logs = target_logits - log_z_conf
+    _check_low_confidence_log_mass(
+        target_sample_logs, "fast-dLLM target probabilities", context,
+    )
+
+    log_threshold = (
+        -math.inf if confidence_threshold == 0.0
+        else math.log(confidence_threshold)
+    )
+    sorted_log_confidence = sorted_logits - log_z_conf.unsqueeze(-1)
+    threshold_values = torch.full(
+        (batch_size, remaining, 1), log_threshold,
+        dtype=torch.float64, device=logits.device,
+    )
+    below_idx = torch.searchsorted(
+        sorted_log_confidence, threshold_values, right=False,
+    ).squeeze(-1)
+    below_gather = (below_idx - 1).clamp(min=0, max=vocab_size - 1)
+    log_ell = log_cdf.gather(-1, below_gather.unsqueeze(-1)).squeeze(-1)
+    log_ell.masked_fill_(below_idx == 0, -math.inf)
+    log_ell.masked_fill_(below_idx == vocab_size, 0.0)
+
+    target_qualifies = target_confidence_logs >= log_threshold
+    log_r = target_sample_logs.masked_fill(~target_qualifies, -math.inf)
+    log_good = torch.logaddexp(log_ell, log_r)
+    prefix_low = torch.zeros_like(log_ell)
+    suffix_good = torch.zeros_like(log_good)
+    if remaining > 1:
+        prefix_low[:, 1:] = torch.cumsum(log_ell, dim=1)[:, :-1]
+        suffix_good[:, :-1] = torch.flip(
+            torch.cumsum(torch.flip(log_good, dims=[1]), dim=1), dims=[1],
+        )[:, 1:]
+    log_first_threshold = prefix_low + log_r + suffix_good
+    log_A_threshold = torch.logsumexp(log_first_threshold, dim=1)
+
+    target_values = target_confidence_logs.unsqueeze(1).expand(
+        -1, remaining, -1,
+    ).contiguous()
+    left_idx = torch.searchsorted(
+        sorted_log_confidence, target_values, right=False,
+    )
+    right_idx = torch.searchsorted(
+        sorted_log_confidence, target_values, right=True,
+    )
+    left_gather = (left_idx - 1).clamp(min=0, max=vocab_size - 1)
+    right_gather = (right_idx - 1).clamp(min=0, max=vocab_size - 1)
+    log_less = log_cdf.gather(-1, left_gather).clone()
+    log_less_equal = log_cdf.gather(-1, right_gather).clone()
+    log_less.masked_fill_(left_idx == 0, -math.inf)
+    log_less.masked_fill_(left_idx == vocab_size, 0.0)
+    log_less_equal.masked_fill_(right_idx == 0, -math.inf)
+    log_less_equal.masked_fill_(right_idx == vocab_size, 0.0)
+
+    competitor = torch.arange(remaining, device=logits.device).view(1, -1, 1)
+    proposed = torch.arange(remaining, device=logits.device).view(1, 1, -1)
+    factors = torch.where(
+        competitor < proposed,
+        log_less,
+        torch.where(
+            competitor > proposed,
+            log_less_equal,
+            torch.zeros((), dtype=torch.float64, device=logits.device),
+        ),
+    )
+    log_win = factors.sum(dim=1)
+    log_alpha_fallback = target_sample_logs + log_win
+    log_alpha_fallback.masked_fill_(target_qualifies, -math.inf)
+    log_A_fallback = torch.logsumexp(log_alpha_fallback, dim=1)
+    log_A = torch.logaddexp(log_A_threshold, log_A_fallback)
+
+    _check_low_confidence_log_mass(log_ell, "fast-dLLM below-threshold masses", context)
+    _check_low_confidence_log_mass(log_r, "fast-dLLM selected-target masses", context)
+    _check_low_confidence_log_mass(
+        log_alpha_fallback, "fast-dLLM fallback transition masses", context,
+    )
+    _check_low_confidence_log_mass(log_A, "fast-dLLM A(S)", context)
+    threshold_bernoulli = torch.zeros_like(log_r)
+    finite_good = torch.isfinite(log_good)
+    threshold_bernoulli[finite_good] = torch.exp(
+        log_r[finite_good] - log_good[finite_good]
+    )
+    threshold_bernoulli.clamp_(0.0, 1.0)
+    return _FastDLLMSuccessMasses(
+        active_slots=active_slots,
+        log_ell=log_ell,
+        log_r=log_r,
+        log_alpha_fallback=log_alpha_fallback,
+        log_first_threshold=log_first_threshold,
+        threshold_bernoulli=threshold_bernoulli,
+        log_A_threshold=log_A_threshold,
+        log_A_fallback=log_A_fallback,
+        log_A=log_A,
+    )
+
+
 def _draw_from_log_weights(log_weights, count, device, rng, sample_on_device):
     probabilities = torch.softmax(log_weights, dim=0)
     if sample_on_device:
@@ -6886,6 +7009,18 @@ def _enumerate_fast_dllm_successful_transition_logs(
             masses.log_alpha_fallback,
         )).detach().cpu().tolist()
     ]
+    return _enumerate_fast_dllm_transition_logs_from_lists(
+        active_slots, log_ell, log_r, log_fallback,
+    )
+
+
+def _enumerate_fast_dllm_transition_logs_from_lists(
+    active_slots: List[int],
+    log_ell: List[float],
+    log_r: List[float],
+    log_fallback: List[float],
+) -> List[Tuple[int, float]]:
+    """CPU subset enumeration after one batched device-to-host transfer."""
     m = len(active_slots)
     transitions: List[Tuple[int, float]] = []
     for local_subset in range(1, 1 << m):
@@ -6932,6 +7067,7 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
     state_batch_size: int = 64,
     max_masked: int = MAX_EXACT_LOW_CONFIDENCE_MASKED,
     evaluate_all_states: bool = False,
+    use_selected_logits: bool = True,
 ) -> Dict[str, object]:
     """Exact subset DP for fast-dLLM threshold remasking.
 
@@ -6944,7 +7080,12 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
     the mutually exclusive fallback branch.  Its factors come from the same
     FP64 distribution and transition-mass routine used by fast-dLLM STS.
 
-    There are at most ``2**m - 1`` model evaluations and
+    States are processed by revealed-count frontier, so independent states can
+    share one model call without violating DP dependencies.  Standard LLaDA
+    models also project only each state's active positions through the vocabulary
+    head.  Unknown architectures retain singleton full-logit forwards.
+
+    There are at most ``2**m - 1`` evaluated model rows and
     ``3**m - 2**m`` subset transitions.  Exactly unreachable states are skipped
     unless ``evaluate_all_states`` is enabled; no positive mass is pruned.
     """
@@ -6970,9 +7111,10 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
         torch.ones(masked_len, dtype=torch.int64, device=device),
         torch.arange(masked_len, dtype=torch.int64, device=device),
     )
-    evaluator = _LowConfidenceStateEvaluator(
-        model, attention_mask, masked_pos_t, use_cache=False,
+    projection_layer = (
+        _random_remasking_projection_layer(model) if use_selected_logits else None
     )
+    model_state_batch_size = state_batch_size if projection_layer is not None else 1
     masked_positions_1based = [
         int(position) + 1 for position in masked_pos_t.detach().cpu().tolist()
     ]
@@ -6980,77 +7122,153 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
     log_dp[0] = 0.0
     num_transition_subsets = 0
     num_finite_transition_subsets = 0
+    model_forward_calls = 0
+    model_forward_rows = 0
+    maximum_model_batch = 0
 
-    for batch_start in range(0, full_state, state_batch_size):
-        batch_stop = min(batch_start + state_batch_size, full_state)
-        for state in range(batch_start, batch_stop):
-            base = log_dp[state]
-            if base == -math.inf and not evaluate_all_states:
+    # A transition always adds at least one revealed bit. Consequently all
+    # incoming mass for frontier k is complete after frontiers < k finish.
+    for revealed_count in range(masked_len):
+        frontier = [
+            state for state in range(full_state)
+            if state.bit_count() == revealed_count
+            and (evaluate_all_states or log_dp[state] != -math.inf)
+        ]
+        for batch_start in range(0, len(frontier), model_state_batch_size):
+            states = frontier[batch_start:batch_start + model_state_batch_size]
+            if not states:
                 continue
-
-            revealed = torch.bitwise_and(state, bit_values) != 0
-            x_row = sequence_tokens[0].clone()
-            x_row[masked_pos_t] = torch.where(
-                revealed,
-                masked_target_row,
-                torch.full_like(masked_target_row, int(mask_id)),
+            batch_size = len(states)
+            states_t = torch.tensor(states, dtype=torch.int64, device=device)
+            revealed_batch = (
+                torch.bitwise_and(states_t.unsqueeze(1), bit_values.unsqueeze(0)) != 0
             )
-            active_slots = torch.nonzero(~revealed, as_tuple=False).squeeze(-1)
-            positions = [
-                masked_positions_1based[slot]
-                for slot in range(masked_len)
-                if state & (1 << slot)
-            ]
-            context = f"revealed_count={len(positions)}, revealed_indices={positions}"
-            distribution = evaluator.distribution(x_row, revealed, tau)
-            masses = _fast_dllm_success_masses(
-                distribution=distribution,
-                active_slots=active_slots,
-                active_target_ids=masked_target_row[active_slots],
+            x_batch = sequence_tokens.expand(batch_size, -1).clone()
+            x_batch[:, masked_pos_t] = torch.where(
+                revealed_batch,
+                masked_target_row.unsqueeze(0).expand(batch_size, -1),
+                torch.full(
+                    (batch_size, masked_len), int(mask_id),
+                    dtype=sequence_tokens.dtype, device=device,
+                ),
+            )
+            remaining_count = masked_len - revealed_count
+            active_slots_batch = torch.nonzero(
+                ~revealed_batch, as_tuple=False,
+            )[:, 1].view(batch_size, remaining_count)
+            active_abs_batch = masked_pos_t[active_slots_batch]
+            batch_attention_mask = (
+                None if attention_mask is None
+                else attention_mask.expand(batch_size, -1).contiguous()
+            )
+            autocast = (
+                torch.autocast(device_type=device.type, enabled=False)
+                if device.type in {"cpu", "cuda"} else nullcontext()
+            )
+            with autocast:
+                logits_batch = _random_remasking_forward_logits(
+                    model,
+                    x_batch.contiguous(),
+                    batch_attention_mask,
+                    active_abs_batch,
+                    projection_layer=projection_layer,
+                )
+            if projection_layer is None:
+                gather_indices = active_abs_batch.unsqueeze(-1).expand(
+                    -1, -1, logits_batch.shape[-1],
+                )
+                logits_batch = logits_batch.gather(1, gather_indices)
+            logits_batch = logits_batch.contiguous()
+            # Sorting and CDF construction dominate once model states are
+            # batched. Flatten the independent [state, active-position] rows
+            # so one set of GPU kernels builds every distribution in this
+            # frontier chunk; individual state views below preserve exactly
+            # the same row-wise FP64 arithmetic.
+            batch_context = (
+                f"batched revealed_count={revealed_count}, "
+                f"states={states[0]}..{states[-1]}"
+            )
+            flat_distribution = _low_confidence_distribution(
+                logits_batch.view(-1, logits_batch.shape[-1]),
+                tau,
+                batch_context,
+            )
+            batch_masses = _fast_dllm_success_masses_batched(
+                distribution=flat_distribution,
+                active_slots=active_slots_batch,
+                active_target_ids=masked_target_row[active_slots_batch],
                 temperature=tau,
                 confidence_threshold=threshold,
-                context=context,
+                context=batch_context,
             )
-            transitions = _enumerate_fast_dllm_successful_transition_logs(masses)
-            num_transition_subsets += len(transitions)
-            finite_transitions = [
-                value for _, value in transitions if value != -math.inf
-            ]
-            num_finite_transition_subsets += len(finite_transitions)
+            active_slots_cpu = active_slots_batch.detach().cpu().tolist()
+            mass_components_cpu = torch.stack((
+                batch_masses.log_ell,
+                batch_masses.log_r,
+                batch_masses.log_alpha_fallback,
+            )).detach().cpu().tolist()
+            analytic_log_A_cpu = batch_masses.log_A.detach().cpu().tolist()
+            model_forward_calls += 1
+            model_forward_rows += batch_size
+            maximum_model_batch = max(maximum_model_batch, batch_size)
 
-            enumerated_log_A = -math.inf
-            for log_transition in finite_transitions:
-                enumerated_log_A = _logaddexp_scalar(
-                    enumerated_log_A, log_transition,
+            for row, state in enumerate(states):
+                base = log_dp[state]
+                positions = [
+                    masked_positions_1based[slot]
+                    for slot in range(masked_len)
+                    if state & (1 << slot)
+                ]
+                context = (
+                    f"revealed_count={revealed_count}, revealed_indices={positions}"
                 )
-            analytic_log_A = float(masses.log_A.item())
-            if not (
-                (enumerated_log_A == analytic_log_A == -math.inf)
-                or (
-                    math.isfinite(enumerated_log_A)
-                    and math.isfinite(analytic_log_A)
-                    and math.isclose(
-                        enumerated_log_A, analytic_log_A,
-                        rel_tol=0.0, abs_tol=1e-10,
+                transitions = _enumerate_fast_dllm_transition_logs_from_lists(
+                    [int(value) for value in active_slots_cpu[row]],
+                    [float(value) for value in mass_components_cpu[0][row]],
+                    [float(value) for value in mass_components_cpu[1][row]],
+                    [float(value) for value in mass_components_cpu[2][row]],
+                )
+                num_transition_subsets += len(transitions)
+                finite_transitions = [
+                    value for _, value in transitions if value != -math.inf
+                ]
+                num_finite_transition_subsets += len(finite_transitions)
+
+                enumerated_log_A = -math.inf
+                for log_transition in finite_transitions:
+                    enumerated_log_A = _logaddexp_scalar(
+                        enumerated_log_A, log_transition,
                     )
-                )
-            ):
-                raise FloatingPointError(
-                    "Enumerated fast-dLLM transition mass disagrees with "
-                    f"analytic A(S) in {context}: enumerated={enumerated_log_A}, "
-                    f"analytic={analytic_log_A}."
-                )
+                analytic_log_A = float(analytic_log_A_cpu[row])
+                if not (
+                    (enumerated_log_A == analytic_log_A == -math.inf)
+                    or (
+                        math.isfinite(enumerated_log_A)
+                        and math.isfinite(analytic_log_A)
+                        and math.isclose(
+                            enumerated_log_A, analytic_log_A,
+                            rel_tol=0.0, abs_tol=1e-10,
+                        )
+                    )
+                ):
+                    raise FloatingPointError(
+                        "Enumerated fast-dLLM transition mass disagrees with "
+                        f"analytic A(S) in {context}: enumerated={enumerated_log_A}, "
+                        f"analytic={analytic_log_A}."
+                    )
 
-            del distribution, masses, x_row, revealed, active_slots
-            if base == -math.inf:
-                continue
-            for subset_bits, log_transition in transitions:
-                if log_transition == -math.inf:
-                    continue
-                next_state = state | subset_bits
-                log_dp[next_state] = _logaddexp_scalar(
-                    log_dp[next_state], base + log_transition,
-                )
+                if base != -math.inf:
+                    for subset_bits, log_transition in transitions:
+                        if log_transition == -math.inf:
+                            continue
+                        next_state = state | subset_bits
+                        log_dp[next_state] = _logaddexp_scalar(
+                            log_dp[next_state], base + log_transition,
+                        )
+            del batch_masses, flat_distribution, logits_batch, x_batch
+            del revealed_batch, active_slots_batch, active_slots_cpu
+            del mass_components_cpu, analytic_log_A_cpu
+            del active_abs_batch, states_t
 
     log_probability = float(log_dp[full_state])
     _check_low_confidence_log_mass(
@@ -7073,11 +7291,14 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
         "num_transition_subsets_evaluated": num_transition_subsets,
         "num_finite_transition_subsets": num_finite_transition_subsets,
         "state_batch_size": state_batch_size,
-        "model_forward_calls": evaluator.forward_rows,
-        "num_evaluated_states": evaluator.forward_rows,
-        "num_skipped_unreachable_states": full_state - evaluator.forward_rows,
+        "model_forward_calls": model_forward_calls,
+        "model_forward_rows": model_forward_rows,
+        "num_evaluated_states": model_forward_rows,
+        "num_skipped_unreachable_states": full_state - model_forward_rows,
         "evaluate_all_states": bool(evaluate_all_states),
-        "model_forward_batch_size": 1,
+        "model_forward_batch_size": model_state_batch_size,
+        "maximum_model_batch": maximum_model_batch,
+        "selected_logits": projection_layer is not None,
         "model_eval_mode": True,
         "tie_breaking": "smallest_index_among_max_confidence",
         "model_forward_dtype": "native",
