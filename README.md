@@ -108,10 +108,13 @@ The exact recurrence evaluates at most `2^m - 1` model states and
 `3^m - 2^m` successful reveal-subset transitions. It shares the FP64
 threshold and fallback transition masses used by STS, accumulates the DP in
 log space, and skips only states with exactly zero incoming probability.
-Independent states on the same revealed-count frontier are model-batched, and
-standard LLaDA models project only active positions through the vocabulary
-head. FP64 sorting, CDF construction, and transition-mass calculations are
-also vectorized across each state batch.
+By default, each state uses the same singleton full-logit model forward,
+FP64 distribution, and transition-mass routine as STS. This avoids changing
+LLaDA's bfloat16 logits through a different model batch shape. The faster
+frontier-batched, selected-position LLaDA path remains an explicit opt-in via
+`use_selected_logits=True` in the Python API or `--use-selected-logits` in
+`benchmark_exact_fast_dllm_colab.py`; its results may differ when logits
+depend on batch shape. The CLI's `--mode exact` uses singleton forwards.
 
 Threshold STS computes the threshold and fallback success masses in FP64 log
 space. It samples a nonempty successful threshold subset by first sampling its

@@ -81,6 +81,15 @@ class BatchToyModel(torch.nn.Module):
         return SimpleNamespace(logits=self.model.transformer.ln_f(hidden))
 
 
+class BatchSensitiveToyModel(BatchToyModel):
+    """Simulate reduced-precision logits changing with model batch shape."""
+    def forward(self, tokens, attention_mask=None):
+        output = super().forward(tokens, attention_mask=attention_mask)
+        if tokens.shape[0] > 1:
+            output.logits[..., 0] += 0.1
+        return output
+
+
 class ExactFastDLLMThresholdDPTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -169,10 +178,9 @@ class ExactFastDLLMThresholdDPTests(unittest.TestCase):
         self.assertLess(abs(mc.estimate - exact), 6 * mc_se + 1e-12)
 
     def test_frontier_batching_matches_singleton_forwards_exactly(self):
+        singleton_model = BatchToyModel()
         singleton = DP(
-            **self.args(BatchToyModel()),
-            state_batch_size=1,
-            use_selected_logits=False,
+            **self.args(singleton_model),
         )
         batched_model = BatchToyModel()
         batched = DP(
@@ -183,11 +191,29 @@ class ExactFastDLLMThresholdDPTests(unittest.TestCase):
         self.assertEqual(batched["log_probability"], singleton["log_probability"])
         self.assertEqual(batched["probability"], singleton["probability"])
         self.assertEqual(singleton["model_forward_calls"], 7)
+        self.assertEqual(singleton["model_forward_batch_size"], 1)
+        self.assertEqual(singleton["maximum_model_batch"], 1)
+        self.assertFalse(singleton["selected_logits"])
+        self.assertTrue(all(len(call) == 1 for call in singleton_model.calls))
         self.assertEqual(batched["model_forward_calls"], 3)
         self.assertEqual(batched["model_forward_rows"], 7)
         self.assertEqual(batched["maximum_model_batch"], 3)
         self.assertTrue(batched["selected_logits"])
         self.assertEqual(len(batched_model.calls), 3)
+
+    def test_default_preserves_singleton_decoder_for_batch_sensitive_model(self):
+        singleton_model = BatchSensitiveToyModel()
+        exact = DP(**self.args(singleton_model))
+        batched = DP(
+            **self.args(BatchSensitiveToyModel()),
+            use_selected_logits=True,
+        )
+        self.assertEqual(exact["model_forward_batch_size"], 1)
+        self.assertTrue(all(len(call) == 1 for call in singleton_model.calls))
+        self.assertAlmostEqual(
+            exact["probability"], exact_probability(1.0, 0.6), places=14,
+        )
+        self.assertNotEqual(batched["probability"], exact["probability"])
 
     def test_log_space_preserves_tiny_probability_and_skips_unreachable_states(self):
         target_probability = 10 ** (-100 / 55)

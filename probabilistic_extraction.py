@@ -7067,7 +7067,7 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
     state_batch_size: int = 64,
     max_masked: int = MAX_EXACT_LOW_CONFIDENCE_MASKED,
     evaluate_all_states: bool = False,
-    use_selected_logits: bool = True,
+    use_selected_logits: bool = False,
 ) -> Dict[str, object]:
     """Exact subset DP for fast-dLLM threshold remasking.
 
@@ -7080,10 +7080,11 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
     the mutually exclusive fallback branch.  Its factors come from the same
     FP64 distribution and transition-mass routine used by fast-dLLM STS.
 
-    States are processed by revealed-count frontier, so independent states can
-    share one model call without violating DP dependencies.  Standard LLaDA
-    models also project only each state's active positions through the vocabulary
-    head.  Unknown architectures retain singleton full-logit forwards.
+    By default each state uses the same singleton full-logit model forward,
+    FP64 distribution, and successful-transition routine as fast-dLLM STS.
+    This avoids batch-shape-dependent bfloat16 logits changing the decoder
+    being measured.  ``use_selected_logits=True`` explicitly opts into the
+    faster frontier-batched LLaDA path for batch-independent models.
 
     There are at most ``2**m - 1`` evaluated model rows and
     ``3**m - 2**m`` subset transitions.  Exactly unreachable states are skipped
@@ -7126,6 +7127,52 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
     model_forward_rows = 0
     maximum_model_batch = 0
 
+    def advance_state(state, transitions, analytic_log_A, context):
+        nonlocal num_transition_subsets, num_finite_transition_subsets
+        num_transition_subsets += len(transitions)
+        finite_transitions = [
+            value for _, value in transitions if value != -math.inf
+        ]
+        num_finite_transition_subsets += len(finite_transitions)
+
+        enumerated_log_A = -math.inf
+        for log_transition in finite_transitions:
+            enumerated_log_A = _logaddexp_scalar(
+                enumerated_log_A, log_transition,
+            )
+        if not (
+            (enumerated_log_A == analytic_log_A == -math.inf)
+            or (
+                math.isfinite(enumerated_log_A)
+                and math.isfinite(analytic_log_A)
+                and math.isclose(
+                    enumerated_log_A, analytic_log_A,
+                    rel_tol=0.0, abs_tol=1e-10,
+                )
+            )
+        ):
+            raise FloatingPointError(
+                "Enumerated fast-dLLM transition mass disagrees with "
+                f"analytic A(S) in {context}: enumerated={enumerated_log_A}, "
+                f"analytic={analytic_log_A}."
+            )
+
+        base = log_dp[state]
+        if base != -math.inf:
+            for subset_bits, log_transition in transitions:
+                if log_transition == -math.inf:
+                    continue
+                next_state = state | subset_bits
+                log_dp[next_state] = _logaddexp_scalar(
+                    log_dp[next_state], base + log_transition,
+                )
+
+    singleton_evaluator = (
+        _LowConfidenceStateEvaluator(
+            model, attention_mask, masked_pos_t, use_cache=False,
+        ) if projection_layer is None else None
+    )
+
     # A transition always adds at least one revealed bit. Consequently all
     # incoming mass for frontier k is complete after frontiers < k finish.
     for revealed_count in range(masked_len):
@@ -7134,6 +7181,38 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
             if state.bit_count() == revealed_count
             and (evaluate_all_states or log_dp[state] != -math.inf)
         ]
+        if singleton_evaluator is not None:
+            for state in frontier:
+                revealed = torch.bitwise_and(state, bit_values) != 0
+                x_row = sequence_tokens[0].clone()
+                x_row[masked_pos_t] = torch.where(
+                    revealed,
+                    masked_target_row,
+                    torch.full_like(masked_target_row, int(mask_id)),
+                )
+                active_slots = torch.nonzero(
+                    ~revealed, as_tuple=False,
+                ).squeeze(-1)
+                context = singleton_evaluator.context(revealed)
+                distribution = singleton_evaluator.distribution(
+                    x_row, revealed, tau,
+                )
+                masses = _fast_dllm_success_masses(
+                    distribution=distribution,
+                    active_slots=active_slots,
+                    active_target_ids=masked_target_row[active_slots],
+                    temperature=tau,
+                    confidence_threshold=threshold,
+                    context=context,
+                )
+                transitions = _enumerate_fast_dllm_successful_transition_logs(
+                    masses,
+                )
+                advance_state(state, transitions, float(masses.log_A.item()), context)
+                model_forward_calls += 1
+                model_forward_rows += 1
+                maximum_model_batch = 1
+            continue
         for batch_start in range(0, len(frontier), model_state_batch_size):
             states = frontier[batch_start:batch_start + model_state_batch_size]
             if not states:
@@ -7213,7 +7292,6 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
             maximum_model_batch = max(maximum_model_batch, batch_size)
 
             for row, state in enumerate(states):
-                base = log_dp[state]
                 positions = [
                     masked_positions_1based[slot]
                     for slot in range(masked_len)
@@ -7228,43 +7306,9 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
                     [float(value) for value in mass_components_cpu[1][row]],
                     [float(value) for value in mass_components_cpu[2][row]],
                 )
-                num_transition_subsets += len(transitions)
-                finite_transitions = [
-                    value for _, value in transitions if value != -math.inf
-                ]
-                num_finite_transition_subsets += len(finite_transitions)
-
-                enumerated_log_A = -math.inf
-                for log_transition in finite_transitions:
-                    enumerated_log_A = _logaddexp_scalar(
-                        enumerated_log_A, log_transition,
-                    )
-                analytic_log_A = float(analytic_log_A_cpu[row])
-                if not (
-                    (enumerated_log_A == analytic_log_A == -math.inf)
-                    or (
-                        math.isfinite(enumerated_log_A)
-                        and math.isfinite(analytic_log_A)
-                        and math.isclose(
-                            enumerated_log_A, analytic_log_A,
-                            rel_tol=0.0, abs_tol=1e-10,
-                        )
-                    )
-                ):
-                    raise FloatingPointError(
-                        "Enumerated fast-dLLM transition mass disagrees with "
-                        f"analytic A(S) in {context}: enumerated={enumerated_log_A}, "
-                        f"analytic={analytic_log_A}."
-                    )
-
-                if base != -math.inf:
-                    for subset_bits, log_transition in transitions:
-                        if log_transition == -math.inf:
-                            continue
-                        next_state = state | subset_bits
-                        log_dp[next_state] = _logaddexp_scalar(
-                            log_dp[next_state], base + log_transition,
-                        )
+                advance_state(
+                    state, transitions, float(analytic_log_A_cpu[row]), context,
+                )
             del batch_masses, flat_distribution, logits_batch, x_batch
             del revealed_batch, active_slots_batch, active_slots_cpu
             del mass_components_cpu, analytic_log_A_cpu

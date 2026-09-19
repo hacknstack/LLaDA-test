@@ -31,6 +31,10 @@ def parse_args():
     parser.add_argument("--large-mc-samples", type=int, default=50000)
     parser.add_argument("--exact-reference", type=float, default=None)
     parser.add_argument("--state-batch-size", type=int, default=64)
+    parser.add_argument(
+        "--use-selected-logits", action="store_true",
+        help="Opt into faster frontier-batched exact forwards; default matches STS singleton forwards.",
+    )
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument(
         "--output", type=Path, default=Path("exact_fast_dllm_benchmark_mit_90_10.json"),
@@ -118,6 +122,7 @@ def main():
             "masked_positions": [91, 100],
             "temperature": args.temperature,
             "confidence_threshold": args.confidence_threshold,
+            "exact_use_selected_logits": args.use_selected_logits,
             "seed": args.seed,
             "device": torch.cuda.get_device_name(0),
             "torch": torch.__version__,
@@ -137,6 +142,7 @@ def main():
         started = time.perf_counter()
         exact = _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
             **common, state_batch_size=args.state_batch_size,
+            use_selected_logits=args.use_selected_logits,
         )
         sync()
         elapsed = time.perf_counter() - started
