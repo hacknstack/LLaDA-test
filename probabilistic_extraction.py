@@ -1,5 +1,6 @@
 import math
 import secrets
+import time
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -27,6 +28,15 @@ class MonteCarloResult:
     hits: int
     num_samples: int
     verbose_samples: Optional[List[Dict[str, object]]] = None
+    sample_log_probabilities: Optional[List[float]] = None
+    sample_wall_time_seconds: Optional[List[float]] = None
+
+
+def _synchronize_for_wall_time(device: torch.device) -> None:
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    elif device.type == 'mps':
+        torch.mps.synchronize()
 
 
 def validate_masked_indexes(
@@ -2029,6 +2039,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     verbose: bool = False,
     verbose_compact: bool = False,
     use_state_cache: bool = True,
+    return_sample_times: bool = False,
 ) -> Dict[str, object]:
     """
     Fast successful-trajectory estimator for low-confidence remasking.
@@ -2264,6 +2275,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
     sample_log_probabilities: List[float] = []
     sample_probabilities: List[float] = []
+    sample_wall_time_seconds: List[float] = []
     verbose_samples: List[Dict[str, object]] = []
 
     running_log_sum = torch.tensor(
@@ -3120,6 +3132,10 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
             num_samples - batch_start,
         )
 
+        if return_sample_times:
+            _synchronize_for_wall_time(device)
+            batch_started = time.perf_counter()
+
         # A state only appears at its corresponding reveal count. All its
         # occurrences in this batch are grouped at that step, so only LATER
         # batches can reuse it. Logits are useful only for verbose cache hits:
@@ -3377,6 +3393,12 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                 .tolist()
             )
 
+        if return_sample_times:
+            _synchronize_for_wall_time(device)
+            sample_wall_time_seconds.extend(
+                [time.perf_counter() - batch_started] * bsz
+            )
+
     # ==================================================================
     # Arithmetic Monte Carlo mean
     #
@@ -3448,6 +3470,9 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         result["sample_probabilities"] = None
         result["sample_log_probabilities"] = None
 
+    result["sample_wall_time_seconds"] = (
+        sample_wall_time_seconds if return_sample_times else None
+    )
     result['verbose_samples'] = verbose_samples if verbose else None
 
     return result
@@ -3932,6 +3957,8 @@ def compute_diffusion_probabilistic_extraction(
     stratified_random_paths: bool = True,
     random_path_step_budget: Optional[int] = DEFAULT_RANDOM_PATH_STEP_BUDGET,
     confidence_threshold: float = 0.9,
+    return_sample_logs: bool = False,
+    return_sample_times: bool = False,
 ):
     """
     Compute probabilistic extraction under LLaDA Algorithm-5 style low-confidence remasking.
@@ -3966,6 +3993,12 @@ def compute_diffusion_probabilistic_extraction(
         Untempered candidate-confidence cutoff used by ``remasking='fast-dllm'``.
         Every candidate meeting the cutoff is revealed; if none does, the
         smallest-index maximum-confidence candidate is revealed.
+    return_sample_logs:
+        For partially masked Monte Carlo, include each trajectory's log hit
+        indicator (0 for a hit, -infinity for a miss) without verbose records.
+    return_sample_times:
+        Include each sample's wall clock latency from batch start until the
+        batch results are ready. Samples in one batch share this duration.
     """
     if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
         raise ValueError('prompt_tokens must have shape (1, a).')
@@ -4126,6 +4159,7 @@ def compute_diffusion_probabilistic_extraction(
             confidence_threshold=confidence_threshold,
             verbose=verbose,
             verbose_compact=verbose_compact,
+            return_sample_times=return_sample_times,
         )
         if estimation_method == 'path_sampling':
             result = _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
@@ -4144,6 +4178,7 @@ def compute_diffusion_probabilistic_extraction(
             decoding_scheme='full',
             k=k,
             verbose_callback=verbose_callback,
+            return_sample_logs=return_sample_logs,
         )
         return {
             'method': 'monte-carlo',
@@ -4154,6 +4189,8 @@ def compute_diffusion_probabilistic_extraction(
             'hits': mc.hits,
             'num_samples': mc.num_samples,
             'verbose_samples': mc.verbose_samples,
+            'sample_log_probabilities': mc.sample_log_probabilities,
+            'sample_wall_time_seconds': mc.sample_wall_time_seconds,
             'remasking': 'fast-dllm',
             'decoding_scheme': 'full',
             'k': None,
@@ -4302,6 +4339,7 @@ def compute_diffusion_probabilistic_extraction(
                     temperature=temperature,
                     verbose=verbose,
                     verbose_compact=verbose_compact,
+                    return_sample_times=return_sample_times,
                 )
                 return {
                     'method': 'path_sampling',
@@ -4309,6 +4347,7 @@ def compute_diffusion_probabilistic_extraction(
                     'log_probability': path_sampling_result['log_probability'],
                     'sample_probabilities': path_sampling_result['sample_probabilities'],
                     'sample_log_probabilities': path_sampling_result['sample_log_probabilities'],
+                    'sample_wall_time_seconds': path_sampling_result['sample_wall_time_seconds'],
                     'verbose_samples': path_sampling_result['verbose_samples'],
                     'num_samples': path_sampling_result['num_samples'],
                     'remasking': 'low-confidence',
@@ -4415,6 +4454,8 @@ def compute_diffusion_probabilistic_extraction(
                 verbose=verbose,
                 verbose_compact=verbose_compact,
                 verbose_callback=verbose_callback,
+                return_sample_logs=return_sample_logs,
+                return_sample_times=return_sample_times,
             )
         
     else:
@@ -4443,6 +4484,8 @@ def compute_diffusion_probabilistic_extraction(
         'hits': mc.hits,
         'num_samples': mc.num_samples,
         'verbose_samples': mc.verbose_samples,
+        'sample_log_probabilities': mc.sample_log_probabilities,
+        'sample_wall_time_seconds': mc.sample_wall_time_seconds,
         'decoding_scheme': decoding_scheme,
         'k': k if decoding_scheme == 'top_k' else None,
     }
@@ -4538,6 +4581,8 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     verbose_compact: bool = False,
     verbose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
     use_state_cache: bool = True,
+    return_sample_logs: bool = False,
+    return_sample_times: bool = False,
 ) -> MonteCarloResult:
     """
     Naive Monte Carlo estimator for one-token-per-step low-confidence remasking.
@@ -4719,6 +4764,8 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     )
     hits = 0
     verbose_samples: List[Dict[str, object]] = []
+    sample_log_probabilities: List[float] = []
+    sample_wall_time_seconds: List[float] = []
 
     slot_grid_base = torch.arange(
         masked_len,
@@ -4735,6 +4782,10 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
             mc_batch_size,
             num_samples - batch_start,
         )
+
+        if return_sample_times:
+            _synchronize_for_wall_time(device)
+            batch_started = time.perf_counter()
 
         # A revealed set determines the step, and all occurrences at that step
         # are already grouped below. It can only recur in a LATER batch.
@@ -5182,6 +5233,10 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
         hits += int(
             alive.sum().item()
         )
+        if return_sample_logs:
+            sample_log_probabilities.extend(
+                0.0 if hit else -math.inf for hit in alive.detach().cpu().tolist()
+            )
 
         if verbose:
             hit_flags = alive.detach().cpu().tolist()
@@ -5192,6 +5247,12 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                 verbose_samples.extend(batch_verbose)
             else:
                 verbose_callback(batch_verbose)
+
+        if return_sample_times:
+            _synchronize_for_wall_time(device)
+            sample_wall_time_seconds.extend(
+                [time.perf_counter() - batch_started] * bsz
+            )
 
     # ------------------------------------------------------------------
     # Bernoulli estimate + uncertainty
@@ -5213,6 +5274,10 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
             verbose_samples
             if verbose and verbose_callback is None
             else None
+        ),
+        sample_log_probabilities=(sample_log_probabilities if return_sample_logs else None),
+        sample_wall_time_seconds=(
+            sample_wall_time_seconds if return_sample_times else None
         ),
     )
 
@@ -5626,6 +5691,7 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
     verbose: bool = False,
     verbose_compact: bool = False,
     use_state_cache: bool = True,
+    return_sample_times: bool = False,
 ) -> Dict[str, object]:
     """Successful-trajectory estimator for fast-dLLM threshold remasking."""
     (
@@ -5652,10 +5718,14 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
     running_log_sum = torch.tensor(-math.inf, dtype=torch.float64, device=device)
     sample_logs: List[float] = []
     sample_probs: List[float] = []
+    sample_wall_time_seconds: List[float] = []
     verbose_samples: List[Dict[str, object]] = []
 
     for batch_start in range(0, num_samples, batch_size):
         bsz = min(batch_size, num_samples - batch_start)
+        if return_sample_times:
+            _synchronize_for_wall_time(device)
+            batch_started = time.perf_counter()
         # With variable-size reveals, the same state can be reached after a
         # different number of model steps within this very batch.  Retain it
         # even in the final batch (unlike the singleton-reveal estimator).
@@ -5779,6 +5849,11 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
             for row, value in enumerate(cpu_logs):
                 batch_verbose[row]["sample_log_estimate"] = float(value)
             verbose_samples.extend(batch_verbose)
+        if return_sample_times:
+            _synchronize_for_wall_time(device)
+            sample_wall_time_seconds.extend(
+                [time.perf_counter() - batch_started] * bsz
+            )
 
     log_probability = float((running_log_sum - math.log(num_samples)).item())
     return {
@@ -5786,6 +5861,9 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
         "log_probability": log_probability,
         "sample_probabilities": sample_probs if return_samples else None,
         "sample_log_probabilities": sample_logs if return_samples else None,
+        "sample_wall_time_seconds": (
+            sample_wall_time_seconds if return_sample_times else None
+        ),
         "verbose_samples": verbose_samples if verbose else None,
         "num_samples": num_samples,
         "estimation_method": "path_sampling_fast_dllm_threshold",
@@ -5829,6 +5907,8 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
     verbose_compact: bool = False,
     verbose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
     use_state_cache: bool = True,
+    return_sample_logs: bool = False,
+    return_sample_times: bool = False,
 ) -> MonteCarloResult:
     """Direct decoder Monte Carlo for fast-dLLM threshold remasking."""
     (
@@ -5860,9 +5940,14 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
     )
     hits = 0
     verbose_samples: List[Dict[str, object]] = []
+    sample_log_probabilities: List[float] = []
+    sample_wall_time_seconds: List[float] = []
 
     for batch_start in range(0, num_samples, mc_batch_size):
         bsz = min(mc_batch_size, num_samples - batch_start)
+        if return_sample_times:
+            _synchronize_for_wall_time(device)
+            batch_started = time.perf_counter()
         # Variable-size transitions can revisit a state at a later model step
         # in the same trajectory batch, including the final batch.
         evaluator.cache_writes_enabled = bool(use_state_cache)
@@ -5977,6 +6062,10 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
 
         completed = alive & revealed.all(dim=1)
         hits += int(completed.sum().item())
+        if return_sample_logs:
+            sample_log_probabilities.extend(
+                0.0 if hit else -math.inf for hit in completed.detach().cpu().tolist()
+            )
         if verbose:
             flags = completed.detach().cpu().tolist()
             for row, flag in enumerate(flags):
@@ -5985,6 +6074,11 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
                 verbose_samples.extend(batch_verbose)
             else:
                 verbose_callback(batch_verbose)
+        if return_sample_times:
+            _synchronize_for_wall_time(device)
+            sample_wall_time_seconds.extend(
+                [time.perf_counter() - batch_started] * bsz
+            )
 
     estimate, se, wald, wilson = _safe_wald_and_wilson(hits, num_samples)
     return MonteCarloResult(
@@ -5996,6 +6090,10 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
         num_samples=num_samples,
         verbose_samples=(
             verbose_samples if verbose and verbose_callback is None else None
+        ),
+        sample_log_probabilities=(sample_log_probabilities if return_sample_logs else None),
+        sample_wall_time_seconds=(
+            sample_wall_time_seconds if return_sample_times else None
         ),
     )
 

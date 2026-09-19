@@ -191,18 +191,27 @@ class FastDLLMThresholdAlignmentTests(unittest.TestCase):
             confidence_threshold=0.6,
             masked_indexes=[100, 1, 50],
         )
-        sts = pe.compute_diffusion_probabilistic_extraction(
-            model=ToyModel(), estimation_method="path_sampling", **common,
-        )
-        mc = pe.compute_diffusion_probabilistic_extraction(
-            model=ToyModel(), estimation_method="monte-carlo", **common,
-        )
+        with patch.object(pe.time, 'perf_counter', side_effect=[1.0, 3.0, 5.0, 9.0]):
+            sts = pe.compute_diffusion_probabilistic_extraction(
+                model=ToyModel(), estimation_method="path_sampling",
+                return_sample_times=True, **common,
+            )
+            mc = pe.compute_diffusion_probabilistic_extraction(
+                model=ToyModel(), estimation_method="monte-carlo",
+                return_sample_logs=True, return_sample_times=True, **common,
+            )
         self.assertEqual(sts["method"], "path_sampling")
         self.assertEqual(mc["method"], "monte-carlo")
         self.assertEqual(sts["remasking"], "fast-dllm")
         self.assertEqual(mc["remasking"], "fast-dllm")
         self.assertEqual(sts["confidence_threshold"], 0.6)
         self.assertEqual(mc["confidence_threshold"], 0.6)
+        self.assertEqual(len(mc["sample_log_probabilities"]), 64)
+        self.assertEqual(set(mc["sample_log_probabilities"]), {0.0, -math.inf})
+        self.assertEqual(mc["sample_log_probabilities"].count(0.0), mc["hits"])
+        self.assertIsNone(mc["verbose_samples"])
+        self.assertEqual(sts["sample_wall_time_seconds"], [2.0] * 64)
+        self.assertEqual(mc["sample_wall_time_seconds"], [4.0] * 64)
 
     def test_every_sts_normalizer_matches_exhaustive_transition_mass(self):
         temperature, threshold = 1.0, 0.6

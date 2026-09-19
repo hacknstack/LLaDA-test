@@ -111,8 +111,9 @@ def parse_args() -> argparse.Namespace:
         '--verbosish',
         action='store_true',
         help=(
-            'Write verbosish.jsonl with only per-sample log estimates. Only '
-            'supported by partially masked low-confidence or fast-dLLM path sampling.'
+            'Write verbosish.jsonl with per-sample log estimates and wall clock '
+            'latencies for partially masked low-confidence or fast-dLLM '
+            'path sampling and Monte Carlo.'
         ),
     )
     parser.add_argument(
@@ -380,6 +381,8 @@ def _compute_probability(
         verbose_compact=args.compact,
         verbose_callback=verbose_callback,
         confidence_threshold=args.confidence_threshold,
+        return_sample_logs=args.verbosish,
+        return_sample_times=args.verbosish,
     )
     if args.mode in {'exact', 'path_sampling'} or str(decoding_scheme).lower() == 'elbo':
         probability = float(result['probability'])
@@ -389,12 +392,16 @@ def _compute_probability(
         return probability, []
     if args.verbosish:
         sample_logs = result.get('sample_log_probabilities')
-        if sample_logs is None:
-            raise RuntimeError('Path sampler did not return per-sample log estimates.')
+        sample_times = result.get('sample_wall_time_seconds')
+        if sample_logs is None or sample_times is None:
+            raise RuntimeError('Estimator did not return per-sample logs and times.')
+        if len(sample_logs) != len(sample_times):
+            raise RuntimeError('Per-sample logs and times have different lengths.')
         return probability, [
             {
                 'sample_index': sample_index,
                 'sample_log_estimate': float(sample_log_estimate),
+                'sample_wall_time_seconds': float(sample_times[sample_index]),
             }
             for sample_index, sample_log_estimate in enumerate(sample_logs)
         ]
@@ -595,7 +602,7 @@ def main() -> None:
                 'the supported positive temperature and full decoding.'
             )
     if args.verbosish:
-        valid_verbosish = (
+        valid_path_verbosish = (
             args.model_family == 'llada'
             and args.mode == 'path_sampling'
             and args.remasking in {'low-confidence', 'fast-dllm'}
@@ -606,11 +613,21 @@ def main() -> None:
                 or math.isclose(args.temperature, 1.0, rel_tol=0.0, abs_tol=1e-9)
             )
         )
-        if not valid_verbosish:
+        valid_mc_verbosish = (
+            args.model_family == 'llada'
+            and args.mode == 'monte-carlo'
+            and args.remasking in {'low-confidence', 'fast-dllm'}
+            and args.masked_indexes is not None
+            and decoding_scheme.lower() == 'full'
+            and math.isfinite(args.temperature)
+            and args.temperature > 0.0
+        )
+        if not (valid_path_verbosish or valid_mc_verbosish):
             raise ValueError(
-                '--verbosish requires partially masked LLaDA low-confidence '
-                'path sampling at temperature 1 or fast-dLLM path sampling, '
-                'with full decoding.'
+                '--verbosish requires partially masked LLaDA low-confidence or '
+                'fast-dLLM path sampling/Monte Carlo with full decoding. '
+                'Low-confidence path sampling requires temperature 1; '
+                'Monte Carlo requires finite positive temperature.'
             )
 
     if args.model_family == 'llada' and args.remasking == 'random' and args.masked_indexes is not None:
@@ -804,7 +821,7 @@ def main() -> None:
                 'parallel-arrays' if args.compact else 'candidate-objects'
             ) if args.verbose else None,
             'verbosish_schema': (
-                'sample-index-and-log-estimate'
+                'sample-index-log-estimate-and-wall-time-seconds'
                 if args.verbosish
                 else None
             ),

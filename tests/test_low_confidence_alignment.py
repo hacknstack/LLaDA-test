@@ -142,6 +142,41 @@ class LowConfidenceAlignmentTests(unittest.TestCase):
             temperature=temperature,
         )
 
+    def test_monte_carlo_sample_logs_match_hits(self):
+        with patch.object(pe.time, 'perf_counter', side_effect=[10.0, 12.0, 20.0, 25.0]):
+            result = MC(
+                **self.args(ToyModel(), temperature=0.5),
+                decoding_scheme='full', k=1, return_sample_logs=True,
+                return_sample_times=True, mc_batch_size=32,
+            )
+        logs = result.sample_log_probabilities
+        self.assertEqual(len(logs), 64)
+        self.assertEqual(set(logs), {0.0, -math.inf})
+        self.assertEqual(logs.count(0.0), result.hits)
+        self.assertEqual(result.estimate, result.hits / 64)
+        self.assertIsNone(result.verbose_samples)
+        self.assertEqual(result.sample_wall_time_seconds, [2.0] * 32 + [5.0] * 32)
+
+    def test_path_sampling_batch_latencies(self):
+        with patch.object(pe.time, 'perf_counter', side_effect=[1.0, 3.0, 7.0, 11.0]):
+            result = STS(
+                **self.args(ToyModel(), samples=64),
+                return_sample_times=True, batch_size=32,
+            )
+        self.assertEqual(result['sample_wall_time_seconds'], [2.0] * 32 + [4.0] * 32)
+
+        with patch.object(pe.time, 'perf_counter', side_effect=[20.0, 23.0]):
+            public_result = pe.compute_diffusion_probabilistic_extraction(
+                model=ToyModel(),
+                prompt_tokens=torch.zeros((1, 50), dtype=torch.long),
+                target_tokens=torch.zeros((1, 50), dtype=torch.long),
+                steps=3, mask_id=MASK_ID, remasking='low-confidence',
+                estimation_method='path_sampling', num_samples=64, seed=1729,
+                decoding_scheme='full', temperature=1.0,
+                masked_indexes=[100, 1, 50], return_sample_times=True,
+            )
+        self.assertEqual(public_result['sample_wall_time_seconds'], [3.0] * 64)
+
     def test_both_estimators_agree_with_exhaustive_decoder(self):
         for temperature in (0.5, 1.0, 2.0):
             with self.subTest(temperature=temperature):

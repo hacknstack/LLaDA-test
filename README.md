@@ -45,6 +45,16 @@ estimation, `--verbose` writes one JSONL record per window/sample to
 sampled-confidence tie count, and per-step untempered sampled log-confidences.
 Add `--compact` to store per-step candidate values as parallel arrays instead
 of repeated JSON objects.
+For partially masked LLaDA low-confidence or fast-dLLM path sampling and Monte
+Carlo, `--verbosish` writes `verbosish.jsonl` with `evaluation_index`,
+`window_index`, `sample_index`, `sample_log_estimate`, and
+`sample_wall_time_seconds`. The time is measured from the start of the sample's
+batch until that batch's results are ready. Samples in the same batch share
+the same latency. In Monte Carlo, each sample is a hit (`0` in log space) or
+miss (`"-Infinity"` in JSON). Low-confidence path sampling requires temperature
+1; Monte Carlo accepts any finite positive temperature. Both require full
+decoding.
+
 `--windows` and `--max-windows` are mutually exclusive, and `--compact` requires
 `--verbose`.
 
