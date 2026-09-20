@@ -48,12 +48,14 @@ of repeated JSON objects.
 For partially masked LLaDA low-confidence or fast-dLLM path sampling and Monte
 Carlo, `--verbosish` writes `verbosish.jsonl` with `evaluation_index`,
 `window_index`, `sample_index`, `sample_log_estimate`, and
-`sample_wall_time_seconds`. The time is measured from the start of the sample's
-batch until that batch's results are ready. Samples in the same batch share
-the same latency. In Monte Carlo, each sample is a hit (`0` in log space) or
-miss (`"-Infinity"` in JSON). Low-confidence path sampling requires temperature
-1; Monte Carlo accepts any finite positive temperature. Both require full
-decoding.
+`sample_wall_time_seconds`. With `--verbosish`, the estimators process samples
+one at a time, disable state caching, and time each sample separately. This is
+substantially slower than batched sampling. The times exclude model loading,
+tokenization, and file writing.
+Changing the batch size can also change the sampled paths for the same seed. In
+Monte Carlo, each sample is a hit (`0` in log space) or miss (`"-Infinity"` in
+JSON). Low-confidence path sampling requires temperature 1; Monte Carlo accepts
+any finite positive temperature. Both require full decoding.
 
 `--windows` and `--max-windows` are mutually exclusive, and `--compact` requires
 `--verbose`.

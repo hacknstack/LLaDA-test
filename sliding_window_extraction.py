@@ -111,9 +111,10 @@ def parse_args() -> argparse.Namespace:
         '--verbosish',
         action='store_true',
         help=(
-            'Write verbosish.jsonl with per-sample log estimates and wall clock '
-            'latencies for partially masked low-confidence or fast-dLLM '
-            'path sampling and Monte Carlo.'
+            'Write verbosish.jsonl with per-sample log estimates and individual '
+            'wall clock times for partially masked low-confidence or fast-dLLM '
+            'path sampling and Monte Carlo. Processes samples one at a time '
+            'without state caching.'
         ),
     )
     parser.add_argument(
