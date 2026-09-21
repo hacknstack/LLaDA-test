@@ -2214,10 +2214,6 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         raise ValueError(
             "batch_size must be positive."
         )
-    if return_sample_times:
-        batch_size = 1
-        use_state_cache = False
-
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
 
@@ -3398,7 +3394,9 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
         if return_sample_times:
             _synchronize_for_wall_time(device)
-            sample_wall_time_seconds.append(time.perf_counter() - batch_started)
+            sample_wall_time_seconds.extend(
+                [time.perf_counter() - batch_started] * bsz
+            )
 
     # ==================================================================
     # Arithmetic Monte Carlo mean
@@ -3998,9 +3996,8 @@ def compute_diffusion_probabilistic_extraction(
         For partially masked Monte Carlo, include each trajectory's log hit
         indicator (0 for a hit, -infinity for a miss) without verbose records.
     return_sample_times:
-        Process samples one at a time and include each sample's wall clock
-        duration. This disables trajectory batching and state caching for the
-        supported estimators.
+        Include each sample's wall clock latency from batch start until the
+        batch results are ready. Samples in one batch share this duration.
     """
     if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
         raise ValueError('prompt_tokens must have shape (1, a).')
@@ -4699,10 +4696,6 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
         raise ValueError(
             "mc_batch_size must be positive."
         )
-    if return_sample_times:
-        mc_batch_size = 1
-        use_state_cache = False
-
     if model_batch_size <= 0:
         raise ValueError(
             "model_batch_size must be positive."
@@ -5255,7 +5248,9 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
 
         if return_sample_times:
             _synchronize_for_wall_time(device)
-            sample_wall_time_seconds.append(time.perf_counter() - batch_started)
+            sample_wall_time_seconds.extend(
+                [time.perf_counter() - batch_started] * bsz
+            )
 
     # ------------------------------------------------------------------
     # Bernoulli estimate + uncertainty
@@ -5706,9 +5701,6 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
     )
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
-    if return_sample_times:
-        batch_size = 1
-        use_state_cache = False
     masked_len = int(masked_pos_t.numel())
     rng_device = device if device.type in {"cpu", "cuda"} else torch.device("cpu")
     sample_on_device = device.type in {"cpu", "cuda"}
@@ -5857,7 +5849,9 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
             verbose_samples.extend(batch_verbose)
         if return_sample_times:
             _synchronize_for_wall_time(device)
-            sample_wall_time_seconds.append(time.perf_counter() - batch_started)
+            sample_wall_time_seconds.extend(
+                [time.perf_counter() - batch_started] * bsz
+            )
 
     log_probability = float((running_log_sum - math.log(num_samples)).item())
     return {
@@ -5927,9 +5921,6 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
     _ = k
     if mc_batch_size <= 0 or model_batch_size <= 0:
         raise ValueError("mc_batch_size and model_batch_size must be positive.")
-    if return_sample_times:
-        mc_batch_size = 1
-        use_state_cache = False
     if verbose_compact and not verbose:
         raise ValueError("verbose_compact requires verbose=True.")
     if verbose_callback is not None and not verbose:
@@ -6083,7 +6074,9 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
                 verbose_callback(batch_verbose)
         if return_sample_times:
             _synchronize_for_wall_time(device)
-            sample_wall_time_seconds.append(time.perf_counter() - batch_started)
+            sample_wall_time_seconds.extend(
+                [time.perf_counter() - batch_started] * bsz
+            )
 
     estimate, se, wald, wilson = _safe_wald_and_wilson(hits, num_samples)
     return MonteCarloResult(

@@ -184,20 +184,14 @@ class FastDLLMThresholdAlignmentTests(unittest.TestCase):
             attention_mask=torch.ones((1, 100), dtype=torch.long),
             mask_id=MASK_ID,
             remasking="fast-dllm",
-            num_samples=4,
+            num_samples=64,
             seed=1729,
             decoding_scheme="full",
             temperature=1.0,
             confidence_threshold=0.6,
             masked_indexes=[100, 1, 50],
         )
-        ticks = [
-            1.0, 2.0, 3.0, 5.0, 6.0, 9.0, 10.0, 14.0,
-            15.0, 20.0, 21.0, 27.0, 28.0, 35.0, 36.0, 44.0,
-        ]
-        evaluator_class = pe._LowConfidenceStateEvaluator
-        with patch.object(pe, '_LowConfidenceStateEvaluator', wraps=evaluator_class) as make_evaluator, \
-                patch.object(pe.time, 'perf_counter', side_effect=ticks):
+        with patch.object(pe.time, 'perf_counter', side_effect=[1.0, 3.0, 5.0, 9.0]):
             sts = pe.compute_diffusion_probabilistic_extraction(
                 model=ToyModel(), estimation_method="path_sampling",
                 return_sample_times=True, **common,
@@ -206,24 +200,18 @@ class FastDLLMThresholdAlignmentTests(unittest.TestCase):
                 model=ToyModel(), estimation_method="monte-carlo",
                 return_sample_logs=True, return_sample_times=True, **common,
             )
-        self.assertTrue(all(
-            call.kwargs['use_cache'] is False
-            for call in make_evaluator.call_args_list
-        ))
         self.assertEqual(sts["method"], "path_sampling")
         self.assertEqual(mc["method"], "monte-carlo")
         self.assertEqual(sts["remasking"], "fast-dllm")
         self.assertEqual(mc["remasking"], "fast-dllm")
         self.assertEqual(sts["confidence_threshold"], 0.6)
         self.assertEqual(mc["confidence_threshold"], 0.6)
-        self.assertEqual(len(mc["sample_log_probabilities"]), 4)
-        self.assertTrue(set(mc["sample_log_probabilities"]).issubset({0.0, -math.inf}))
+        self.assertEqual(len(mc["sample_log_probabilities"]), 64)
+        self.assertEqual(set(mc["sample_log_probabilities"]), {0.0, -math.inf})
         self.assertEqual(mc["sample_log_probabilities"].count(0.0), mc["hits"])
         self.assertIsNone(mc["verbose_samples"])
-        self.assertEqual(sts["sample_wall_time_seconds"], [1.0, 2.0, 3.0, 4.0])
-        self.assertEqual(mc["sample_wall_time_seconds"], [5.0, 6.0, 7.0, 8.0])
-        self.assertFalse(sts["state_cache_enabled"])
-        self.assertEqual(sts["state_cache_entries"], 0)
+        self.assertEqual(sts["sample_wall_time_seconds"], [2.0] * 64)
+        self.assertEqual(mc["sample_wall_time_seconds"], [4.0] * 64)
 
     def test_every_sts_normalizer_matches_exhaustive_transition_mass(self):
         temperature, threshold = 1.0, 0.6
