@@ -84,7 +84,17 @@ those later batches; ordinary STS uses the smaller successful-transition cache.
 This removes unnecessary CPU copies and repeated diagnostics. Changing batch
 size changes seeded proposal draws, but preserves the STS estimator formulas.
 
-Both use the same per-state FP64 confidence, normalization, and CDF calculations,
+For partially masked low-confidence and fast-dLLM path sampling, `--fast`
+batches up to eight distinct states per model forward and projects only active
+positions through the LLaDA vocabulary head. Transition probabilities and
+importance weights still use the full vocabulary and FP64 arithmetic. The fast
+path uses an FP64 probability-space CDF scan and vectorizes the low-confidence
+winner calculation. Native model logits can change slightly with batch shape,
+so estimates may differ slightly from the default path. Add `--fast` to either
+path sampling command below; it requires `--masked_indexes`.
+
+By default, both use the same per-state FP64 confidence, normalization, and CDF
+calculations,
 plus a bounded 64 MiB CPU cache of native active logits. `use_state_cache=False`
 disables this cache (and STS's successful-transition cache). Invalid numerical
 values raise `FloatingPointError` with the step and revealed positions; genuine

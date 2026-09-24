@@ -68,6 +68,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--model-name', type=str, default=None)
     parser.add_argument('--num-samples', type=int, default=20, help='Samples for Monte Carlo or path sampling')
     parser.add_argument(
+        '--fast', action='store_true',
+        help='Batch model states for partially masked low-confidence or fast-dLLM path sampling.',
+    )
+    parser.add_argument(
         '--random-path-sample-budget',
         type=int,
         default=DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
@@ -383,6 +387,7 @@ def _compute_probability(
         confidence_threshold=args.confidence_threshold,
         return_sample_logs=args.verbosish,
         return_sample_times=args.verbosish,
+        fast=args.fast,
     )
     if args.mode in {'exact', 'path_sampling'} or str(decoding_scheme).lower() == 'elbo':
         probability = float(result['probability'])
@@ -410,6 +415,12 @@ def _compute_probability(
 
 def main() -> None:
     args = parse_args()
+    if args.fast and not (
+        args.model_family == 'llada' and args.mode == 'path_sampling'
+        and args.remasking in {'low-confidence', 'fast-dllm'}
+        and args.masked_indexes is not None
+    ):
+        raise ValueError('--fast requires LLaDA path_sampling with --masked_indexes and --remasking low-confidence or fast-dllm.')
     use_exact_low_confidence_dp = (
         args.model_family == 'llada'
         and args.mode == 'exact'
@@ -801,6 +812,7 @@ def main() -> None:
             'suffix_tokens': args.suffix_tokens,
             'tau_min': args.tau,
             'mode': args.mode,
+            'fast': args.fast,
             'model_family': args.model_family,
             'model_name': args.model_name,
             'remasking': args.remasking,
