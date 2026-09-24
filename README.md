@@ -85,13 +85,15 @@ This removes unnecessary CPU copies and repeated diagnostics. Changing batch
 size changes seeded proposal draws, but preserves the STS estimator formulas.
 
 For partially masked low-confidence and fast-dLLM path sampling, `--fast`
-batches up to eight distinct states per model forward and projects only active
-positions through the LLaDA vocabulary head. Transition probabilities and
-importance weights still use the full vocabulary and FP64 arithmetic. The fast
-path uses an FP64 probability-space CDF scan and vectorizes the low-confidence
-winner calculation. Native model logits can change slightly with batch shape,
-so estimates may differ slightly from the default path. Add `--fast` to either
-path sampling command below; it requires `--masked_indexes`.
+batches distinct states per model forward (up to 128 on GPUs with at least
+40 GiB) and projects only active positions through the LLaDA vocabulary head.
+It batches the FP64 vocabulary CDF and transition calculations across states;
+all requested samples and the full vocabulary remain in use. At temperature
+1, sampling and confidence share the same softmax probabilities. The fast path
+allows faster nondeterministic CUDA kernels, and native logits can change
+slightly with forward batch shape, so estimates may differ slightly from the
+default path. Add `--fast` to either path sampling command below; it requires
+`--masked_indexes`.
 
 By default, both use the same per-state FP64 confidence, normalization, and CDF
 calculations,

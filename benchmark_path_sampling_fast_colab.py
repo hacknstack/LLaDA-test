@@ -25,6 +25,8 @@ def main():
                         default="low-confidence")
     parser.add_argument("--confidence-threshold", type=float, default=0.9)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--fast-only", action="store_true")
+    parser.add_argument("--profile-forward", action="store_true")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -38,6 +40,18 @@ def main():
     model = AutoModel.from_pretrained(
         args.model, trust_remote_code=True, torch_dtype=torch.bfloat16,
     ).to("cuda").eval()
+    forward_events = []
+    if args.profile_forward:
+        original_forward = model.forward
+        def timed_forward(*forward_args, **forward_kwargs):
+            started = torch.cuda.Event(enable_timing=True)
+            finished = torch.cuda.Event(enable_timing=True)
+            started.record()
+            output = original_forward(*forward_args, **forward_kwargs)
+            finished.record()
+            forward_events.append((started, finished))
+            return output
+        model.forward = timed_forward
     estimator = (
         _path_sampling_low_confidence_probability_fast_from_partially_masked
         if args.remasking == "low-confidence" else
@@ -56,8 +70,9 @@ def main():
     # The one-state path also checks that model hooks support active projection.
     estimator(**{**common, "num_samples": 1}, fast=True)
     torch.cuda.synchronize()
+    forward_events.clear()
     runs = {}
-    for fast in (False, True):
+    for fast in ((True,) if args.fast_only else (False, True)):
         torch.cuda.reset_peak_memory_stats()
         start = time.perf_counter()
         result = estimator(**common, fast=fast)
@@ -78,12 +93,26 @@ def main():
             "peak_memory_gib": torch.cuda.max_memory_allocated() / 2**30,
             "sample_log_probabilities": result["sample_log_probabilities"],
         }
+        if args.profile_forward:
+            runs["fast" if fast else "standard"]["forward_cuda_seconds"] = sum(
+                started.elapsed_time(finished) for started, finished in forward_events
+            ) / 1000.0
+            forward_events.clear()
         print(json.dumps({"run": "fast" if fast else "standard",
                           **{k: v for k, v in runs["fast" if fast else "standard"].items()
                              if k != "sample_log_probabilities"}}), flush=True)
 
-    standard = runs["standard"]
     faster = runs["fast"]
+    if args.fast_only:
+        if args.output is not None:
+            args.output.write_text(json.dumps({
+                "text": str(args.text), "remasking": args.remasking,
+                "samples": args.samples, "seed": args.seed,
+                "fast": {key: value for key, value in faster.items()
+                         if key != "sample_log_probabilities"},
+            }, indent=2), encoding="utf-8")
+        return
+    standard = runs["standard"]
     finite_pairs = [(a, b) for a, b in zip(
         standard["sample_log_probabilities"], faster["sample_log_probabilities"]
     ) if math.isfinite(a) and math.isfinite(b)]

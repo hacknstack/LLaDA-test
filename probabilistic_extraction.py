@@ -1517,10 +1517,11 @@ def _low_confidence_eval_mode(function):
         cudnn_deterministic = torch.backends.cudnn.deterministic
         try:
             model.eval()
-            # Fail rather than silently permit a known nondeterministic kernel.
-            # CUDA may require CUBLAS_WORKSPACE_CONFIG before process startup;
-            # PyTorch reports that requirement if an affected operation is used.
-            torch.use_deterministic_algorithms(True)
+            # The standard path rejects nondeterministic kernels. Fast mode
+            # permits them for throughput and restores the caller's setting.
+            # Deterministic CUDA may require CUBLAS_WORKSPACE_CONFIG before
+            # process startup; PyTorch reports that requirement when needed.
+            torch.use_deterministic_algorithms(not bool(kwargs.get('fast', False)))
             torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
             return function(model, *args, **kwargs)
@@ -1611,6 +1612,18 @@ def _low_confidence_distribution(logits_native, temperature, context, fast_cdf=F
     )
 
 
+def _fast_path_forward_batch_size(device):
+    """Leave room for model weights and FP64 vocabulary arrays on smaller GPUs."""
+    if device.type != 'cuda':
+        return 128
+    memory_gib = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+    if memory_gib >= 40:
+        return 128
+    if memory_gib >= 24:
+        return 32
+    return 8
+
+
 class _LowConfidenceStateEvaluator:
     """Canonical singleton forwards with a per-call, bounded CPU logits cache.
 
@@ -1689,15 +1702,39 @@ class _LowConfidenceStateEvaluator:
             )
         self.forward_rows += count
         self.forward_calls += 1
+        # Sort and normalize several states at once. Each masked position is
+        # independent, so flattening this axis preserves the FP64 calculation
+        # while avoiding a GPU synchronization for every distinct state.
         result = []
-        for row, active_positions in enumerate(active):
-            native = (logits[row, :active_positions.numel(), :].contiguous()
-                      if positions is not None else
-                      logits[row, active_positions, :].contiguous())
-            result.append(_low_confidence_distribution(
-                native, temperature, self.context(revealed_rows[row]),
-                fast_cdf=True,
-            ))
+        row = 0
+        while row < count:
+            end = row
+            active_tokens = 0
+            while end < count and (end == row or
+                                   active_tokens + active[end].numel() <= 256):
+                active_tokens += active[end].numel()
+                end += 1
+            native_rows = [
+                (logits[index, :active[index].numel(), :]
+                 if positions is not None else logits[index, active[index], :])
+                for index in range(row, end)
+            ]
+            flat = _low_confidence_distribution(
+                torch.cat(native_rows, dim=0), temperature,
+                f"batched states {row + 1}-{end}", fast_cdf=True,
+            )
+            lengths = [active[index].numel() for index in range(row, end)]
+            fields = [
+                field.split(lengths, dim=0)
+                for field in (flat.logits, flat.log_Z_conf, flat.log_Z_sample,
+                              flat.sorted_logits, flat.sorted_token_ids, flat.log_cdf)
+            ]
+            result.extend(
+                _LowConfidenceDistribution(*(parts[index].contiguous().clone()
+                                             for parts in fields))
+                for index in range(end - row)
+            )
+            row = end
         return result
 
 
@@ -2172,9 +2209,9 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     shared in implementation with direct MC. use_state_cache=False disables both
     caches for this call.
 
-    By default, model forwards use batch size one. With fast=True, up to eight
-    distinct states share a forward, active LLaDA slots are projected, and the
-    FP64 CDF and competitor calculation use faster equivalent arithmetic.
+    By default, model forwards use batch size one. With fast=True, distinct
+    states share a memory-aware forward batch, active LLaDA slots are
+    projected, and the FP64 CDF and competitor calculation are batched.
     Temporary eval mode is used and the caller's module training flags are
     restored on return or error. batch_size controls trajectory sampling only.
     Custom stochastic/stateful eval forwards remain unsupported.
@@ -2206,6 +2243,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     """
 
     device = _model_device(model)
+    forward_batch_size = _fast_path_forward_batch_size(device) if fast else 1
 
     # Keep model parameters/buffers in their existing dtype to avoid the VRAM
     # cost of model.double().  Only the active-position logits are promoted to
@@ -2819,6 +2857,56 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
         return log_a_full, verbose_batch
 
+    def _compute_fast_log_a_for_distinct_states(revealed_rows, distributions, m):
+        """Score distinct states of one reveal step in a single GPU operation."""
+        count = len(distributions)
+        active_slots = slot_grid_base.expand(count, -1)[~revealed_rows].view(count, m)
+        targets = masked_target_row[active_slots]
+        logits = torch.stack([item.logits for item in distributions], dim=0)
+        log_z_conf = torch.stack([item.log_Z_conf for item in distributions], dim=0)
+        log_z_sample = torch.stack([item.log_Z_sample for item in distributions], dim=0)
+        raw_targets = logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        target_conf_logs = raw_targets - log_z_conf
+        target_sample_logs = (
+            target_conf_logs if tau == 1.0
+            else raw_targets / tau - log_z_sample
+        )
+        if m == 1:
+            active_logs = target_sample_logs
+        else:
+            sorted_logits = torch.stack(
+                [item.sorted_logits for item in distributions], dim=0,
+            )
+            log_cdf = torch.stack([item.log_cdf for item in distributions], dim=0)
+            sorted_conf = sorted_logits - log_z_conf.unsqueeze(-1)
+            comparison = target_conf_logs.unsqueeze(1).expand(-1, m, -1).contiguous()
+            left = torch.searchsorted(sorted_conf, comparison, right=False)
+            right = torch.searchsorted(sorted_conf, comparison, right=True)
+            vocab_size = sorted_logits.shape[-1]
+            log_less = log_cdf.gather(-1, (left - 1).clamp(0, vocab_size - 1))
+            log_less_equal = log_cdf.gather(-1, (right - 1).clamp(0, vocab_size - 1))
+            log_less.masked_fill_(left == 0, -math.inf)
+            log_less.masked_fill_(left == vocab_size, 0.0)
+            log_less_equal.masked_fill_(right == 0, -math.inf)
+            log_less_equal.masked_fill_(right == vocab_size, 0.0)
+            competitor = torch.arange(m, device=device).view(1, m, 1)
+            proposed = torch.arange(m, device=device).view(1, 1, m)
+            factors = torch.where(
+                competitor < proposed, log_less,
+                torch.where(competitor > proposed, log_less_equal,
+                            torch.zeros((), dtype=torch.float64, device=device)),
+            )
+            active_logs = target_sample_logs + factors.sum(dim=1)
+        result = torch.full(
+            (count, masked_len), -math.inf, dtype=torch.float64, device=device,
+        )
+        result.scatter_(1, active_slots, active_logs)
+        _check_low_confidence_log_mass(
+            result, 'successful transition masses',
+            f'batch of {count} states with {m} masked positions',
+        )
+        return result
+
     def _compute_log_a_for_batch_uncached(
         x, revealed, alive, num_unrevealed, verbose_draw_counts=None,
     ):
@@ -2826,7 +2914,6 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         # remains per-state in FP64 to preserve the estimator formula.
         log_a_rows = []
         diagnostic_rows = []
-        forward_batch_size = 8 if fast else 1
         for chunk_start in range(0, x.shape[0], forward_batch_size):
             chunk_end = min(x.shape[0], chunk_start + forward_batch_size)
             live_chunk = [row for row in range(chunk_start, chunk_end)
@@ -2840,6 +2927,21 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                 )
                 distributions = dict(zip(live_chunk, batch))
                 del batch
+            if fast and not verbose:
+                chunk_result = torch.full(
+                    (chunk_end - chunk_start, masked_len), -math.inf,
+                    dtype=torch.float64, device=device,
+                )
+                if live_chunk:
+                    live_result = _compute_fast_log_a_for_distinct_states(
+                        revealed.index_select(0, live_indices),
+                        [distributions[row] for row in live_chunk], num_unrevealed,
+                    )
+                    local_indices = live_indices - chunk_start
+                    chunk_result.index_copy_(0, local_indices, live_result)
+                log_a_rows.append(chunk_result)
+                distributions.clear()
+                continue
             for row in range(chunk_start, chunk_end):
                 if not bool(alive[row].item()):
                     # Dummy reveal paths after zero success mass never need a
@@ -3516,7 +3618,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         "validated_no_ties": False,
         "tie_breaking": "smallest_index_among_max_confidence",
         "model_forward_dtype": "native",
-        "model_forward_batch_size": 8 if fast else 1,
+        "model_forward_batch_size": forward_batch_size,
         "model_eval_mode": True,
         "estimator_dtype_after_logits": "float64",
         "state_cache_enabled": cache_enabled,
@@ -5457,8 +5559,11 @@ def _fast_dllm_success_masses(
     logits = distribution.logits
     m, vocab_size = logits.shape
     target_logits = logits.gather(-1, active_target_ids.unsqueeze(-1)).squeeze(-1)
-    target_sample_logs = target_logits / temperature - distribution.log_Z_sample
     target_confidence_logs = target_logits - distribution.log_Z_conf
+    target_sample_logs = (
+        target_confidence_logs if temperature == 1.0
+        else target_logits / temperature - distribution.log_Z_sample
+    )
     _check_low_confidence_log_mass(
         target_sample_logs, "fast-dLLM target probabilities", context,
     )
@@ -5599,8 +5704,11 @@ def _fast_dllm_success_masses_batched(
     target_logits = logits.gather(
         -1, active_target_ids.unsqueeze(-1),
     ).squeeze(-1)
-    target_sample_logs = target_logits / temperature - log_z_sample
     target_confidence_logs = target_logits - log_z_conf
+    target_sample_logs = (
+        target_confidence_logs if temperature == 1.0
+        else target_logits / temperature - log_z_sample
+    )
     _check_low_confidence_log_mass(
         target_sample_logs, "fast-dLLM target probabilities", context,
     )
@@ -5790,6 +5898,7 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     masked_len = int(masked_pos_t.numel())
+    forward_batch_size = _fast_path_forward_batch_size(device) if fast else 1
     rng_device = device if device.type in {"cpu", "cuda"} else torch.device("cpu")
     sample_on_device = device.type in {"cpu", "cuda"}
     rng = None if seed is None else torch.Generator(device=rng_device)
@@ -5848,24 +5957,46 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
             if fast:
                 missing = [key for key in rows_by_state
                            if not use_state_cache or key not in state_cache]
-                for start in range(0, len(missing), 8):
-                    keys = missing[start:start + 8]
+                for start in range(0, len(missing), forward_batch_size):
+                    keys = missing[start:start + forward_batch_size]
                     representatives = [rows_by_state[key][0] for key in keys]
                     rep_t = torch.tensor(representatives, dtype=torch.long, device=device)
                     distributions = evaluator.batched_distributions(
                         x.index_select(0, rep_t), revealed.index_select(0, rep_t), tau,
                     )
-                    for key, representative, distribution in zip(
-                        keys, representatives, distributions,
-                    ):
-                        active_slots = torch.nonzero(
-                            ~revealed[representative], as_tuple=False,
-                        ).squeeze(-1)
-                        step_masses[key] = _fast_dllm_success_masses(
-                            distribution, active_slots,
-                            masked_target_row[active_slots], tau, threshold,
-                            evaluator.context(revealed[representative]),
+                    groups = {}
+                    for index, key in enumerate(keys):
+                        remaining = masked_len - sum(key)
+                        groups.setdefault(remaining, []).append(index)
+                    for remaining, indices in groups.items():
+                        selected = [distributions[index] for index in indices]
+                        flat = _LowConfidenceDistribution(*(
+                            torch.cat([getattr(item, field) for item in selected], dim=0)
+                            for field in (
+                                'logits', 'log_Z_conf', 'log_Z_sample',
+                                'sorted_logits', 'sorted_token_ids', 'log_cdf',
+                            )
+                        ))
+                        active_slots = torch.stack([
+                            torch.nonzero(~revealed[representatives[index]],
+                                          as_tuple=False).squeeze(-1)
+                            for index in indices
+                        ])
+                        masses = _fast_dllm_success_masses_batched(
+                            flat, active_slots, masked_target_row[active_slots],
+                            tau, threshold,
+                            f'batch of {len(indices)} states with {remaining} masked positions',
                         )
+                        for local_index, index in enumerate(indices):
+                            step_masses[keys[index]] = _FastDLLMSuccessMasses(*(
+                                getattr(masses, field)[local_index].clone()
+                                for field in (
+                                    'active_slots', 'log_ell', 'log_r',
+                                    'log_alpha_fallback', 'log_first_threshold',
+                                    'threshold_bernoulli', 'log_A_threshold',
+                                    'log_A_fallback', 'log_A',
+                                )
+                            ))
                     del distributions
 
             for key, rows in rows_by_state.items():
@@ -5989,7 +6120,7 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
         "num_masked": masked_len,
         "tie_breaking": "smallest_index_among_max_confidence",
         "model_forward_dtype": "native",
-        "model_forward_batch_size": 8 if fast else 1,
+        "model_forward_batch_size": forward_batch_size,
         "model_eval_mode": True,
         "estimator_dtype_after_logits": "float64",
         "state_cache_enabled": bool(use_state_cache),
