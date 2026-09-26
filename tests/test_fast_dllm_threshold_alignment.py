@@ -283,6 +283,18 @@ class FastDLLMThresholdAlignmentTests(unittest.TestCase):
         )
         self.assertEqual(len(mc_model.calls), len(set(mc_model.calls)))
 
+    def test_scaled_monte_carlo_matches_seeded_results(self):
+        common = dict(decoding_scheme='full', k=1, mc_batch_size=71)
+        baseline = MC(**self.args(ToyModel(), 1.0, 0.6, 512), **common,
+                      return_sample_logs=True)
+        for cached in (False, True):
+            result = MC(**self.args(ToyModel(), 1.0, 0.6, 512), **common,
+                        use_state_cache=cached, scale=True,
+                        return_sample_logs=True)
+            self.assertEqual(result.hits, baseline.hits)
+            self.assertEqual(result.sample_log_probabilities,
+                             baseline.sample_log_probabilities)
+
 
 if __name__ == "__main__":
     unittest.main()

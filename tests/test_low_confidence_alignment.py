@@ -350,6 +350,46 @@ class LowConfidenceAlignmentTests(unittest.TestCase):
                         else:
                             self.assertEqual(result.hits, baseline.hits)
 
+    def test_scaled_monte_carlo_preserves_estimate_and_packed_states(self):
+        # Include the highest bit used by a 50-position masked window.
+        bits = torch.tensor([0, 1 << 49, (1 << 50) - 1, 7], dtype=torch.int64)
+        alive = torch.tensor([True, True, True, False])
+        self.assertEqual(
+            pe._scaled_mc_state_groups(alive, bits),
+            {0: [0], 1 << 49: [1], (1 << 50) - 1: [2]},
+        )
+
+        baseline = MC(**self.args(ToyModel(), samples=4096),
+                      decoding_scheme='full', k=1, mc_batch_size=512)
+        for cached in (False, True):
+            result = MC(**self.args(ToyModel(), samples=4096),
+                        decoding_scheme='full', k=1, mc_batch_size=512,
+                        use_state_cache=cached, scale=True,
+                        return_sample_logs=True)
+            self.assertEqual(result.sample_log_probabilities.count(0.0), result.hits)
+            self.assertLess(abs(result.estimate - baseline.estimate), 0.05)
+
+    def test_scaled_cache_reuses_prepared_distribution(self):
+        class CacheModel:
+            device = torch.device('cpu')
+
+            def __call__(self, tokens, attention_mask=None):
+                logits = torch.zeros((1, 100, 3), dtype=torch.float32)
+                return SimpleNamespace(logits=logits)
+
+        model = CacheModel()
+        evaluator = pe._LowConfidenceStateEvaluator(
+            model, None, torch.tensor(POSITIONS), cache_distributions=True,
+        )
+        x = torch.zeros(100, dtype=torch.long)
+        x[list(POSITIONS)] = MASK_ID
+        revealed = torch.zeros(3, dtype=torch.bool)
+        first = evaluator.distribution(x, revealed, 1.0, state_key=0)
+        second = evaluator.distribution(x, revealed, 1.0, state_key=0)
+        self.assertIs(first, second)
+        self.assertEqual(evaluator.forward_rows, 1)
+        self.assertGreater(evaluator.prepared_cache_bytes, 0)
+
     def test_temporary_eval_mode_restores_mixed_modes_and_disables_autocast(self):
         for estimator in (STS, MC):
             model = ToyModel().train()

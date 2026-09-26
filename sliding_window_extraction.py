@@ -76,6 +76,10 @@ def parse_args() -> argparse.Namespace:
         help='Disable state caching for partially masked low-confidence or fast-dLLM sampling.',
     )
     parser.add_argument(
+        '--scale', action='store_true',
+        help='Use high-sample-count optimizations for partially masked low-confidence or fast-dLLM Monte Carlo.',
+    )
+    parser.add_argument(
         '--random-path-sample-budget',
         type=int,
         default=DEFAULT_RANDOM_PATH_SAMPLE_BUDGET,
@@ -401,6 +405,7 @@ def _compute_probability(
         return_sample_times=args.verbosisih,
         fast=args.fast,
         use_state_cache=not args.nocache,
+        scale=args.scale,
     )
     if args.mode in {'exact', 'path_sampling'} or str(decoding_scheme).lower() == 'elbo':
         probability = float(result['probability'])
@@ -448,6 +453,16 @@ def main() -> None:
         raise ValueError(
             '--nocache requires LLaDA Monte Carlo or path sampling with '
             '--masked_indexes and --remasking low-confidence or fast-dllm.'
+        )
+    if args.scale and not (
+        args.model_family == 'llada'
+        and args.mode == 'monte-carlo'
+        and args.remasking in {'low-confidence', 'fast-dllm'}
+        and args.masked_indexes is not None
+    ):
+        raise ValueError(
+            '--scale requires LLaDA Monte Carlo with --masked_indexes and '
+            '--remasking low-confidence or fast-dllm.'
         )
     use_exact_low_confidence_dp = (
         args.model_family == 'llada'
@@ -845,6 +860,7 @@ def main() -> None:
             'mode': args.mode,
             'fast': args.fast,
             'nocache': args.nocache,
+            'scale': args.scale,
             'model_family': args.model_family,
             'model_name': args.model_name,
             'remasking': args.remasking,

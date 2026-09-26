@@ -1624,15 +1624,26 @@ def _fast_path_forward_batch_size(device):
     return 8
 
 
+def _scaled_mc_state_groups(alive, state_bits, full_mask=None):
+    """Group live trajectories with one device-to-host transfer per step."""
+    keys = torch.where(alive, state_bits, -1).detach().cpu().tolist()
+    rows_by_state = {}
+    for row, key in enumerate(keys):
+        if key != -1 and key != full_mask:
+            rows_by_state.setdefault(key, []).append(row)
+    return rows_by_state
+
+
 class _LowConfidenceStateEvaluator:
-    """Canonical singleton forwards with a per-call, bounded CPU logits cache.
+    """Canonical singleton forwards with bounded per-call state caches.
 
     The enclosing estimator enforces eval mode. Custom stochastic/stateful eval
-    forwards are unsupported. The cache retains native active logits, not full
-    sequence outputs or FP64 vocabulary tensors, and never changes forward shape.
+    forwards are unsupported. The default CPU cache retains native active logits.
+    Scaled Monte Carlo can also retain prepared FP64 distributions on the
+    compute device, with a budget based on available device memory.
     """
     def __init__(self, model, attention_mask, masked_positions, use_cache=True,
-                 cache_max_bytes=64 * 1024 * 1024):
+                 cache_max_bytes=64 * 1024 * 1024, cache_distributions=False):
         self.model = model
         self.device = _model_device(model)
         self.attention_mask = attention_mask
@@ -1643,13 +1654,39 @@ class _LowConfidenceStateEvaluator:
         self.cache_writes_enabled = True
         self.forward_rows = 0
         self.forward_calls = 0
+        self.prepared_cache = OrderedDict()
+        self.prepared_cache_bytes = 0
+        self.prepared_cache_max_bytes = 0
+        if use_cache and cache_distributions:
+            limit = 256 * 1024 * 1024
+            if self.device.type == 'cuda':
+                total_bytes = torch.cuda.get_device_properties(self.device).total_memory
+                if total_bytes >= 70 * 1024 ** 3:
+                    limit = 2 * 1024 ** 3
+                free_bytes, _ = torch.cuda.mem_get_info(self.device)
+                limit = min(limit, free_bytes // 10)
+            self.prepared_cache_max_bytes = limit
+        self.masked_positions_cpu = None
 
-    def context(self, revealed):
-        positions = self.masked_positions[revealed].detach().cpu().tolist()
+    def context(self, revealed, state_key=None):
+        if isinstance(state_key, int):
+            if self.masked_positions_cpu is None:
+                self.masked_positions_cpu = self.masked_positions.detach().cpu().tolist()
+            positions = [
+                pos for slot, pos in enumerate(self.masked_positions_cpu)
+                if state_key & (1 << slot)
+            ]
+        else:
+            positions = self.masked_positions[revealed].detach().cpu().tolist()
         return f"step={len(positions)}, revealed_indices={[p + 1 for p in positions]}"
 
-    def distribution(self, x_row, revealed, temperature):
-        key = tuple(bool(v) for v in revealed.detach().cpu().tolist())
+    def distribution(self, x_row, revealed, temperature, state_key=None,
+                     active_slots=None):
+        key = (state_key if state_key is not None else
+               tuple(bool(v) for v in revealed.detach().cpu().tolist()))
+        prepared = self.prepared_cache.get(key)
+        if prepared is not None:
+            return prepared[0]
         logits = self.cache.get(key)
         if logits is None:
             autocast = (torch.autocast(device_type=self.device.type, enabled=False)
@@ -1657,7 +1694,10 @@ class _LowConfidenceStateEvaluator:
             with autocast:
                 outputs = self.model(x_row.unsqueeze(0).contiguous(),
                                      attention_mask=self.attention_mask)
-            logits = outputs.logits[0, self.masked_positions[~revealed], :].contiguous()
+            active_positions = self.masked_positions[
+                active_slots if active_slots is not None else ~revealed
+            ]
+            logits = outputs.logits[0, active_positions, :].contiguous()
             del outputs
             self.forward_rows += 1
             self.forward_calls += 1
@@ -1671,7 +1711,24 @@ class _LowConfidenceStateEvaluator:
         else:
             self.cache.move_to_end(key)
             logits = logits.to(self.device)
-        return _low_confidence_distribution(logits, temperature, self.context(revealed))
+        distribution = _low_confidence_distribution(
+            logits, temperature, self.context(revealed, state_key),
+        )
+        if self.cache_writes_enabled and self.prepared_cache_max_bytes:
+            size = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in (
+                    distribution.logits, distribution.log_Z_conf,
+                    distribution.log_Z_sample, distribution.sorted_logits,
+                    distribution.sorted_token_ids, distribution.log_cdf,
+                )
+            )
+            # Preserve the earliest, most shared states; later one-off states
+            # must not evict the initial state between trajectory batches.
+            if self.prepared_cache_bytes + size <= self.prepared_cache_max_bytes:
+                self.prepared_cache[key] = (distribution, size)
+                self.prepared_cache_bytes += size
+        return distribution
 
     def batched_distributions(self, x_rows, revealed_rows, temperature):
         """Evaluate distinct states together, projecting only active LLaDA slots.
@@ -4136,6 +4193,7 @@ def compute_diffusion_probabilistic_extraction(
     return_sample_times: bool = False,
     fast: bool = False,
     use_state_cache: bool = True,
+    scale: bool = False,
 ):
     """
     Compute probabilistic extraction under LLaDA Algorithm-5 style low-confidence remasking.
@@ -4182,9 +4240,18 @@ def compute_diffusion_probabilistic_extraction(
     use_state_cache:
         Cache computations by revealed state for partially masked low-confidence
         or fast-dLLM Monte Carlo and path sampling.
+    scale:
+        Use high-sample-count Monte Carlo optimizations without changing the
+        sampling law. Seeded trajectories may differ from the standard path.
     """
     if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
         raise ValueError('prompt_tokens must have shape (1, a).')
+    if scale and not (
+        estimation_method == 'monte-carlo'
+        and remasking in {'low-confidence', 'fast-dllm'}
+        and masked_indexes is not None
+    ):
+        raise ValueError('scale requires partially masked low-confidence or fast-dLLM Monte Carlo.')
     if target_tokens.ndim != 2 or target_tokens.shape[0] != 1:
         raise ValueError('target_tokens must have shape (1, j).')
     if fast and not (
@@ -4371,6 +4438,7 @@ def compute_diffusion_probabilistic_extraction(
             verbose_callback=verbose_callback,
             return_sample_logs=return_sample_logs,
             use_state_cache=use_state_cache,
+            scale=scale,
         )
         return {
             'method': 'monte-carlo',
@@ -4652,6 +4720,7 @@ def compute_diffusion_probabilistic_extraction(
                 return_sample_logs=return_sample_logs,
                 return_sample_times=return_sample_times,
                 use_state_cache=use_state_cache,
+                scale=scale,
             )
         
     else:
@@ -4779,6 +4848,7 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     use_state_cache: bool = True,
     return_sample_logs: bool = False,
     return_sample_times: bool = False,
+    scale: bool = False,
 ) -> MonteCarloResult:
     """
     Naive Monte Carlo estimator for one-token-per-step low-confidence remasking.
@@ -4827,6 +4897,8 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     vocabulary size. Native active logits use the same per-call 64 MiB CPU LRU
     cache as STS when multiple trajectory batches are needed. The last batch
     reads existing cache entries but skips writes: its states cannot recur.
+    scale=True also caches prepared distributions for early states, packs
+    revealed states into integer keys, and skips the unused tie-breaking draw.
     use_state_cache=False disables the cache. Custom stochastic/stateful eval
     forwards are unsupported. Changing mc_batch_size changes RNG consumption,
     but not the singleton forwards, distribution arithmetic, or decoder law.
@@ -4868,6 +4940,8 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
         )
 
     masked_len = len(masked_pos)
+    if scale and masked_len > 63:
+        raise ValueError('scale supports at most 63 masked positions.')
 
     if steps != masked_len:
         raise ValueError(
@@ -4956,6 +5030,7 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
 
     state_evaluator = _LowConfidenceStateEvaluator(
         model, attention_mask, masked_pos_t, use_cache=use_state_cache,
+        cache_distributions=scale,
     )
     hits = 0
     verbose_samples: List[Dict[str, object]] = []
@@ -5003,6 +5078,10 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
             dtype=torch.bool,
             device=device,
         )
+        state_bits = (
+            torch.zeros(bsz, dtype=torch.int64, device=device)
+            if scale else None
+        )
 
         alive = torch.ones(
             bsz,
@@ -5028,82 +5107,41 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
         # ==============================================================
 
         for step in range(masked_len):
-
-            alive_rows_t = torch.nonzero(
-                alive,
-                as_tuple=False,
-            ).squeeze(-1)
-
-            if alive_rows_t.numel() == 0:
-                break
-
             m = masked_len - step
-
-            # ----------------------------------------------------------
-            # Group identical successful states S.
-            #
-            # Preserve FIRST-OCCURRENCE order, matching the state grouping
-            # convention used by the successful-trajectory cache.
-            #
-            # Group order controls RNG consumption, so preserve it independently
-            # of the canonical singleton model forwards.
-            # ----------------------------------------------------------
-
-            alive_revealed = revealed.index_select(
-                0,
-                alive_rows_t,
-            )
-
-            alive_rows_cpu = (
-                alive_rows_t
-                .detach()
-                .cpu()
-                .tolist()
-            )
-
-
-            revealed_cpu = (
-                alive_revealed
-                .detach()
-                .cpu()
-                .tolist()
-            )
-
-            state_to_index: dict[tuple[bool, ...], int] = {}
-            rows_per_state: list[list[int]] = []
-            representative_rows: list[int] = []
-
-            for row, state_bits in zip(
-                alive_rows_cpu,
-                revealed_cpu,
-            ):
-                key = tuple(bool(v) for v in state_bits)
-
-                state_idx = state_to_index.get(key)
-
-                if state_idx is None:
-                    state_idx = len(rows_per_state)
-                    state_to_index[key] = state_idx
-
-                    rows_per_state.append([])
-                    representative_rows.append(
-                        int(row)
-                    )
-
-                rows_per_state[state_idx].append(
-                    int(row)
-                )
+            if scale:
+                rows_by_state = _scaled_mc_state_groups(alive, state_bits)
+            else:
+                # Preserve first-occurrence order and the historical RNG stream.
+                alive_rows_t = torch.nonzero(alive, as_tuple=False).squeeze(-1)
+                if alive_rows_t.numel() == 0:
+                    break
+                alive_revealed = revealed.index_select(0, alive_rows_t)
+                alive_rows_cpu = alive_rows_t.detach().cpu().tolist()
+                revealed_cpu = alive_revealed.detach().cpu().tolist()
+                rows_by_state = {}
+                for row, bits in zip(alive_rows_cpu, revealed_cpu):
+                    rows_by_state.setdefault(tuple(bool(v) for v in bits), []).append(row)
+            if not rows_by_state:
+                break
 
 
             # model_batch_size remains an accepted compatibility argument;
             # all model forwards have batch size one, independent of grouping.
-            for global_state_idx, representative_row in enumerate(representative_rows):
-                trajectory_rows = rows_per_state[global_state_idx]
+            for state_key, trajectory_rows in rows_by_state.items():
+                representative_row = trajectory_rows[0]
                 group_size = len(trajectory_rows)
                 rows_t = torch.tensor(trajectory_rows, dtype=torch.long, device=device)
-                state_active_slots = slot_grid_base[0][~revealed[representative_row]]
+                state_active_slots = (
+                    torch.tensor(
+                        [slot for slot in range(masked_len)
+                         if not state_key & (1 << slot)],
+                        dtype=torch.long, device=device,
+                    ) if scale else slot_grid_base[0][~revealed[representative_row]]
+                )
                 distribution = state_evaluator.distribution(
                     x[representative_row], revealed[representative_row], tau,
+                    state_key=state_key if scale else None,
+                    active_slots=state_active_slots if scale else None,
                 )
                 state_active_logits = distribution.logits
                 log_Z_conf = distribution.log_Z_conf
@@ -5215,33 +5253,24 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                 # because tie-breaking is deterministic, but retaining it
                 # keeps all later candidate-token draws aligned with the old
                 # implementation whenever the preceding state path is the same.
-                winner_weights = (
-                    is_max_confidence
-                    .transpose(0, 1)
-                    .to(torch.float64)
-                    .contiguous()
-                )
-                winner_weights.div_(
-                    winner_weights.sum(
-                        dim=-1,
-                        keepdim=True,
+                if not scale:
+                    winner_weights = (
+                        is_max_confidence
+                        .transpose(0, 1)
+                        .to(torch.float64)
+                        .contiguous()
                     )
-                )
-
-                if sample_on_device:
-                    discarded_tie_draw = torch.multinomial(
-                        winner_weights,
-                        num_samples=1,
-                        replacement=True,
-                        generator=rng,
-                    )
-                else:
-                    discarded_tie_draw = torch.multinomial(
-                        winner_weights.detach().cpu(),
-                        num_samples=1,
-                        replacement=True,
-                        generator=rng,
-                    )
+                    winner_weights.div_(winner_weights.sum(dim=-1, keepdim=True))
+                    if sample_on_device:
+                        discarded_tie_draw = torch.multinomial(
+                            winner_weights, num_samples=1, replacement=True,
+                            generator=rng,
+                        )
+                    else:
+                        discarded_tie_draw = torch.multinomial(
+                            winner_weights.detach().cpu(), num_samples=1,
+                            replacement=True, generator=rng,
+                        )
 
                 # ==================================================
                 # Permanently revealed position
@@ -5397,6 +5426,11 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                         successful_rows_t,
                         successful_slots,
                     ] = True
+                    if scale:
+                        state_bits[successful_rows_t] |= torch.bitwise_left_shift(
+                            torch.ones_like(successful_slots, dtype=torch.int64),
+                            successful_slots,
+                        )
 
                 # --------------------------------------------------
                 # Release per-state temporaries
@@ -5413,8 +5447,9 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
                 del sampled_log_confidence
                 del max_sampled_log_confidence
                 del is_max_confidence
-                del winner_weights
-                del discarded_tie_draw
+                if not scale:
+                    del winner_weights
+                    del discarded_tie_draw
                 del chosen_local_positions
                 del sampled_token_ids_by_trajectory
                 del distribution
@@ -6165,6 +6200,7 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
     use_state_cache: bool = True,
     return_sample_logs: bool = False,
     return_sample_times: bool = False,
+    scale: bool = False,
 ) -> MonteCarloResult:
     """Direct decoder Monte Carlo for fast-dLLM threshold remasking."""
     (
@@ -6185,6 +6221,8 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
         raise ValueError("verbose_callback requires verbose=True.")
 
     masked_len = int(masked_pos_t.numel())
+    if scale and masked_len > 63:
+        raise ValueError('scale supports at most 63 masked positions.')
     rng_device = device if device.type in {"cpu", "cuda"} else torch.device("cpu")
     sample_on_device = device.type in {"cpu", "cuda"}
     rng = None if seed is None else torch.Generator(device=rng_device)
@@ -6193,6 +6231,7 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
     log_threshold = -math.inf if threshold == 0.0 else math.log(threshold)
     evaluator = _LowConfidenceStateEvaluator(
         model, attention_mask, masked_pos_t, use_cache=use_state_cache,
+        cache_distributions=scale,
     )
     hits = 0
     verbose_samples: List[Dict[str, object]] = []
@@ -6210,6 +6249,10 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
         x = sequence_tokens.expand(bsz, -1).clone()
         x[:, masked_pos_t] = mask_id
         revealed = torch.zeros((bsz, masked_len), dtype=torch.bool, device=device)
+        state_bits = (
+            torch.zeros(bsz, dtype=torch.int64, device=device)
+            if scale else None
+        )
         alive = torch.ones(bsz, dtype=torch.bool, device=device)
         batch_verbose = [
             {
@@ -6222,24 +6265,39 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
         ] if verbose else []
 
         for model_step in range(masked_len):
-            unfinished = alive & ~revealed.all(dim=1)
-            rows_live_t = torch.nonzero(unfinished, as_tuple=False).squeeze(-1)
-            if rows_live_t.numel() == 0:
+            if scale:
+                rows_by_state = _scaled_mc_state_groups(
+                    alive, state_bits, full_mask=(1 << masked_len) - 1,
+                )
+            else:
+                unfinished = alive & ~revealed.all(dim=1)
+                rows_live_t = torch.nonzero(unfinished, as_tuple=False).squeeze(-1)
+                if rows_live_t.numel() == 0:
+                    break
+                rows_live = rows_live_t.detach().cpu().tolist()
+                states = revealed[rows_live_t].detach().cpu().tolist()
+                rows_by_state: Dict[Tuple[bool, ...], List[int]] = {}
+                for row, bits in zip(rows_live, states):
+                    rows_by_state.setdefault(tuple(bool(bit) for bit in bits), []).append(row)
+            if not rows_by_state:
                 break
-            rows_live = rows_live_t.detach().cpu().tolist()
-            states = revealed[rows_live_t].detach().cpu().tolist()
-            rows_by_state: Dict[Tuple[bool, ...], List[int]] = {}
-            for row, bits in zip(rows_live, states):
-                rows_by_state.setdefault(tuple(bool(bit) for bit in bits), []).append(row)
 
-            for rows in rows_by_state.values():
+            for state_key, rows in rows_by_state.items():
                 representative = rows[0]
                 rows_t = torch.tensor(rows, dtype=torch.long, device=device)
-                active_slots = torch.nonzero(
-                    ~revealed[representative], as_tuple=False,
-                ).squeeze(-1)
+                active_slots = (
+                    torch.tensor(
+                        [slot for slot in range(masked_len)
+                         if not state_key & (1 << slot)],
+                        dtype=torch.long, device=device,
+                    ) if scale else torch.nonzero(
+                        ~revealed[representative], as_tuple=False,
+                    ).squeeze(-1)
+                )
                 distribution = evaluator.distribution(
                     x[representative], revealed[representative], tau,
+                    state_key=state_key if scale else None,
+                    active_slots=active_slots if scale else None,
                 )
                 m = int(active_slots.numel())
                 count = len(rows)
@@ -6286,6 +6344,15 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
                 revealed[
                     row_grid[successful_selected], slot_grid[successful_selected]
                 ] = True
+                if scale:
+                    selected_bits = torch.where(
+                        successful_selected,
+                        torch.bitwise_left_shift(
+                            torch.ones_like(slot_grid, dtype=torch.int64), slot_grid,
+                        ),
+                        0,
+                    ).sum(dim=1)
+                    state_bits[rows_t] |= selected_bits
                 x[
                     row_grid[successful_selected], abs_grid[successful_selected]
                 ] = target_grid[successful_selected]
