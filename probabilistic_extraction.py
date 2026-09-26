@@ -4135,6 +4135,7 @@ def compute_diffusion_probabilistic_extraction(
     return_sample_logs: bool = False,
     return_sample_times: bool = False,
     fast: bool = False,
+    use_state_cache: bool = True,
 ):
     """
     Compute probabilistic extraction under LLaDA Algorithm-5 style low-confidence remasking.
@@ -4178,6 +4179,9 @@ def compute_diffusion_probabilistic_extraction(
     fast:
         Batch distinct states and use faster FP64 CDF arithmetic for partially
         masked low-confidence or fast-dLLM path sampling.
+    use_state_cache:
+        Cache computations by revealed state for partially masked low-confidence
+        or fast-dLLM Monte Carlo and path sampling.
     """
     if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1:
         raise ValueError('prompt_tokens must have shape (1, a).')
@@ -4350,6 +4354,7 @@ def compute_diffusion_probabilistic_extraction(
             result = _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
                 **common,
                 fast=fast,
+                use_state_cache=use_state_cache,
             )
             return {
                 **result,
@@ -4365,6 +4370,7 @@ def compute_diffusion_probabilistic_extraction(
             k=k,
             verbose_callback=verbose_callback,
             return_sample_logs=return_sample_logs,
+            use_state_cache=use_state_cache,
         )
         return {
             'method': 'monte-carlo',
@@ -4527,6 +4533,7 @@ def compute_diffusion_probabilistic_extraction(
                     verbose_compact=verbose_compact,
                     return_sample_times=return_sample_times,
                     fast=fast,
+                    use_state_cache=use_state_cache,
                 )
                 return {
                     'method': 'path_sampling',
@@ -4644,6 +4651,7 @@ def compute_diffusion_probabilistic_extraction(
                 verbose_callback=verbose_callback,
                 return_sample_logs=return_sample_logs,
                 return_sample_times=return_sample_times,
+                use_state_cache=use_state_cache,
             )
         
     else:
