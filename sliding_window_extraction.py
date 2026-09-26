@@ -115,7 +115,15 @@ def parse_args() -> argparse.Namespace:
         '--verbosish',
         action='store_true',
         help=(
-            'Write verbosish.jsonl with per-sample log estimates and wall clock '
+            'Write verbosish.jsonl with per-sample log estimates for partially masked '
+            'low-confidence or fast-dLLM path sampling and Monte Carlo.'
+        ),
+    )
+    diagnostics_group.add_argument(
+        '--verbosisih',
+        action='store_true',
+        help=(
+            'Write verbosisih.jsonl with per-sample log estimates and wall clock '
             'latencies for partially masked low-confidence or fast-dLLM '
             'path sampling and Monte Carlo.'
         ),
@@ -220,8 +228,8 @@ def _write_verbose_records(
     verbose_file.flush()
 
 
-def _write_verbosish_records(
-    verbosish_file,
+def _write_sample_records(
+    sample_file,
     records: List[Dict[str, object]],
     evaluation_index: int,
     window_index: int,
@@ -232,11 +240,11 @@ def _write_verbosish_records(
             'window_index': window_index,
             **item,
         }
-        verbosish_file.write(
+        sample_file.write(
             json.dumps(_json_safe(record), separators=(',', ':'), allow_nan=False)
             + '\n'
         )
-    verbosish_file.flush()
+    sample_file.flush()
 
 
 def _prepare_requested_windows(requested, text, word_starts, tokenizer, args):
@@ -385,8 +393,8 @@ def _compute_probability(
         verbose_compact=args.compact,
         verbose_callback=verbose_callback,
         confidence_threshold=args.confidence_threshold,
-        return_sample_logs=args.verbosish,
-        return_sample_times=args.verbosish,
+        return_sample_logs=args.verbosish or args.verbosisih,
+        return_sample_times=args.verbosisih,
         fast=args.fast,
     )
     if args.mode in {'exact', 'path_sampling'} or str(decoding_scheme).lower() == 'elbo':
@@ -395,18 +403,23 @@ def _compute_probability(
         probability = float(result['estimate'])
     if verbose_callback is not None and result['method'] == 'monte-carlo':
         return probability, []
-    if args.verbosish:
+    if args.verbosish or args.verbosisih:
         sample_logs = result.get('sample_log_probabilities')
-        sample_times = result.get('sample_wall_time_seconds')
-        if sample_logs is None or sample_times is None:
-            raise RuntimeError('Estimator did not return per-sample logs and times.')
-        if len(sample_logs) != len(sample_times):
-            raise RuntimeError('Per-sample logs and times have different lengths.')
+        if sample_logs is None:
+            raise RuntimeError('Estimator did not return per-sample logs.')
+        sample_times = result.get('sample_wall_time_seconds') if args.verbosisih else None
+        if args.verbosisih and (
+            sample_times is None or len(sample_logs) != len(sample_times)
+        ):
+            raise RuntimeError('Estimator did not return matching per-sample times.')
         return probability, [
             {
                 'sample_index': sample_index,
                 'sample_log_estimate': float(sample_log_estimate),
-                'sample_wall_time_seconds': float(sample_times[sample_index]),
+                **(
+                    {'sample_wall_time_seconds': float(sample_times[sample_index])}
+                    if sample_times is not None else {}
+                ),
             }
             for sample_index, sample_log_estimate in enumerate(sample_logs)
         ]
@@ -612,7 +625,7 @@ def main() -> None:
                 'fast-dLLM path sampling/Monte Carlo, or DUEL estimation, with '
                 'the supported positive temperature and full decoding.'
             )
-    if args.verbosish:
+    if args.verbosish or args.verbosisih:
         valid_path_verbosish = (
             args.model_family == 'llada'
             and args.mode == 'path_sampling'
@@ -635,7 +648,8 @@ def main() -> None:
         )
         if not (valid_path_verbosish or valid_mc_verbosish):
             raise ValueError(
-                '--verbosish requires partially masked LLaDA low-confidence or '
+                '--verbosish and --verbosisih require partially masked LLaDA '
+                'low-confidence or '
                 'fast-dLLM path sampling/Monte Carlo with full decoding. '
                 'Low-confidence path sampling requires temperature 1; '
                 'Monte Carlo requires finite positive temperature.'
@@ -684,9 +698,11 @@ def main() -> None:
         total_to_evaluate = total_possible
     pbar = tqdm(total=total_to_evaluate, desc='Sliding windows', unit='window')
     verbose_file = (run_dir / 'verbose.jsonl').open('w', encoding='utf-8') if args.verbose else None
-    verbosish_file = (
-        (run_dir / 'verbosish.jsonl').open('w', encoding='utf-8')
-        if args.verbosish
+    sample_file = (
+        (run_dir / ('verbosisih.jsonl' if args.verbosisih else 'verbosish.jsonl')).open(
+            'w', encoding='utf-8'
+        )
+        if args.verbosish or args.verbosisih
         else None
     )
     window_data = _iter_window_data(
@@ -735,11 +751,11 @@ def main() -> None:
                     window_index=window_index,
                     masked_indexes=args.masked_indexes,
                 )
-            elif verbosish_file is not None:
+            elif sample_file is not None:
                 if verbose_records is None:
-                    raise RuntimeError('Verbosish estimator data was not returned.')
-                _write_verbosish_records(
-                    verbosish_file=verbosish_file,
+                    raise RuntimeError('Per-sample estimator data was not returned.')
+                _write_sample_records(
+                    sample_file=sample_file,
                     records=verbose_records,
                     evaluation_index=evaluation_index,
                     window_index=window_index,
@@ -769,8 +785,8 @@ def main() -> None:
     pbar.close()
     if verbose_file is not None:
         verbose_file.close()
-    if verbosish_file is not None:
-        verbosish_file.close()
+    if sample_file is not None:
+        sample_file.close()
 
     windows_path = run_dir / 'windows.csv'
     with windows_path.open('w', newline='', encoding='utf-8') as f:
@@ -828,13 +844,19 @@ def main() -> None:
             'masked_indexes': args.masked_indexes,
             'verbose': args.verbose,
             'verbosish': args.verbosish,
+            'verbosisih': args.verbosisih,
             'compact': args.compact,
             'verbose_schema': (
                 'parallel-arrays' if args.compact else 'candidate-objects'
             ) if args.verbose else None,
             'verbosish_schema': (
-                'sample-index-log-estimate-and-wall-time-seconds'
+                'sample-index-log-estimate'
                 if args.verbosish
+                else None
+            ),
+            'verbosisih_schema': (
+                'sample-index-log-estimate-and-wall-time-seconds'
+                if args.verbosisih
                 else None
             ),
         },

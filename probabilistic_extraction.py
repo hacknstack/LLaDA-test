@@ -6149,7 +6149,7 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
     confidence_threshold: float,
     decoding_scheme: str = "full",
     k: int = 1,
-    mc_batch_size: int = 16384,
+    mc_batch_size: int = 2*16384,
     model_batch_size: int = 64,
     verbose: bool = False,
     verbose_compact: bool = False,
