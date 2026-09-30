@@ -1,4 +1,4 @@
-# Assessing the Privacy of Large Language Diffusion Models
+# Estimating Extraction Probabilities in Diffusion Language Models under Confidence-Based Sampling
 
 This repository contains code and result artifacts for running sliding-window extraction experiments for LLaDA and other autoregressive language models.
 
