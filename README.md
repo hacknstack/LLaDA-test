@@ -45,7 +45,7 @@ estimation, `--verbose` writes one JSONL record per window/sample to
 sampled-confidence tie count, and per-step untempered sampled log-confidences.
 Add `--compact` to store per-step candidate values as parallel arrays instead
 of repeated JSON objects.
-For partially masked LLaDA low-confidence or fast-dLLM path sampling and Monte
+For partially masked LLaDA low-confidence or threshold path sampling and Monte
 Carlo, `--verbosish` writes `verbosish.jsonl` with `evaluation_index`,
 `window_index`, `sample_index`, `sample_log_estimate`, and
 `sample_wall_time_seconds`. The time is measured from the start of the sample's
@@ -84,17 +84,6 @@ those later batches; ordinary STS uses the smaller successful-transition cache.
 This removes unnecessary CPU copies and repeated diagnostics. Changing batch
 size changes seeded proposal draws, but preserves the STS estimator formulas.
 
-For partially masked low-confidence and fast-dLLM path sampling, `--fast`
-batches distinct states per model forward (up to 128 on GPUs with at least
-40 GiB) and projects only active positions through the LLaDA vocabulary head.
-It batches the FP64 vocabulary CDF and transition calculations across states;
-all requested samples and the full vocabulary remain in use. At temperature
-1, sampling and confidence share the same softmax probabilities. The fast path
-allows faster nondeterministic CUDA kernels, and native logits can change
-slightly with forward batch shape, so estimates may differ slightly from the
-default path. Add `--fast` to either path sampling command below; it requires
-`--masked_indexes`.
-
 By default, both use the same per-state FP64 confidence, normalization, and CDF
 calculations,
 plus a bounded 64 MiB CPU cache of native active logits. `use_state_cache=False`
@@ -105,8 +94,8 @@ or mutable evaluation behavior are unsupported. CUDA operations that require a
 deterministic cuBLAS workspace need `CUBLAS_WORKSPACE_CONFIG=:4096:8` set before
 starting Python; unsupported deterministic operations raise a PyTorch error.
 
-The same two estimators are available for fast-dLLM threshold remasking with
-`--remasking fast-dllm --confidence-threshold VALUE`. A threshold step reveals
+The same two estimators are available for threshold remasking with
+`--remasking threshold --confidence-threshold VALUE`. A threshold step reveals
 every sampled candidate whose untempered confidence is at least the threshold;
 when none qualifies, the smallest-index maximum-confidence candidate is the
 fallback. Both estimators support variable-size masked sets and positive sampling
@@ -114,16 +103,16 @@ temperatures with full-vocabulary decoding. For example, in PowerShell:
 
 ```powershell
 $mask = 51..100
-python .\sliding_window_extraction.py .\texts\book.txt --model-family llada --mode path_sampling --remasking fast-dllm --decoding-scheme full --temperature 1 --confidence-threshold 0.9 --masked_indexes $mask --num-samples 1000
-python .\sliding_window_extraction.py .\texts\book.txt --model-family llada --mode monte-carlo --remasking fast-dllm --decoding-scheme full --temperature 1 --confidence-threshold 0.9 --masked_indexes $mask --num-samples 100000
+python .\sliding_window_extraction.py .\texts\book.txt --model-family llada --mode path_sampling --remasking threshold --decoding-scheme full --temperature 1 --confidence-threshold 0.9 --masked_indexes $mask --num-samples 1000
+python .\sliding_window_extraction.py .\texts\book.txt --model-family llada --mode monte-carlo --remasking threshold --decoding-scheme full --temperature 1 --confidence-threshold 0.9 --masked_indexes $mask --num-samples 100000
 ```
 
-For a 90-visible/10-masked window, `--mode exact` uses the fast-dLLM subset DP
+For a 90-visible/10-masked window, `--mode exact` uses the threshold subset DP
 without the sampled estimators' historical 50-index requirement:
 
 ```powershell
 $mask = 91..100
-python .\sliding_window_extraction.py .\texts\book.txt --model-family llada --mode exact --remasking fast-dllm --decoding-scheme full --temperature 1 --confidence-threshold 0.9 --masked_indexes $mask
+python .\sliding_window_extraction.py .\texts\book.txt --model-family llada --mode exact --remasking threshold --decoding-scheme full --temperature 1 --confidence-threshold 0.9 --masked_indexes $mask
 ```
 
 The exact recurrence evaluates at most `2^m - 1` model states and
@@ -135,7 +124,7 @@ FP64 distribution, and transition-mass routine as STS. This avoids changing
 LLaDA's bfloat16 logits through a different model batch shape. The faster
 frontier-batched, selected-position LLaDA path remains an explicit opt-in via
 `use_selected_logits=True` in the Python API or `--use-selected-logits` in
-`benchmark_exact_fast_dllm_colab.py`; its results may differ when logits
+`benchmark_exact_threshold_colab.py`; its results may differ when logits
 depend on batch shape. The CLI's `--mode exact` uses singleton forwards.
 
 Threshold STS computes the threshold and fallback success masses in FP64 log

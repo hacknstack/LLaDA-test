@@ -77,7 +77,7 @@ def _unsupported_partially_masked_configuration(
 
 def _validate_common_args(remasking: str, estimation_method: str) -> None:
     allowed_remasking = {
-        'low-confidence', 'fast-dllm', 'target-token-confidence', 'random',
+        'low-confidence', 'threshold', 'target-token-confidence', 'random',
         'highest-index',
     }
     if remasking not in allowed_remasking:
@@ -1517,11 +1517,9 @@ def _low_confidence_eval_mode(function):
         cudnn_deterministic = torch.backends.cudnn.deterministic
         try:
             model.eval()
-            # The standard path rejects nondeterministic kernels. Fast mode
-            # permits them for throughput and restores the caller's setting.
             # Deterministic CUDA may require CUBLAS_WORKSPACE_CONFIG before
             # process startup; PyTorch reports that requirement when needed.
-            torch.use_deterministic_algorithms(not bool(kwargs.get('fast', False)))
+            torch.use_deterministic_algorithms(True)
             torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
             return function(model, *args, **kwargs)
@@ -1555,12 +1553,12 @@ class _LowConfidenceDistribution:
     log_cdf: torch.Tensor
 
 
-def _low_confidence_distribution(logits_native, temperature, context, fast_cdf=False):
+def _low_confidence_distribution(logits_native, temperature, context):
     """Canonical row-wise FP64 arithmetic for ``[rows, vocabulary]`` logits."""
     if logits_native.ndim != 2 or logits_native.shape[-1] == 0:
         raise ValueError(f"Expected nonempty [remaining, vocabulary] logits ({context}).")
     logits = logits_native.to(torch.float64)
-    if not fast_cdf and bool((torch.isnan(logits) | torch.isposinf(logits)).any().item()):
+    if bool((torch.isnan(logits) | torch.isposinf(logits)).any().item()):
         raise FloatingPointError(f"Invalid model logits ({context}): NaN or +inf.")
     log_Z_conf = torch.logsumexp(logits, dim=-1)
     log_Z_sample = (log_Z_conf if temperature == 1.0 else
@@ -1568,7 +1566,7 @@ def _low_confidence_distribution(logits_native, temperature, context, fast_cdf=F
     if not bool((torch.isfinite(log_Z_conf) & torch.isfinite(log_Z_sample)).all().item()):
         raise FloatingPointError(f"Nonfinite distribution normalizer ({context}).")
 
-    if temperature != 1.0 and not fast_cdf:
+    if temperature != 1.0:
         confidence_logs = logits - log_Z_conf.unsqueeze(-1)
         _check_low_confidence_log_mass(confidence_logs, 'confidence probabilities', context)
         confidence_total = torch.logsumexp(confidence_logs, dim=-1)
@@ -1577,51 +1575,29 @@ def _low_confidence_distribution(logits_native, temperature, context, fast_cdf=F
             raise FloatingPointError(f"Confidence distribution is not normalized ({context}).")
         del confidence_logs
 
-    if not fast_cdf:
-        sample_logs = logits / temperature - log_Z_sample.unsqueeze(-1)
-        _check_low_confidence_log_mass(sample_logs, 'token probabilities', context)
-        log_total = torch.logsumexp(sample_logs, dim=-1)
-        if not bool((torch.isfinite(log_total) & (log_total.abs() <= _LOW_CONFIDENCE_LOG_TOL)).all().item()):
-            raise FloatingPointError(f"Sampling distribution is not normalized ({context}).")
-        del sample_logs
+    sample_logs = logits / temperature - log_Z_sample.unsqueeze(-1)
+    _check_low_confidence_log_mass(sample_logs, 'token probabilities', context)
+    log_total = torch.logsumexp(sample_logs, dim=-1)
+    if not bool((torch.isfinite(log_total) & (log_total.abs() <= _LOW_CONFIDENCE_LOG_TOL)).all().item()):
+        raise FloatingPointError(f"Sampling distribution is not normalized ({context}).")
+    del sample_logs
 
     sorted_native, sorted_token_ids = torch.sort(logits_native, dim=-1)
     sorted_logits = sorted_native.to(torch.float64)
     sorted_sample_logits = (sorted_logits if temperature == 1.0 else
                             sorted_logits / temperature)
-    if fast_cdf:
-        # A probability-space FP64 scan is substantially cheaper than
-        # logcumsumexp on CUDA. Underflow can affect only subnormal tail mass.
-        log_cdf = torch.cumsum(
-            torch.exp(sorted_sample_logits - log_Z_sample.unsqueeze(-1)),
-            dim=-1,
-        ).log_()
-    else:
-        log_cdf = torch.logcumsumexp(
-            sorted_sample_logits, dim=-1,
-        ) - log_Z_sample.unsqueeze(-1)
-    if not fast_cdf:
-        _check_low_confidence_log_mass(log_cdf, 'sampling CDF', context)
+    log_cdf = torch.logcumsumexp(
+        sorted_sample_logits, dim=-1,
+    ) - log_Z_sample.unsqueeze(-1)
+    _check_low_confidence_log_mass(log_cdf, 'sampling CDF', context)
     if not bool((log_cdf[:, -1].abs() <= _LOW_CONFIDENCE_LOG_TOL).all().item()):
         raise FloatingPointError(f"Sampling CDF is not normalized ({context}).")
-    if not fast_cdf and bool((log_cdf[:, 1:] < log_cdf[:, :-1]).any().item()):
+    if bool((log_cdf[:, 1:] < log_cdf[:, :-1]).any().item()):
         raise FloatingPointError(f"Sampling CDF is not monotone ({context}).")
     log_cdf.clamp_max_(0.0)
     return _LowConfidenceDistribution(
         logits, log_Z_conf, log_Z_sample, sorted_logits, sorted_token_ids, log_cdf,
     )
-
-
-def _fast_path_forward_batch_size(device):
-    """Leave room for model weights and FP64 vocabulary arrays on smaller GPUs."""
-    if device.type != 'cuda':
-        return 128
-    memory_gib = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-    if memory_gib >= 40:
-        return 128
-    if memory_gib >= 24:
-        return 32
-    return 8
 
 
 def _scaled_mc_state_groups(alive, state_bits, full_mask=None):
@@ -1729,71 +1705,6 @@ class _LowConfidenceStateEvaluator:
                 self.prepared_cache[key] = (distribution, size)
                 self.prepared_cache_bytes += size
         return distribution
-
-    def batched_distributions(self, x_rows, revealed_rows, temperature):
-        """Evaluate distinct states together, projecting only active LLaDA slots.
-
-        This is an opt-in throughput path. A model whose logits change with the
-        forward batch shape can produce slightly different estimates.
-        """
-        count = x_rows.shape[0]
-        if count == 0:
-            return []
-        active = [self.masked_positions[~revealed_rows[row]] for row in range(count)]
-        projection_layer = _random_remasking_projection_layer(self.model)
-        positions = None
-        if projection_layer is not None:
-            width = max(int(item.numel()) for item in active)
-            positions = torch.stack([
-                torch.nn.functional.pad(item, (0, width - item.numel()), value=0)
-                for item in active
-            ])
-        attention_mask = (None if self.attention_mask is None else
-                          self.attention_mask.expand(count, -1).contiguous())
-        autocast = (torch.autocast(device_type=self.device.type, enabled=False)
-                    if self.device.type in {'cpu', 'cuda'} else nullcontext())
-        with autocast:
-            logits = _random_remasking_forward_logits(
-                self.model, x_rows.contiguous(), attention_mask, positions,
-                projection_layer,
-            )
-        self.forward_rows += count
-        self.forward_calls += 1
-        # Sort and normalize several states at once. Each masked position is
-        # independent, so flattening this axis preserves the FP64 calculation
-        # while avoiding a GPU synchronization for every distinct state.
-        result = []
-        row = 0
-        while row < count:
-            end = row
-            active_tokens = 0
-            while end < count and (end == row or
-                                   active_tokens + active[end].numel() <= 256):
-                active_tokens += active[end].numel()
-                end += 1
-            native_rows = [
-                (logits[index, :active[index].numel(), :]
-                 if positions is not None else logits[index, active[index], :])
-                for index in range(row, end)
-            ]
-            flat = _low_confidence_distribution(
-                torch.cat(native_rows, dim=0), temperature,
-                f"batched states {row + 1}-{end}", fast_cdf=True,
-            )
-            lengths = [active[index].numel() for index in range(row, end)]
-            fields = [
-                field.split(lengths, dim=0)
-                for field in (flat.logits, flat.log_Z_conf, flat.log_Z_sample,
-                              flat.sorted_logits, flat.sorted_token_ids, flat.log_cdf)
-            ]
-            result.extend(
-                _LowConfidenceDistribution(*(parts[index].contiguous().clone()
-                                             for parts in fields))
-                for index in range(end - row)
-            )
-            row = end
-        return result
-
 
 def _target_probability_state(
     model, x_row, active_abs_positions, active_target_ids, attention_mask,
@@ -2187,10 +2098,9 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     verbose_compact: bool = False,
     use_state_cache: bool = True,
     return_sample_times: bool = False,
-    fast: bool = False,
 ) -> Dict[str, object]:
     """
-    Fast successful-trajectory estimator for low-confidence remasking.
+    Successful-trajectory estimator for low-confidence remasking.
 
     Estimates
 
@@ -2266,11 +2176,9 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     shared in implementation with direct MC. use_state_cache=False disables both
     caches for this call.
 
-    By default, model forwards use batch size one. With fast=True, distinct
-    states share a memory-aware forward batch, active LLaDA slots are
-    projected, and the FP64 CDF and competitor calculation are batched.
-    Temporary eval mode is used and the caller's module training flags are
-    restored on return or error. batch_size controls trajectory sampling only.
+    Model forwards use batch size one. Temporary eval mode is used and the
+    caller's module training flags are restored on return or error.
+    batch_size controls trajectory sampling only.
     Custom stochastic/stateful eval forwards remain unsupported.
 
     The default trajectory batch is 1024, covering typical 300-1000-sample runs
@@ -2300,7 +2208,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
     """
 
     device = _model_device(model)
-    forward_batch_size = _fast_path_forward_batch_size(device) if fast else 1
+    forward_batch_size = 1
 
     # Keep model parameters/buffers in their existing dtype to avoid the VRAM
     # cost of model.double().  Only the active-position logits are promoted to
@@ -2481,7 +2389,6 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         alive: torch.Tensor,          # [bsz]
         num_unrevealed: int,
         verbose_draw_counts: Optional[List[int]] = None,
-        prefetched_distribution: Optional[_LowConfidenceDistribution] = None,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, object]]]:
         """
         Returns
@@ -2525,10 +2432,7 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         ]
         # [bsz, m]
 
-        # This function always receives one state. Fast mode may have obtained
-        # its distribution from a shared model forward.
-        distribution = (prefetched_distribution if prefetched_distribution is not None
-                        else state_evaluator.distribution(x[0], revealed[0], tau))
+        distribution = state_evaluator.distribution(x[0], revealed[0], tau)
         active_logits = distribution.logits.unsqueeze(0)
         log_Z_conf = distribution.log_Z_conf.unsqueeze(0)
         log_Z_sample = distribution.log_Z_sample.unsqueeze(0)
@@ -2807,40 +2711,25 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         #   competitor j == i -> neutral factor 1
         # --------------------------------------------------------------
 
-        if fast:
-            competitor_j = torch.arange(m, device=device).view(1, m, 1)
-            proposed_i = torch.arange(m, device=device).view(1, 1, m)
+        proposed_i = torch.arange(
+            m, dtype=torch.long, device=device,
+        ).view(1, m)
+        log_smallest_index_win_mass = torch.zeros(
+            (bsz, m), dtype=torch.float64, device=device,
+        )
+        for competitor_j in range(m):
             competitor_factor = torch.where(
                 competitor_j < proposed_i,
-                log_L,
+                log_L[:, competitor_j, :],
                 torch.where(
                     competitor_j > proposed_i,
-                    log_LE,
+                    log_LE[:, competitor_j, :],
                     torch.zeros((), dtype=torch.float64, device=device),
                 ),
             )
-            log_smallest_index_win_mass = competitor_factor.sum(dim=1)
-        else:
-            proposed_i = torch.arange(
-                m, dtype=torch.long, device=device,
-            ).view(1, m)
-            log_smallest_index_win_mass = torch.zeros(
-                (bsz, m), dtype=torch.float64, device=device,
+            log_smallest_index_win_mass = (
+                log_smallest_index_win_mass + competitor_factor
             )
-            # Preserve the original accumulation order for the default path.
-            for competitor_j in range(m):
-                competitor_factor = torch.where(
-                    competitor_j < proposed_i,
-                    log_L[:, competitor_j, :],
-                    torch.where(
-                        competitor_j > proposed_i,
-                        log_LE[:, competitor_j, :],
-                        torch.zeros((), dtype=torch.float64, device=device),
-                    ),
-                )
-                log_smallest_index_win_mass = (
-                    log_smallest_index_win_mass + competitor_factor
-                )
 
         log_a_active = (
             target_sample_log_probs
@@ -2914,91 +2803,13 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
 
         return log_a_full, verbose_batch
 
-    def _compute_fast_log_a_for_distinct_states(revealed_rows, distributions, m):
-        """Score distinct states of one reveal step in a single GPU operation."""
-        count = len(distributions)
-        active_slots = slot_grid_base.expand(count, -1)[~revealed_rows].view(count, m)
-        targets = masked_target_row[active_slots]
-        logits = torch.stack([item.logits for item in distributions], dim=0)
-        log_z_conf = torch.stack([item.log_Z_conf for item in distributions], dim=0)
-        log_z_sample = torch.stack([item.log_Z_sample for item in distributions], dim=0)
-        raw_targets = logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        target_conf_logs = raw_targets - log_z_conf
-        target_sample_logs = (
-            target_conf_logs if tau == 1.0
-            else raw_targets / tau - log_z_sample
-        )
-        if m == 1:
-            active_logs = target_sample_logs
-        else:
-            sorted_logits = torch.stack(
-                [item.sorted_logits for item in distributions], dim=0,
-            )
-            log_cdf = torch.stack([item.log_cdf for item in distributions], dim=0)
-            sorted_conf = sorted_logits - log_z_conf.unsqueeze(-1)
-            comparison = target_conf_logs.unsqueeze(1).expand(-1, m, -1).contiguous()
-            left = torch.searchsorted(sorted_conf, comparison, right=False)
-            right = torch.searchsorted(sorted_conf, comparison, right=True)
-            vocab_size = sorted_logits.shape[-1]
-            log_less = log_cdf.gather(-1, (left - 1).clamp(0, vocab_size - 1))
-            log_less_equal = log_cdf.gather(-1, (right - 1).clamp(0, vocab_size - 1))
-            log_less.masked_fill_(left == 0, -math.inf)
-            log_less.masked_fill_(left == vocab_size, 0.0)
-            log_less_equal.masked_fill_(right == 0, -math.inf)
-            log_less_equal.masked_fill_(right == vocab_size, 0.0)
-            competitor = torch.arange(m, device=device).view(1, m, 1)
-            proposed = torch.arange(m, device=device).view(1, 1, m)
-            factors = torch.where(
-                competitor < proposed, log_less,
-                torch.where(competitor > proposed, log_less_equal,
-                            torch.zeros((), dtype=torch.float64, device=device)),
-            )
-            active_logs = target_sample_logs + factors.sum(dim=1)
-        result = torch.full(
-            (count, masked_len), -math.inf, dtype=torch.float64, device=device,
-        )
-        result.scatter_(1, active_slots, active_logs)
-        _check_low_confidence_log_mass(
-            result, 'successful transition masses',
-            f'batch of {count} states with {m} masked positions',
-        )
-        return result
-
     def _compute_log_a_for_batch_uncached(
         x, revealed, alive, num_unrevealed, verbose_draw_counts=None,
     ):
-        # In fast mode, model forwards share a batch. Vocabulary arithmetic
-        # remains per-state in FP64 to preserve the estimator formula.
         log_a_rows = []
         diagnostic_rows = []
         for chunk_start in range(0, x.shape[0], forward_batch_size):
             chunk_end = min(x.shape[0], chunk_start + forward_batch_size)
-            live_chunk = [row for row in range(chunk_start, chunk_end)
-                          if bool(alive[row].item())]
-            distributions = {}
-            if fast and live_chunk:
-                live_indices = torch.tensor(live_chunk, dtype=torch.long, device=device)
-                batch = state_evaluator.batched_distributions(
-                    x.index_select(0, live_indices),
-                    revealed.index_select(0, live_indices), tau,
-                )
-                distributions = dict(zip(live_chunk, batch))
-                del batch
-            if fast and not verbose:
-                chunk_result = torch.full(
-                    (chunk_end - chunk_start, masked_len), -math.inf,
-                    dtype=torch.float64, device=device,
-                )
-                if live_chunk:
-                    live_result = _compute_fast_log_a_for_distinct_states(
-                        revealed.index_select(0, live_indices),
-                        [distributions[row] for row in live_chunk], num_unrevealed,
-                    )
-                    local_indices = live_indices - chunk_start
-                    chunk_result.index_copy_(0, local_indices, live_result)
-                log_a_rows.append(chunk_result)
-                distributions.clear()
-                continue
             for row in range(chunk_start, chunk_end):
                 if not bool(alive[row].item()):
                     # Dummy reveal paths after zero success mass never need a
@@ -3027,7 +2838,6 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                     x[row:row + 1], revealed[row:row + 1], alive[row:row + 1],
                     num_unrevealed,
                     None if verbose_draw_counts is None else [verbose_draw_counts[row]],
-                    distributions.get(row),
                 )
                 _check_low_confidence_log_mass(
                     log_a_row, 'successful transition masses',
@@ -3036,7 +2846,6 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
                 log_a_rows.append(log_a_row)
                 if verbose:
                     diagnostic_rows.append(diagnostic)
-            distributions.clear()
         merged = None
         if verbose:
             merged = {
@@ -3688,7 +3497,6 @@ def _path_sampling_low_confidence_probability_fast_from_partially_masked(
         "verbose_diagnostic_forward_rows": verbose_diagnostic_forward_rows,
         "model_forward_rows": state_evaluator.forward_rows,
         "model_forward_calls": state_evaluator.forward_calls,
-        "fast": bool(fast),
     }
 
     if return_samples:
@@ -4191,7 +3999,6 @@ def compute_diffusion_probabilistic_extraction(
     confidence_threshold: float = 0.9,
     return_sample_logs: bool = False,
     return_sample_times: bool = False,
-    fast: bool = False,
     use_state_cache: bool = True,
     scale: bool = False,
 ):
@@ -4225,7 +4032,7 @@ def compute_diffusion_probabilistic_extraction(
         Maximum model steps per partially masked random path. ``None`` preserves
         one-token-at-a-time conditioning for all requested ``steps``.
     confidence_threshold:
-        Untempered candidate-confidence cutoff used by ``remasking='fast-dllm'``.
+        Untempered candidate-confidence cutoff used by ``remasking='threshold'``.
         Every candidate meeting the cutoff is revealed; if none does, the
         smallest-index maximum-confidence candidate is revealed.
     return_sample_logs:
@@ -4234,12 +4041,9 @@ def compute_diffusion_probabilistic_extraction(
     return_sample_times:
         Include each sample's wall clock latency from batch start until the
         batch results are ready. Samples in one batch share this duration.
-    fast:
-        Batch distinct states and use faster FP64 CDF arithmetic for partially
-        masked low-confidence or fast-dLLM path sampling.
     use_state_cache:
         Cache computations by revealed state for partially masked low-confidence
-        or fast-dLLM Monte Carlo and path sampling.
+        or threshold Monte Carlo and path sampling.
     scale:
         Use high-sample-count Monte Carlo optimizations without changing the
         sampling law. Seeded trajectories may differ from the standard path.
@@ -4248,19 +4052,12 @@ def compute_diffusion_probabilistic_extraction(
         raise ValueError('prompt_tokens must have shape (1, a).')
     if scale and not (
         estimation_method == 'monte-carlo'
-        and remasking in {'low-confidence', 'fast-dllm'}
+        and remasking in {'low-confidence', 'threshold'}
         and masked_indexes is not None
     ):
-        raise ValueError('scale requires partially masked low-confidence or fast-dLLM Monte Carlo.')
+        raise ValueError('scale requires partially masked low-confidence or threshold Monte Carlo.')
     if target_tokens.ndim != 2 or target_tokens.shape[0] != 1:
         raise ValueError('target_tokens must have shape (1, j).')
-    if fast and not (
-        estimation_method == 'path_sampling'
-        and remasking in {'fast-dllm', 'low-confidence'}
-        and masked_indexes is not None
-    ):
-        raise ValueError('--fast requires path_sampling with partially masked fast-dllm or low-confidence.')
-
     use_variable_count_low_confidence_masks = (
         model_family.lower() == 'llada'
         and (
@@ -4270,7 +4067,7 @@ def compute_diffusion_probabilistic_extraction(
             )
             or (
                 estimation_method in {'exact', 'path_sampling', 'monte-carlo'}
-                and remasking == 'fast-dllm'
+                and remasking == 'threshold'
             )
         )
         and masked_indexes is not None
@@ -4299,17 +4096,17 @@ def compute_diffusion_probabilistic_extraction(
     if verbose:
         valid_path_verbose = (
             normalized_masked_indexes is not None
-            and remasking in {'low-confidence', 'fast-dllm'}
+            and remasking in {'low-confidence', 'threshold'}
             and estimation_method == 'path_sampling'
             and normalized_decoding_scheme == 'full'
             and (
-                remasking == 'fast-dllm'
+                remasking == 'threshold'
                 or math.isclose(float(temperature), 1.0, rel_tol=0.0, abs_tol=1e-9)
             )
         )
         valid_mc_verbose = (
             normalized_masked_indexes is not None
-            and remasking in {'low-confidence', 'fast-dllm'}
+            and remasking in {'low-confidence', 'threshold'}
             and estimation_method == 'monte-carlo'
             and normalized_decoding_scheme == 'full'
             and math.isfinite(float(temperature))
@@ -4358,23 +4155,23 @@ def compute_diffusion_probabilistic_extraction(
     if normalized_masked_indexes is None and target_tokens.shape[1] < steps:
         raise ValueError('steps must be <= target suffix length for this scheduler.')
 
-    if remasking == 'fast-dllm':
+    if remasking == 'threshold':
         if normalized_masked_indexes is None:
             raise ValueError(
-                'remasking="fast-dllm" requires --masked_indexes for a '
+                'remasking="threshold" requires --masked_indexes for a '
                 '100-token partially masked sequence.'
             )
         if normalized_decoding_scheme != 'full':
             raise ValueError(
-                'remasking="fast-dllm" only supports decoding_scheme="full".'
+                'remasking="threshold" only supports decoding_scheme="full".'
             )
         if estimation_method not in {'exact', 'path_sampling', 'monte-carlo'}:
             raise ValueError(
-                'remasking="fast-dllm" supports estimation_method '
+                'remasking="threshold" supports estimation_method '
                 '"exact", "path_sampling", or "monte-carlo".'
             )
         if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
-            raise ValueError('fast-dLLM requires finite temperature > 0.')
+            raise ValueError('threshold requires finite temperature > 0.')
         if (
             not math.isfinite(float(confidence_threshold))
             or not 0.0 <= float(confidence_threshold) <= 1.0
@@ -4384,7 +4181,7 @@ def compute_diffusion_probabilistic_extraction(
             raise ValueError('num_samples must be > 0.')
 
         if estimation_method == 'exact':
-            result = _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
+            result = _exact_threshold_probability_dp_from_partially_masked(
                 model=model,
                 sequence_tokens=sequence_tokens,
                 masked_indexes=normalized_masked_indexes,
@@ -4397,7 +4194,7 @@ def compute_diffusion_probabilistic_extraction(
             return {
                 **result,
                 'method': 'exact',
-                'remasking': 'fast-dllm',
+                'remasking': 'threshold',
                 'decoding_scheme': 'full',
                 'k': None,
             }
@@ -4418,20 +4215,19 @@ def compute_diffusion_probabilistic_extraction(
             return_sample_times=return_sample_times,
         )
         if estimation_method == 'path_sampling':
-            result = _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
+            result = _path_sampling_threshold_probability_fast_from_partially_masked(
                 **common,
-                fast=fast,
                 use_state_cache=use_state_cache,
             )
             return {
                 **result,
                 'method': 'path_sampling',
-                'remasking': 'fast-dllm',
+                'remasking': 'threshold',
                 'decoding_scheme': 'full',
                 'k': None,
             }
 
-        mc = _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
+        mc = _monte_carlo_threshold_probability_fast_from_partially_masked(
             **common,
             decoding_scheme='full',
             k=k,
@@ -4451,7 +4247,7 @@ def compute_diffusion_probabilistic_extraction(
             'verbose_samples': mc.verbose_samples,
             'sample_log_probabilities': mc.sample_log_probabilities,
             'sample_wall_time_seconds': mc.sample_wall_time_seconds,
-            'remasking': 'fast-dllm',
+            'remasking': 'threshold',
             'decoding_scheme': 'full',
             'k': None,
             'temperature': temperature,
@@ -4600,7 +4396,6 @@ def compute_diffusion_probabilistic_extraction(
                     verbose=verbose,
                     verbose_compact=verbose_compact,
                     return_sample_times=return_sample_times,
-                    fast=fast,
                     use_state_cache=use_state_cache,
                 )
                 return {
@@ -4612,7 +4407,6 @@ def compute_diffusion_probabilistic_extraction(
                     'sample_wall_time_seconds': path_sampling_result['sample_wall_time_seconds'],
                     'verbose_samples': path_sampling_result['verbose_samples'],
                     'num_samples': path_sampling_result['num_samples'],
-                    'fast': bool(fast),
                     'remasking': 'low-confidence',
                     'decoding_scheme': normalized_decoding_scheme,
                     'k': None,
@@ -5512,7 +5306,7 @@ def _monte_carlo_probability_temperature_fast_from_partially_masked(
     )
 
 @dataclass
-class _FastDLLMSuccessMasses:
+class _ThresholdSuccessMasses:
     active_slots: torch.Tensor
     log_ell: torch.Tensor
     log_r: torch.Tensor
@@ -5524,7 +5318,7 @@ class _FastDLLMSuccessMasses:
     log_A: torch.Tensor
 
 
-def _prepare_fast_dllm_inputs(
+def _prepare_threshold_inputs(
     model,
     sequence_tokens,
     masked_indexes,
@@ -5534,7 +5328,7 @@ def _prepare_fast_dllm_inputs(
     confidence_threshold,
     num_samples: Optional[int],
 ):
-    """Validate and canonicalize the shared fast-dLLM estimator inputs."""
+    """Validate and canonicalize the shared threshold estimator inputs."""
     device = _model_device(model)
     sequence_tokens = sequence_tokens.to(device)
     if sequence_tokens.ndim != 2 or sequence_tokens.shape[0] != 1:
@@ -5554,7 +5348,7 @@ def _prepare_fast_dllm_inputs(
         )
     if int(steps) != len(masked_pos):
         raise ValueError(
-            "fast-dLLM can take fewer decoding iterations because a threshold "
+            "threshold can take fewer decoding iterations because a threshold "
             "step may reveal several tokens, but steps must specify the safe "
             f"maximum len(masked_indexes)={len(masked_pos)}."
         )
@@ -5586,14 +5380,14 @@ def _prepare_fast_dllm_inputs(
     )
 
 
-def _fast_dllm_success_masses(
+def _threshold_success_masses(
     distribution: _LowConfidenceDistribution,
     active_slots: torch.Tensor,
     active_target_ids: torch.Tensor,
     temperature: float,
     confidence_threshold: float,
     context: str,
-) -> _FastDLLMSuccessMasses:
+) -> _ThresholdSuccessMasses:
     """Exact FP64 successful threshold/fallback masses for one state.
 
     The nonempty threshold mass is accumulated by partitioning on the first
@@ -5608,7 +5402,7 @@ def _fast_dllm_success_masses(
         else target_logits / temperature - distribution.log_Z_sample
     )
     _check_low_confidence_log_mass(
-        target_sample_logs, "fast-dLLM target probabilities", context,
+        target_sample_logs, "threshold target probabilities", context,
     )
 
     log_threshold = (
@@ -5686,12 +5480,12 @@ def _fast_dllm_success_masses(
     log_A_fallback = torch.logsumexp(log_alpha_fallback, dim=0)
     log_A = torch.logaddexp(log_A_threshold, log_A_fallback)
 
-    _check_low_confidence_log_mass(log_ell, "fast-dLLM below-threshold masses", context)
-    _check_low_confidence_log_mass(log_r, "fast-dLLM selected-target masses", context)
+    _check_low_confidence_log_mass(log_ell, "threshold below-threshold masses", context)
+    _check_low_confidence_log_mass(log_r, "threshold selected-target masses", context)
     _check_low_confidence_log_mass(
-        log_alpha_fallback, "fast-dLLM fallback transition masses", context,
+        log_alpha_fallback, "threshold fallback transition masses", context,
     )
-    _check_low_confidence_log_mass(log_A, "fast-dLLM A(S)", context)
+    _check_low_confidence_log_mass(log_A, "threshold A(S)", context)
 
     threshold_bernoulli = torch.zeros_like(log_r)
     finite_good = torch.isfinite(log_good)
@@ -5699,7 +5493,7 @@ def _fast_dllm_success_masses(
         log_r[finite_good] - log_good[finite_good]
     )
     threshold_bernoulli.clamp_(0.0, 1.0)
-    return _FastDLLMSuccessMasses(
+    return _ThresholdSuccessMasses(
         active_slots=active_slots,
         log_ell=log_ell,
         log_r=log_r,
@@ -5720,15 +5514,15 @@ def _draw_uniform(shape, device, rng_device, rng, sample_on_device):
     ).to(device)
 
 
-def _fast_dllm_success_masses_batched(
+def _threshold_success_masses_batched(
     distribution: _LowConfidenceDistribution,
     active_slots: torch.Tensor,
     active_target_ids: torch.Tensor,
     temperature: float,
     confidence_threshold: float,
     context: str,
-) -> _FastDLLMSuccessMasses:
-    """Vectorized equivalent of ``_fast_dllm_success_masses`` for exact DP.
+) -> _ThresholdSuccessMasses:
+    """Vectorized equivalent of ``_threshold_success_masses`` for exact DP.
 
     The flattened distribution has ``batch * remaining`` independent rows;
     returned per-position fields have shape ``[batch, remaining]`` and totals
@@ -5753,7 +5547,7 @@ def _fast_dllm_success_masses_batched(
         else target_logits / temperature - log_z_sample
     )
     _check_low_confidence_log_mass(
-        target_sample_logs, "fast-dLLM target probabilities", context,
+        target_sample_logs, "threshold target probabilities", context,
     )
 
     log_threshold = (
@@ -5821,19 +5615,19 @@ def _fast_dllm_success_masses_batched(
     log_A_fallback = torch.logsumexp(log_alpha_fallback, dim=1)
     log_A = torch.logaddexp(log_A_threshold, log_A_fallback)
 
-    _check_low_confidence_log_mass(log_ell, "fast-dLLM below-threshold masses", context)
-    _check_low_confidence_log_mass(log_r, "fast-dLLM selected-target masses", context)
+    _check_low_confidence_log_mass(log_ell, "threshold below-threshold masses", context)
+    _check_low_confidence_log_mass(log_r, "threshold selected-target masses", context)
     _check_low_confidence_log_mass(
-        log_alpha_fallback, "fast-dLLM fallback transition masses", context,
+        log_alpha_fallback, "threshold fallback transition masses", context,
     )
-    _check_low_confidence_log_mass(log_A, "fast-dLLM A(S)", context)
+    _check_low_confidence_log_mass(log_A, "threshold A(S)", context)
     threshold_bernoulli = torch.zeros_like(log_r)
     finite_good = torch.isfinite(log_good)
     threshold_bernoulli[finite_good] = torch.exp(
         log_r[finite_good] - log_good[finite_good]
     )
     threshold_bernoulli.clamp_(0.0, 1.0)
-    return _FastDLLMSuccessMasses(
+    return _ThresholdSuccessMasses(
         active_slots=active_slots,
         log_ell=log_ell,
         log_r=log_r,
@@ -5857,8 +5651,8 @@ def _draw_from_log_weights(log_weights, count, device, rng, sample_on_device):
     ).to(device)
 
 
-def _sample_fast_dllm_successful_subsets(
-    masses: _FastDLLMSuccessMasses,
+def _sample_threshold_successful_subsets(
+    masses: _ThresholdSuccessMasses,
     count: int,
     device,
     rng_device,
@@ -5895,7 +5689,7 @@ def _sample_fast_dllm_successful_subsets(
     fallback_rows = torch.nonzero(~branch_threshold, as_tuple=False).squeeze(-1)
     if fallback_rows.numel() > 0:
         if not torch.isfinite(masses.log_A_fallback):
-            raise RuntimeError("Selected a zero-mass fast-dLLM fallback branch.")
+            raise RuntimeError("Selected a zero-mass threshold fallback branch.")
         winners = _draw_from_log_weights(
             masses.log_alpha_fallback,
             int(fallback_rows.numel()),
@@ -5905,13 +5699,13 @@ def _sample_fast_dllm_successful_subsets(
         )
         selected[fallback_rows, winners] = True
     if not bool(selected.any(dim=1).all().item()):
-        raise RuntimeError("fast-dLLM successful proposal produced an empty subset.")
+        raise RuntimeError("threshold successful proposal produced an empty subset.")
     return selected, branch_threshold
 
 
 @torch.inference_mode()
 @_low_confidence_eval_mode
-def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
+def _path_sampling_threshold_probability_fast_from_partially_masked(
     model,
     sequence_tokens: torch.Tensor,
     masked_indexes: list[int],
@@ -5928,20 +5722,19 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
     verbose_compact: bool = False,
     use_state_cache: bool = True,
     return_sample_times: bool = False,
-    fast: bool = False,
 ) -> Dict[str, object]:
-    """Successful-trajectory estimator for fast-dLLM threshold remasking."""
+    """Successful-trajectory estimator for threshold remasking."""
     (
         device, sequence_tokens, attention_mask, masked_pos_t,
         masked_target_row, tau, threshold,
-    ) = _prepare_fast_dllm_inputs(
+    ) = _prepare_threshold_inputs(
         model, sequence_tokens, masked_indexes, steps, attention_mask,
         temperature, confidence_threshold, num_samples,
     )
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     masked_len = int(masked_pos_t.numel())
-    forward_batch_size = _fast_path_forward_batch_size(device) if fast else 1
+    forward_batch_size = 1
     rng_device = device if device.type in {"cpu", "cuda"} else torch.device("cpu")
     sample_on_device = device.type in {"cpu", "cuda"}
     rng = None if seed is None else torch.Generator(device=rng_device)
@@ -5951,7 +5744,7 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
     evaluator = _LowConfidenceStateEvaluator(
         model, attention_mask, masked_pos_t, use_cache=False,
     )
-    state_cache: Dict[Tuple[bool, ...], _FastDLLMSuccessMasses] = {}
+    state_cache: Dict[Tuple[bool, ...], _ThresholdSuccessMasses] = {}
     cache_requests = cache_hits = cache_misses = 0
     running_log_sum = torch.tensor(-math.inf, dtype=torch.float64, device=device)
     sample_logs: List[float] = []
@@ -5994,59 +5787,9 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
             for row, bits in zip(rows_live, states):
                 rows_by_state.setdefault(tuple(bool(bit) for bit in bits), []).append(row)
 
-            # All states at this decoder step are already known. Batch only
-            # cache misses; proposal sampling below still uses the same masses.
-            step_masses = {}
-            if fast:
-                missing = [key for key in rows_by_state
-                           if not use_state_cache or key not in state_cache]
-                for start in range(0, len(missing), forward_batch_size):
-                    keys = missing[start:start + forward_batch_size]
-                    representatives = [rows_by_state[key][0] for key in keys]
-                    rep_t = torch.tensor(representatives, dtype=torch.long, device=device)
-                    distributions = evaluator.batched_distributions(
-                        x.index_select(0, rep_t), revealed.index_select(0, rep_t), tau,
-                    )
-                    groups = {}
-                    for index, key in enumerate(keys):
-                        remaining = masked_len - sum(key)
-                        groups.setdefault(remaining, []).append(index)
-                    for remaining, indices in groups.items():
-                        selected = [distributions[index] for index in indices]
-                        flat = _LowConfidenceDistribution(*(
-                            torch.cat([getattr(item, field) for item in selected], dim=0)
-                            for field in (
-                                'logits', 'log_Z_conf', 'log_Z_sample',
-                                'sorted_logits', 'sorted_token_ids', 'log_cdf',
-                            )
-                        ))
-                        active_slots = torch.stack([
-                            torch.nonzero(~revealed[representatives[index]],
-                                          as_tuple=False).squeeze(-1)
-                            for index in indices
-                        ])
-                        masses = _fast_dllm_success_masses_batched(
-                            flat, active_slots, masked_target_row[active_slots],
-                            tau, threshold,
-                            f'batch of {len(indices)} states with {remaining} masked positions',
-                        )
-                        for local_index, index in enumerate(indices):
-                            step_masses[keys[index]] = _FastDLLMSuccessMasses(*(
-                                getattr(masses, field)[local_index].clone()
-                                for field in (
-                                    'active_slots', 'log_ell', 'log_r',
-                                    'log_alpha_fallback', 'log_first_threshold',
-                                    'threshold_bernoulli', 'log_A_threshold',
-                                    'log_A_fallback', 'log_A',
-                                )
-                            ))
-                    del distributions
-
             for key, rows in rows_by_state.items():
                 cache_requests += len(rows)
                 masses = (state_cache.get(key) if use_state_cache else None)
-                if masses is None:
-                    masses = step_masses.get(key)
                 representative = rows[0]
                 if masses is None:
                     active_slots = torch.nonzero(
@@ -6055,7 +5798,7 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
                     distribution = evaluator.distribution(
                         x[representative], revealed[representative], tau,
                     )
-                    masses = _fast_dllm_success_masses(
+                    masses = _threshold_success_masses(
                         distribution,
                         active_slots,
                         masked_target_row[active_slots],
@@ -6076,7 +5819,7 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
                     alive[rows_t] = False
                     continue
                 log_weight[rows_t] += masses.log_A
-                selected, threshold_branch = _sample_fast_dllm_successful_subsets(
+                selected, threshold_branch = _sample_threshold_successful_subsets(
                     masses,
                     len(rows),
                     device,
@@ -6155,7 +5898,7 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
         ),
         "verbose_samples": verbose_samples if verbose else None,
         "num_samples": num_samples,
-        "estimation_method": "path_sampling_fast_dllm_threshold",
+        "estimation_method": "path_sampling_threshold",
         "decoding_scheme": "full",
         "temperature": tau,
         "confidence_threshold": threshold,
@@ -6173,13 +5916,12 @@ def _path_sampling_fast_dllm_threshold_probability_fast_from_partially_masked(
         "state_cache_misses": cache_misses,
         "model_forward_rows": evaluator.forward_rows,
         "model_forward_calls": evaluator.forward_calls,
-        "fast": bool(fast),
     }
 
 
 @torch.inference_mode()
 @_low_confidence_eval_mode
-def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
+def _monte_carlo_threshold_probability_fast_from_partially_masked(
     model,
     sequence_tokens: torch.Tensor,
     masked_indexes: list[int],
@@ -6202,16 +5944,16 @@ def _monte_carlo_fast_dllm_threshold_probability_fast_from_partially_masked(
     return_sample_times: bool = False,
     scale: bool = False,
 ) -> MonteCarloResult:
-    """Direct decoder Monte Carlo for fast-dLLM threshold remasking."""
+    """Direct decoder Monte Carlo for threshold remasking."""
     (
         device, sequence_tokens, attention_mask, masked_pos_t,
         masked_target_row, tau, threshold,
-    ) = _prepare_fast_dllm_inputs(
+    ) = _prepare_threshold_inputs(
         model, sequence_tokens, masked_indexes, steps, attention_mask,
         temperature, confidence_threshold, num_samples,
     )
     if str(decoding_scheme).lower() != "full":
-        raise ValueError('fast-dLLM Monte Carlo requires decoding_scheme="full".')
+        raise ValueError('threshold Monte Carlo requires decoding_scheme="full".')
     _ = k
     if mc_batch_size <= 0 or model_batch_size <= 0:
         raise ValueError("mc_batch_size and model_batch_size must be positive.")
@@ -7408,8 +7150,8 @@ def _exact_low_confidence_probability_dp_from_partially_masked(
     }
 
 
-def _enumerate_fast_dllm_successful_transition_logs(
-    masses: _FastDLLMSuccessMasses,
+def _enumerate_threshold_successful_transition_logs(
+    masses: _ThresholdSuccessMasses,
 ) -> List[Tuple[int, float]]:
     """Return ``(global subset bits, log alpha_B)`` for every nonempty B.
 
@@ -7430,12 +7172,12 @@ def _enumerate_fast_dllm_successful_transition_logs(
             masses.log_alpha_fallback,
         )).detach().cpu().tolist()
     ]
-    return _enumerate_fast_dllm_transition_logs_from_lists(
+    return _enumerate_threshold_transition_logs_from_lists(
         active_slots, log_ell, log_r, log_fallback,
     )
 
 
-def _enumerate_fast_dllm_transition_logs_from_lists(
+def _enumerate_threshold_transition_logs_from_lists(
     active_slots: List[int],
     log_ell: List[float],
     log_r: List[float],
@@ -7476,7 +7218,7 @@ def _enumerate_fast_dllm_transition_logs_from_lists(
 
 @torch.inference_mode()
 @_low_confidence_eval_mode
-def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
+def _exact_threshold_probability_dp_from_partially_masked(
     model,
     sequence_tokens: torch.Tensor,
     masked_indexes: list[int],
@@ -7490,7 +7232,7 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
     evaluate_all_states: bool = False,
     use_selected_logits: bool = False,
 ) -> Dict[str, object]:
-    """Exact subset DP for fast-dLLM threshold remasking.
+    """Exact subset DP for threshold remasking.
 
     ``DP[S]`` is the probability of reaching the correctly revealed subset S.
     From S, the recurrence considers every nonempty successful reveal subset B:
@@ -7499,10 +7241,10 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
 
     ``alpha_B`` exactly combines the threshold branch and, for singleton B,
     the mutually exclusive fallback branch.  Its factors come from the same
-    FP64 distribution and transition-mass routine used by fast-dLLM STS.
+    FP64 distribution and transition-mass routine used by threshold STS.
 
     By default each state uses the same singleton full-logit model forward,
-    FP64 distribution, and successful-transition routine as fast-dLLM STS.
+    FP64 distribution, and successful-transition routine as threshold STS.
     This avoids batch-shape-dependent bfloat16 logits changing the decoder
     being measured.  ``use_selected_logits=True`` explicitly opts into the
     faster frontier-batched LLaDA path for batch-independent models.
@@ -7514,7 +7256,7 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
     (
         device, sequence_tokens, attention_mask, masked_pos_t,
         masked_target_row, tau, threshold,
-    ) = _prepare_fast_dllm_inputs(
+    ) = _prepare_threshold_inputs(
         model, sequence_tokens, masked_indexes, steps, attention_mask,
         temperature, confidence_threshold, None,
     )
@@ -7522,7 +7264,7 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
     if masked_len > max_masked:
         raise ValueError(
             f"masked_len={masked_len} exceeds max_masked={max_masked}; "
-            "exact fast-dLLM DP is exponential."
+            "exact threshold DP is exponential."
         )
     if state_batch_size <= 0:
         raise ValueError("state_batch_size must be positive.")
@@ -7573,7 +7315,7 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
             )
         ):
             raise FloatingPointError(
-                "Enumerated fast-dLLM transition mass disagrees with "
+                "Enumerated threshold transition mass disagrees with "
                 f"analytic A(S) in {context}: enumerated={enumerated_log_A}, "
                 f"analytic={analytic_log_A}."
             )
@@ -7618,7 +7360,7 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
                 distribution = singleton_evaluator.distribution(
                     x_row, revealed, tau,
                 )
-                masses = _fast_dllm_success_masses(
+                masses = _threshold_success_masses(
                     distribution=distribution,
                     active_slots=active_slots,
                     active_target_ids=masked_target_row[active_slots],
@@ -7626,7 +7368,7 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
                     confidence_threshold=threshold,
                     context=context,
                 )
-                transitions = _enumerate_fast_dllm_successful_transition_logs(
+                transitions = _enumerate_threshold_successful_transition_logs(
                     masses,
                 )
                 advance_state(state, transitions, float(masses.log_A.item()), context)
@@ -7693,7 +7435,7 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
                 tau,
                 batch_context,
             )
-            batch_masses = _fast_dllm_success_masses_batched(
+            batch_masses = _threshold_success_masses_batched(
                 distribution=flat_distribution,
                 active_slots=active_slots_batch,
                 active_target_ids=masked_target_row[active_slots_batch],
@@ -7721,7 +7463,7 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
                 context = (
                     f"revealed_count={revealed_count}, revealed_indices={positions}"
                 )
-                transitions = _enumerate_fast_dllm_transition_logs_from_lists(
+                transitions = _enumerate_threshold_transition_logs_from_lists(
                     [int(value) for value in active_slots_cpu[row]],
                     [float(value) for value in mass_components_cpu[0][row]],
                     [float(value) for value in mass_components_cpu[1][row]],
@@ -7738,13 +7480,13 @@ def _exact_fast_dllm_threshold_probability_dp_from_partially_masked(
     log_probability = float(log_dp[full_state])
     _check_low_confidence_log_mass(
         torch.tensor(log_probability, dtype=torch.float64),
-        "final fast-dLLM DP probability", "full revealed subset",
+        "final threshold DP probability", "full revealed subset",
     )
     probability = 0.0 if log_probability == -math.inf else math.exp(log_probability)
     return {
         "probability": float(probability),
         "log_probability": log_probability,
-        "estimation_method": "exact_fast_dllm_threshold_subset_dp",
+        "estimation_method": "exact_threshold_subset_dp",
         "decoding_scheme": "full",
         "temperature": tau,
         "confidence_threshold": threshold,

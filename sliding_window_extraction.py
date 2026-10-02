@@ -68,16 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--model-name', type=str, default=None)
     parser.add_argument('--num-samples', type=int, default=20, help='Samples for Monte Carlo or path sampling')
     parser.add_argument(
-        '--fast', action='store_true',
-        help='Batch model states for partially masked low-confidence or fast-dLLM path sampling.',
-    )
-    parser.add_argument(
         '--nocache', action='store_true',
-        help='Disable state caching for partially masked low-confidence or fast-dLLM sampling.',
+        help='Disable state caching for partially masked low-confidence or threshold sampling.',
     )
     parser.add_argument(
         '--scale', action='store_true',
-        help='Use high-sample-count optimizations for partially masked low-confidence or fast-dLLM Monte Carlo.',
+        help='Use high-sample-count optimizations for partially masked low-confidence or threshold Monte Carlo.',
     )
     parser.add_argument(
         '--random-path-sample-budget',
@@ -116,7 +112,7 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help=(
             'Write verbose.jsonl for supported partially masked '
-            'low-confidence/fast-dLLM path sampling or Monte Carlo, or DUEL estimation.'
+            'low-confidence/threshold path sampling or Monte Carlo, or DUEL estimation.'
         ),
     )
     diagnostics_group.add_argument(
@@ -124,7 +120,7 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help=(
             'Write verbosish.jsonl with per-sample log estimates for partially masked '
-            'low-confidence or fast-dLLM path sampling and Monte Carlo.'
+            'low-confidence or threshold path sampling and Monte Carlo.'
         ),
     )
     diagnostics_group.add_argument(
@@ -132,7 +128,7 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help=(
             'Write verbosisih.jsonl with per-sample log estimates and wall clock '
-            'latencies for partially masked low-confidence or fast-dLLM '
+            'latencies for partially masked low-confidence or threshold '
             'path sampling and Monte Carlo.'
         ),
     )
@@ -156,9 +152,9 @@ def parse_args() -> argparse.Namespace:
         '--confidence-threshold',
         type=float,
         default=0.9,
-        help='Untempered confidence threshold for --remasking fast-dllm.',
+        help='Untempered confidence threshold for --remasking threshold.',
     )
-    parser.add_argument('--remasking', choices=['low-confidence', 'fast-dllm', 'target-token-confidence', 'random', 'highest-index'], default='low-confidence',
+    parser.add_argument('--remasking', choices=['low-confidence', 'threshold', 'target-token-confidence', 'random', 'highest-index'], default='low-confidence',
                         help='Remasking strategy when --model-family llada')
     parser.add_argument(
         '--masked_indexes',
@@ -168,9 +164,9 @@ def parse_args() -> argparse.Namespace:
         help=(
             '1-indexed positions in the 100-token sequence to mask. Exact '
             f'low-confidence LLaDA supports 1-{MAX_EXACT_LOW_CONFIDENCE_MASKED}; '
-            'exact low-confidence/fast-dLLM support '
+            'exact low-confidence/threshold support '
             f'1-{MAX_EXACT_LOW_CONFIDENCE_MASKED}; sampled low-confidence and '
-            'fast-dLLM support 1-100; other '
+            'threshold support 1-100; other '
             'partially masked modes require exactly 50.'
         ),
     )
@@ -403,7 +399,6 @@ def _compute_probability(
         confidence_threshold=args.confidence_threshold,
         return_sample_logs=args.verbosish or args.verbosisih,
         return_sample_times=args.verbosisih,
-        fast=args.fast,
         use_state_cache=not args.nocache,
         scale=args.scale,
     )
@@ -438,31 +433,25 @@ def _compute_probability(
 
 def main() -> None:
     args = parse_args()
-    if args.fast and not (
-        args.model_family == 'llada' and args.mode == 'path_sampling'
-        and args.remasking in {'low-confidence', 'fast-dllm'}
-        and args.masked_indexes is not None
-    ):
-        raise ValueError('--fast requires LLaDA path_sampling with --masked_indexes and --remasking low-confidence or fast-dllm.')
     if args.nocache and not (
         args.model_family == 'llada'
         and args.mode in {'monte-carlo', 'path_sampling'}
-        and args.remasking in {'low-confidence', 'fast-dllm'}
+        and args.remasking in {'low-confidence', 'threshold'}
         and args.masked_indexes is not None
     ):
         raise ValueError(
             '--nocache requires LLaDA Monte Carlo or path sampling with '
-            '--masked_indexes and --remasking low-confidence or fast-dllm.'
+            '--masked_indexes and --remasking low-confidence or threshold.'
         )
     if args.scale and not (
         args.model_family == 'llada'
         and args.mode == 'monte-carlo'
-        and args.remasking in {'low-confidence', 'fast-dllm'}
+        and args.remasking in {'low-confidence', 'threshold'}
         and args.masked_indexes is not None
     ):
         raise ValueError(
             '--scale requires LLaDA Monte Carlo with --masked_indexes and '
-            '--remasking low-confidence or fast-dllm.'
+            '--remasking low-confidence or threshold.'
         )
     use_exact_low_confidence_dp = (
         args.model_family == 'llada'
@@ -476,9 +465,9 @@ def main() -> None:
         and args.remasking == 'low-confidence'
         and args.masked_indexes is not None
     )
-    use_partially_masked_fast_dllm = (
+    use_partially_masked_threshold = (
         args.model_family == 'llada'
-        and args.remasking == 'fast-dllm'
+        and args.remasking == 'threshold'
         and args.mode in {'exact', 'path_sampling', 'monte-carlo'}
         and args.masked_indexes is not None
     )
@@ -489,14 +478,14 @@ def main() -> None:
             if (
                 use_exact_low_confidence_dp
                 or use_partially_masked_low_confidence_path_sampling
-                or use_partially_masked_fast_dllm
+                or use_partially_masked_threshold
             )
             else 50
         ),
     )
     if (
         (use_exact_low_confidence_dp or (
-            use_partially_masked_fast_dllm and args.mode == 'exact'
+            use_partially_masked_threshold and args.mode == 'exact'
         ))
         and len(args.masked_indexes) > MAX_EXACT_LOW_CONFIDENCE_MASKED
     ):
@@ -578,18 +567,18 @@ def main() -> None:
             raise ValueError("--mode must be 'path_sampling' when --remasking random.")
         if decoding_scheme.lower() not in {'full', 'top_k'}:
             raise ValueError("--decoding-scheme must be one of {'full', 'top_k'} when --remasking random.")
-    if args.model_family == 'llada' and args.remasking == 'fast-dllm':
+    if args.model_family == 'llada' and args.remasking == 'threshold':
         if args.mode not in {'exact', 'path_sampling', 'monte-carlo'}:
             raise ValueError(
-                "--remasking fast-dllm requires --mode exact, path_sampling, "
+                "--remasking threshold requires --mode exact, path_sampling, "
                 "or monte-carlo."
             )
         if args.masked_indexes is None:
-            raise ValueError("--remasking fast-dllm requires --masked_indexes.")
+            raise ValueError("--remasking threshold requires --masked_indexes.")
         if decoding_scheme.lower() != 'full':
-            raise ValueError("--remasking fast-dllm requires --decoding-scheme full.")
+            raise ValueError("--remasking threshold requires --decoding-scheme full.")
         if not math.isfinite(args.temperature) or args.temperature <= 0.0:
-            raise ValueError("--remasking fast-dllm requires finite --temperature > 0.")
+            raise ValueError("--remasking threshold requires finite --temperature > 0.")
         if (
             not math.isfinite(args.confidence_threshold)
             or not 0.0 <= args.confidence_threshold <= 1.0
@@ -623,18 +612,18 @@ def main() -> None:
         valid_path_verbose = (
             args.model_family == 'llada'
             and args.mode == 'path_sampling'
-            and args.remasking in {'low-confidence', 'fast-dllm'}
+            and args.remasking in {'low-confidence', 'threshold'}
             and args.masked_indexes is not None
             and decoding_scheme.lower() == 'full'
             and (
-                args.remasking == 'fast-dllm'
+                args.remasking == 'threshold'
                 or math.isclose(args.temperature, 1.0, rel_tol=0.0, abs_tol=1e-9)
             )
         )
         valid_mc_verbose = (
             args.model_family == 'llada'
             and args.mode == 'monte-carlo'
-            and args.remasking in {'low-confidence', 'fast-dllm'}
+            and args.remasking in {'low-confidence', 'threshold'}
             and args.masked_indexes is not None
             and decoding_scheme.lower() == 'full'
             and math.isfinite(args.temperature)
@@ -652,25 +641,25 @@ def main() -> None:
         if not (valid_path_verbose or valid_mc_verbose or valid_duel_verbose):
             raise ValueError(
                 '--verbose requires partially masked LLaDA low-confidence or '
-                'fast-dLLM path sampling/Monte Carlo, or DUEL estimation, with '
+                'threshold path sampling/Monte Carlo, or DUEL estimation, with '
                 'the supported positive temperature and full decoding.'
             )
     if args.verbosish or args.verbosisih:
         valid_path_verbosish = (
             args.model_family == 'llada'
             and args.mode == 'path_sampling'
-            and args.remasking in {'low-confidence', 'fast-dllm'}
+            and args.remasking in {'low-confidence', 'threshold'}
             and args.masked_indexes is not None
             and decoding_scheme.lower() == 'full'
             and (
-                args.remasking == 'fast-dllm'
+                args.remasking == 'threshold'
                 or math.isclose(args.temperature, 1.0, rel_tol=0.0, abs_tol=1e-9)
             )
         )
         valid_mc_verbosish = (
             args.model_family == 'llada'
             and args.mode == 'monte-carlo'
-            and args.remasking in {'low-confidence', 'fast-dllm'}
+            and args.remasking in {'low-confidence', 'threshold'}
             and args.masked_indexes is not None
             and decoding_scheme.lower() == 'full'
             and math.isfinite(args.temperature)
@@ -680,7 +669,7 @@ def main() -> None:
             raise ValueError(
                 '--verbosish and --verbosisih require partially masked LLaDA '
                 'low-confidence or '
-                'fast-dLLM path sampling/Monte Carlo with full decoding. '
+                'threshold path sampling/Monte Carlo with full decoding. '
                 'Low-confidence path sampling requires temperature 1; '
                 'Monte Carlo requires finite positive temperature.'
             )
@@ -858,7 +847,6 @@ def main() -> None:
             'suffix_tokens': args.suffix_tokens,
             'tau_min': args.tau,
             'mode': args.mode,
-            'fast': args.fast,
             'nocache': args.nocache,
             'scale': args.scale,
             'model_family': args.model_family,
