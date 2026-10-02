@@ -137,7 +137,7 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help='Use parallel arrays for candidate values in verbose.jsonl (requires --verbose).',
     )
-    parser.add_argument('--decoding-scheme', choices=['auto', 'full', 'top_k', 'greedy', 'ELBO', 'elbo', 'random'], default='full')
+    parser.add_argument('--decoding-scheme', choices=['auto', 'full', 'top_k', 'greedy', 'ELBO', 'elbo'], default='full')
     parser.add_argument('--k', type=int, default=40, help='Top-k value when --decoding-scheme top_k')
     parser.add_argument(
         '--temperature',
@@ -154,7 +154,7 @@ def parse_args() -> argparse.Namespace:
         default=0.9,
         help='Untempered confidence threshold for --remasking threshold.',
     )
-    parser.add_argument('--remasking', choices=['low-confidence', 'threshold', 'target-token-confidence', 'random', 'highest-index'], default='low-confidence',
+    parser.add_argument('--remasking', choices=['low-confidence', 'threshold', 'random', 'highest-index'], default='low-confidence',
                         help='Remasking strategy when --model-family llada')
     parser.add_argument(
         '--masked_indexes',
@@ -162,9 +162,8 @@ def parse_args() -> argparse.Namespace:
         nargs='+',
         default=None,
         help=(
-            '1-indexed positions in the 100-token sequence to mask. Exact '
-            f'low-confidence LLaDA supports 1-{MAX_EXACT_LOW_CONFIDENCE_MASKED}; '
-            'exact low-confidence/threshold support '
+            'Required for LLaDA: 1-indexed positions in the 100-token sequence to mask. '
+            'Exact low-confidence/threshold support '
             f'1-{MAX_EXACT_LOW_CONFIDENCE_MASKED}; sampled low-confidence and '
             'threshold support 1-100; other '
             'partially masked modes require exactly 50.'
@@ -380,7 +379,7 @@ def _compute_probability(
         model=model,
         prompt_tokens=prompt_tokens,
         target_tokens=target_tokens,
-        steps=len(args.masked_indexes) if args.masked_indexes is not None else len(suffix_ids),
+        steps=len(args.masked_indexes),
         attention_mask=None,
         mask_id=MASK_ID,
         remasking=args.remasking,
@@ -433,6 +432,8 @@ def _compute_probability(
 
 def main() -> None:
     args = parse_args()
+    if args.model_family == 'llada' and args.masked_indexes is None:
+        raise ValueError('--model-family llada requires --masked_indexes.')
     if args.nocache and not (
         args.model_family == 'llada'
         and args.mode in {'monte-carlo', 'path_sampling'}
@@ -541,8 +542,8 @@ def main() -> None:
         if decoding_scheme in {'top_k', 'full'} and args.temperature <= 0:
             raise ValueError("--temperature must be > 0 when --model-family is one of {'llama', 'llama2', 'olmo', 'mistral'} with --decoding-scheme in {'top_k', 'full'}.")
     else:
-        if decoding_scheme.lower() not in {'top_k', 'full', 'elbo', 'random'}:
-            raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'ELBO', 'random'} when --model-family llada.")
+        if decoding_scheme.lower() not in {'top_k', 'full', 'elbo'}:
+            raise ValueError("--decoding-scheme must be one of {'auto', 'top_k', 'full', 'ELBO'} when --model-family llada.")
     if args.model_family == 'llada' and args.mode == 'duel':
         if args.remasking != 'low-confidence':
             raise ValueError("--mode duel requires --remasking low-confidence.")
@@ -554,11 +555,6 @@ def main() -> None:
             raise ValueError("--mode duel requires a finite --temperature greater than 0.")
     if decoding_scheme == 'top_k' and args.k <= 0:
         raise ValueError("--k must be > 0 when --decoding-scheme top_k.")
-    if args.model_family == 'llada' and args.remasking == 'target-token-confidence':
-        if args.mode != 'exact':
-            raise ValueError("--mode must be 'exact' when --remasking target-token-confidence.")
-        if args.temperature <= 0:
-            raise ValueError("--temperature must be > 0 when --remasking target-token-confidence.")
     if args.model_family == 'llada' and args.remasking == 'highest-index':
         if args.mode != 'exact':
             raise ValueError("--mode must be 'exact' when --remasking highest-index.")
