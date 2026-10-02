@@ -20,7 +20,7 @@ Values in the right column are examples from the experiments or CLI defaults. Su
 | `--k` | Vocabulary cutoff for `--decoding-scheme top_k`. | `40` by default; ignored with `full`. |
 | `--temperature` | Token sampling temperature. | `1.0` (default and used throughout the main experiments).|
 | `--confidence-threshold` | Untempered candidate-confidence cutoff for `--remasking threshold`. | `0.9` (default and used in the experiments). |
-| `--num-samples` | Number of path-sampling trajectories or Monte Carlo trials. No effect on `exact` or `duel`. |
+| `--num-samples` | Number of path-sampling trajectories or Monte Carlo trials. No effect on `exact` or `duel`. | `20` by default; `5000` in the example below. |
 | `--stride-words` | Word starts skipped between consecutive windows. | `1` default; `1` and `5` were used. |
 | `--seq-tokens` | Length of each evaluated sequence. | `100` default; masked-index runs require 100. |
 | `--windows` | Evaluate selected **zero-based** window indices in the supplied order. Duplicate indices are run again. | For example `--windows 0 6 11`. |
@@ -35,11 +35,12 @@ Values in the right column are examples from the experiments or CLI defaults. Su
 ## Example configuration
 
 ```powershell
-$mask50 = @(51..100)                             # last 50 positions
+$mask50 = @(51..100) # last 50 positions
 
 # Direct Monte Carlo under threshold remasking
-python .\sliding_window_extraction.py .\texts\MITLicense.txt --model-family llada --mode monte-carlo --remasking threshold --masked_indexes $mask50 --decoding-scheme full --temperature 1 --confidence-threshold 0.9 --num-samples 5000 --stride-words 1
-
+python .\sliding_window_extraction.py .\texts\MITLicense.txt --model-family llada --mode monte-carlo --remasking threshold --masked_indexes $mask50 --decoding-scheme full --temperature 1 --confidence-threshold 0.9 --num-samples 5000 --stride-words 1 --max-windows 1
 ```
+
+This PowerShell example evaluates the first window. Remove `--max-windows 1` to evaluate every available window.
 
 `windows.csv` has one row per evaluated window with `p_z`, its extracted classification, window indices, and any error. `summary.json` records the parameters and aggregate statistics.
