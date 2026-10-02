@@ -1,5 +1,7 @@
 # Estimating Extraction Probabilities in Diffusion Language Models under Confidence-Based Sampling
 
+This repository contains the code for the paper *Estimating Extraction Probabilities in Diffusion Language Models under Confidence-Based Sampling*. It implements the sliding-window extraction experiments for LLaDA and the autoregressive baselines.
+
 Run `sliding_window_extraction.py` from the repository root with a text file in `texts/`. It loads the selected model, slides a token window through the text, estimates an extraction probability `p_z` for each window, and writes `windows.csv` and `summary.json` under `outputs/<text-stem>/<timestamp>/` by default. Install PyTorch, Transformers, and tqdm first; large LLaDA runs require a suitable GPU.
 
 
