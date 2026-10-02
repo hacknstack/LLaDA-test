@@ -116,18 +116,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     diagnostics_group.add_argument(
-        '--verbosish',
+        '--detailed',
         action='store_true',
         help=(
-            'Write verbosish.jsonl with per-sample log estimates for partially masked '
+            'Write detailed.jsonl with per-sample log estimates for partially masked '
             'low-confidence or threshold path sampling and Monte Carlo.'
         ),
     )
     diagnostics_group.add_argument(
-        '--verbosisih',
+        '--detailedWithClockTimes',
         action='store_true',
         help=(
-            'Write verbosisih.jsonl with per-sample log estimates and wall clock '
+            'Write detailedWithClockTimes.jsonl with per-sample log estimates and wall clock '
             'latencies for partially masked low-confidence or threshold '
             'path sampling and Monte Carlo.'
         ),
@@ -397,8 +397,8 @@ def _compute_probability(
         verbose_compact=args.compact,
         verbose_callback=verbose_callback,
         confidence_threshold=args.confidence_threshold,
-        return_sample_logs=args.verbosish or args.verbosisih,
-        return_sample_times=args.verbosisih,
+        return_sample_logs=args.detailed or args.detailedWithClockTimes,
+        return_sample_times=args.detailedWithClockTimes,
         use_state_cache=not args.nocache,
         scale=args.scale,
     )
@@ -408,12 +408,12 @@ def _compute_probability(
         probability = float(result['estimate'])
     if verbose_callback is not None and result['method'] == 'monte-carlo':
         return probability, []
-    if args.verbosish or args.verbosisih:
+    if args.detailed or args.detailedWithClockTimes:
         sample_logs = result.get('sample_log_probabilities')
         if sample_logs is None:
             raise RuntimeError('Estimator did not return per-sample logs.')
-        sample_times = result.get('sample_wall_time_seconds') if args.verbosisih else None
-        if args.verbosisih and (
+        sample_times = result.get('sample_wall_time_seconds') if args.detailedWithClockTimes else None
+        if args.detailedWithClockTimes and (
             sample_times is None or len(sample_logs) != len(sample_times)
         ):
             raise RuntimeError('Estimator did not return matching per-sample times.')
@@ -644,8 +644,8 @@ def main() -> None:
                 'threshold path sampling/Monte Carlo, or DUEL estimation, with '
                 'the supported positive temperature and full decoding.'
             )
-    if args.verbosish or args.verbosisih:
-        valid_path_verbosish = (
+    if args.detailed or args.detailedWithClockTimes:
+        valid_path_detailed = (
             args.model_family == 'llada'
             and args.mode == 'path_sampling'
             and args.remasking in {'low-confidence', 'threshold'}
@@ -656,7 +656,7 @@ def main() -> None:
                 or math.isclose(args.temperature, 1.0, rel_tol=0.0, abs_tol=1e-9)
             )
         )
-        valid_mc_verbosish = (
+        valid_mc_detailed = (
             args.model_family == 'llada'
             and args.mode == 'monte-carlo'
             and args.remasking in {'low-confidence', 'threshold'}
@@ -665,9 +665,9 @@ def main() -> None:
             and math.isfinite(args.temperature)
             and args.temperature > 0.0
         )
-        if not (valid_path_verbosish or valid_mc_verbosish):
+        if not (valid_path_detailed or valid_mc_detailed):
             raise ValueError(
-                '--verbosish and --verbosisih require partially masked LLaDA '
+                '--detailed and --detailedWithClockTimes require partially masked LLaDA '
                 'low-confidence or '
                 'threshold path sampling/Monte Carlo with full decoding. '
                 'Low-confidence path sampling requires temperature 1; '
@@ -718,10 +718,10 @@ def main() -> None:
     pbar = tqdm(total=total_to_evaluate, desc='Sliding windows', unit='window')
     verbose_file = (run_dir / 'verbose.jsonl').open('w', encoding='utf-8') if args.verbose else None
     sample_file = (
-        (run_dir / ('verbosisih.jsonl' if args.verbosisih else 'verbosish.jsonl')).open(
+        (run_dir / ('detailedWithClockTimes.jsonl' if args.detailedWithClockTimes else 'detailed.jsonl')).open(
             'w', encoding='utf-8'
         )
-        if args.verbosish or args.verbosisih
+        if args.detailed or args.detailedWithClockTimes
         else None
     )
     window_data = _iter_window_data(
@@ -863,20 +863,20 @@ def main() -> None:
             'seed': args.seed,
             'masked_indexes': args.masked_indexes,
             'verbose': args.verbose,
-            'verbosish': args.verbosish,
-            'verbosisih': args.verbosisih,
+            'detailed': args.detailed,
+            'detailedWithClockTimes': args.detailedWithClockTimes,
             'compact': args.compact,
             'verbose_schema': (
                 'parallel-arrays' if args.compact else 'candidate-objects'
             ) if args.verbose else None,
-            'verbosish_schema': (
+            'detailed_schema': (
                 'sample-index-log-estimate'
-                if args.verbosish
+                if args.detailed
                 else None
             ),
-            'verbosisih_schema': (
+            'detailedWithClockTimes_schema': (
                 'sample-index-log-estimate-and-wall-time-seconds'
-                if args.verbosisih
+                if args.detailedWithClockTimes
                 else None
             ),
         },
